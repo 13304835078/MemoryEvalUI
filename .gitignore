@@ -1,0 +1,32 @@
+# local secrets
+config/local_config.json
+.env
+
+# generated data/results
+data/**
+!data/**/
+!data/**/.gitkeep
+logs/**
+!logs/.gitkeep
+
+# build artifacts
+build/
+dist/
+*.spec~
+
+# python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

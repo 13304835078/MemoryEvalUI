@@ -1,0 +1,23 @@
+{
+  "status": "interrupted",
+  "heartbeat_at": "2026-07-02T02:18:14.685331+00:00",
+  "events": [
+    {
+      "time": "2026-07-02T02:18:14.685331+00:00",
+      "level": "warning",
+      "message": "后台闭环任务可能已中断：长时间没有心跳。"
+    }
+  ],
+  "config": {
+    "extraction_timeout": 1,
+    "extraction_max_retries": 1,
+    "extraction_retry_sleep": 1,
+    "eval_config": {
+      "judge_timeout": 1,
+      "judge_max_retries": 1,
+      "judge_qps_backoff": 1
+    }
+  },
+  "stage": "已中断",
+  "finished_at": "2026-07-02T02:18:14.685331+00:00"
+}

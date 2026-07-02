@@ -1,0 +1,618 @@
+Memory Eval UI 使用说明
+=========================
+
+一、工具简介
+------------
+
+Memory Eval UI 是一个本地运行的记忆评测工具，用于辅助评估模型生成的用户记忆内容质量。
+
+当前版本主要支持 USER.md 更新质量评测，后续可扩展到：
+1. 天级记忆评测
+2. 长期记忆评测
+3. 摘要评测
+
+工具支持两种评测模式：
+1. Mock 模式：不调用真实大模型，主要用于演示 UI 流程和测试功能是否正常。
+2. 真实 Judge 模式：调用配置的大模型接口，对 case 进行自动打分和备注。
+
+整体流程为：
+
+配置 API / Prompt
+    ↓
+导入或生成 Case
+    ↓
+执行评测
+    ↓
+查看结果总览
+    ↓
+查看单条 Case 详情
+    ↓
+人工复核与导出结果
+
+
+二、启动方式
+------------
+
+如果拿到的是打包后的版本，请先解压整个文件夹，不要只单独复制 exe 文件。
+
+推荐目录结构类似：
+
+MemoryEvalUI/
+├── MemoryEvalUI.exe
+├── _internal/
+├── data/
+├── config/
+└── 其他依赖文件
+
+启动方法：
+
+1. 双击 MemoryEvalUI.exe
+2. 程序会在本地启动 Streamlit 服务
+3. 正常情况下浏览器会自动打开页面
+4. 如果浏览器没有自动打开，可以手动访问：
+
+http://localhost:8501
+
+注意：
+- 程序是本地 Web UI，数据默认在本地处理。
+- 启动后出现黑色命令行窗口是正常现象，不要关闭。
+- 关闭命令行窗口会停止服务。
+- 如果 8501 端口被占用，可能需要关闭已有 Streamlit 进程或重新启动。
+
+
+三、页面说明
+------------
+
+左侧导航栏包含 5 个主要页面：
+
+1. 配置
+2. 数据输入
+3. 执行评测
+4. 结果总览
+5. Case 详情
+
+
+四、配置页使用说明
+------------------
+
+配置页用于设置 Judge 模型接口、Prompt 和评测规则。
+
+1. API 配置
+
+主要字段：
+
+API Base URL：
+    填写大模型接口地址。
+    例如：
+    http://xxx.xxx.xxx.xxx:8080/service/xxx/llm/v1/chat/completions
+
+Judge 模型名：
+    填写实际接口支持的模型名。
+    不建议随便填写。
+    例如内部接口可能使用：
+    AGENT-GLM5-PERF
+
+API Token：
+    填写接口鉴权 Token。
+    如果接口要求 Bearer Token，请填写完整格式：
+    Bearer xxxxx
+
+max_tokens：
+    Judge 模型最大输出 token 数。
+    默认 2000，一般够用。
+    如果评测输出被截断，可以适当调大。
+
+timeout 秒：
+    单次请求超时时间。
+    默认 120 秒。
+
+max_retries：
+    单条 case 调用失败后的最大重试次数。
+    遇到限流时建议设置为 5。
+
+请求间隔秒数 request_interval：
+    每条 case 之间等待多少秒。
+    如果接口限制为 0.10 QPS，建议设置为 10.5 到 12 秒。
+
+限流重试等待秒数 qps_backoff：
+    遇到 QPS limit exceeded 后等待多久再重试。
+    建议设置为 12 秒。
+
+Mock 模式：
+    勾选后不调用真实接口。
+    用于演示流程或调试 UI。
+    如果要真实调用大模型 Judge，请取消勾选。
+
+2. 测试连接
+
+填写 API Base URL、Judge 模型名和 API Token 后，可以点击“测试连接”。
+
+测试连接成功表示：
+- 接口可访问
+- 鉴权通过
+- 模型能返回合法 JSON
+- 返回结果符合 JudgeResult 格式
+
+如果测试连接失败，常见原因包括：
+- Token 错误或过期
+- API Base URL 填错
+- 模型名不被接口支持
+- 当前网络无法访问接口
+- 接口返回 authentication fail
+- 接口限流
+
+注意：
+“能返回 JSON”不等于测试成功。必须返回符合评测格式的 JSON 才算成功。
+
+3. Prompt 配置
+
+配置页右侧可以选择和编辑 Judge Prompt。
+
+常用操作：
+- 选择当前任务类型，例如 user_md_update
+- 选择 prompts/judge/ 下的评测 prompt 文件
+- 查看和编辑 prompt 内容
+- 保存为新的 prompt 版本
+
+建议：
+- 不要直接覆盖已有稳定版本
+- 修改 prompt 后保存为新文件，例如 judge_user_md_v2.md
+- 后续比较不同 prompt 效果时，可以通过结果中的 judge_prompt_version 区分
+
+
+五、数据输入页使用说明
+----------------------
+
+数据输入页用于加载或生成标准评测 Case。
+
+支持几种输入方式：
+
+1. 选择已有 cases.jsonl
+
+如果 data/cases/ 目录下已经有标准 case 文件，可以直接选择并加载。
+
+适合场景：
+- 已经转换过数据
+- 只是重新评测
+- 只是查看已有 case
+
+2. 上传 run_user.py 输出 Excel
+
+这是当前 USER.md 评测最推荐的输入方式。
+
+适用 Excel 格式：
+- 每行有 query 和 answer
+- 每个 chunk 的末行有 user.md 或 result
+- user.md 表示该 chunk 后生成的新 USER.md
+- 上一个 chunk 的 user.md 会作为下一个 chunk 的 old_memory
+
+转换逻辑：
+- old_memory = 上一个 chunk 的 user.md
+- dialogue = 当前 chunk 内所有 query + answer
+- candidate_output = 当前 chunk 的 user.md
+- 每个 chunk 生成一个评测 case
+
+需要填写：
+- 被评测模型名，例如 GLM5、DeepSeek、Qwen
+- 生成 Prompt 版本，例如 user_md_v1、user_10.2
+
+这两个字段会写入 case 和评测结果，后续结果总览页可以按模型和 prompt 版本筛选、对比。
+
+3. 上传通用 Excel / JSON / JSONL
+
+适合已有标准字段的数据。
+
+常见字段包括：
+- case_id
+- session_id
+- old_memory
+- dialogue
+- candidate_output
+- reference_output
+- model_name
+- prompt_version
+
+通用 Excel 会尝试自动识别中英文列名，但如果列名过于特殊，可能需要先手动整理。
+
+4. 读取 Markdown case 目录
+
+适合手工构造少量测试样例。
+
+目录中需要包含：
+
+old_user.md
+dialogue.md
+new_user.md
+
+dialogue.md 格式示例：
+
+- user: 我最近在学 Rust
+- assistant: Rust 是个很好的选择
+- user: 我更喜欢简洁一点的回答
+- assistant: 明白
+
+读取后会生成标准 case 文件。
+
+
+六、执行评测页使用说明
+----------------------
+
+执行评测页用于真正运行 Judge 评测。
+
+基本步骤：
+
+1. 确认已经加载 Case
+2. 选择任务类型，例如 user_md_update
+3. 选择是否使用 Mock 模式
+4. 选择 Judge Prompt 文件
+5. 设置评测条数限制
+6. 点击“开始评测”
+
+1. Mock 模式
+
+Mock 模式不会调用真实大模型。
+适合：
+- 检查 UI 是否正常
+- 检查 case 是否能加载
+- 演示完整流程
+- 避免消耗接口资源
+
+Mock 模式下的分数不代表真实评测结果。
+
+2. 真实 Judge 模式
+
+取消 Mock 模式后，会调用配置页设置的大模型接口。
+
+建议首次测试：
+- limit 设置为 1 或 3
+- request_interval 设置为 10.5 到 12 秒
+- qps_backoff 设置为 12 秒
+- max_retries 设置为 5
+
+确认少量 case 能正常打分后，再跑全量。
+
+3. 关于限流
+
+如果接口返回：
+
+QPS limit exceeded, limit:0.10
+
+说明接口限制为 0.10 QPS，大约 10 秒最多 1 次请求。
+
+此时建议配置：
+- request_interval = 12
+- qps_backoff = 12
+- max_retries = 5
+
+如果 57 条 case 全量评测，预计至少需要 10 到 12 分钟。
+
+4. 注意事项
+
+评测运行过程中不要切换到其他页面。
+当前版本切换页面后，进度条状态可能消失，但评测状态不便继续展示。
+建议等待当前评测完成后再切换页面。
+
+5. 评测结果保存位置
+
+评测完成后会生成结果文件：
+
+data/results/eval_results_YYYYMMDD_HHMMSS.jsonl
+
+每一行是一条 EvalResult，包含：
+- case_id
+- score_total
+- scores
+- comment
+- error_tags
+- fatal_error
+- model_name
+- prompt_version
+- judge_model
+- judge_prompt_version
+- raw_response
+- timestamp
+
+
+七、结果总览页使用说明
+----------------------
+
+结果总览页用于查看整体统计结果。
+
+可以展示：
+- Case 数量
+- 平均总分
+- fatal_error 数量
+- fatal_error 比例
+- 各维度平均分
+- 错误标签分布
+- 按被评测模型分组统计
+- 按生成 Prompt 分组统计
+- 明细表格
+
+1. 加载结果文件
+
+可以在侧边栏选择 data/results/ 下的 result jsonl 文件。
+
+如果希望在结果表格里看到 old_memory、candidate_output 预览，需要同时加载对应的 case 文件。
+
+2. 筛选功能
+
+支持按以下条件筛选：
+- 被评测模型 model_name
+- 生成 Prompt 版本 prompt_version
+- fatal_error
+- 最低分数
+
+3. 导出结果
+
+支持导出：
+- CSV
+- Excel
+
+导出结果适合后续人工分析、汇报或发送给其他人查看。
+
+
+八、Case 详情页使用说明
+-----------------------
+
+Case 详情页用于查看单条评测样本的详细内容。
+
+展示内容包括：
+- old_memory
+- candidate_output
+- old_memory 与 candidate_output 的 diff
+- 对话记录 dialogue
+- 各维度得分
+- 总分
+- Judge 评语 comment
+- 错误标签 error_tags
+- Judge 原始响应 raw_response
+
+如果加载了 case 文件，页面会展示完整输入。
+如果只加载 result 文件，可能只能看到评测结果，看不到原始对话和 USER.md。
+
+1. 单条 Case 选择
+
+可以通过下拉框选择某条结果。
+如果同一个 case_id 有多个模型或 prompt 版本，会显示 model_name 和 prompt_version 以便区分。
+
+2. 人工复核
+
+可以填写：
+- 人工评分 human_score
+- 人工错误标签 human_error_tags
+- 人工备注 human_comment
+- 复核状态 review_status
+
+复核结果会保存到：
+
+data/results/human_reviews.jsonl
+
+适合记录：
+- Judge 是否误判
+- 需要讨论的 case
+- 后续 prompt 优化依据
+- 模型对比中的典型错误样例
+
+
+九、常见问题
+------------
+
+1. 双击 exe 后黑色窗口一闪而过
+
+可能原因：
+- 打包文件不完整
+- 没有解压整个文件夹
+- 缺少 _internal 目录
+- app.py、pages、src 等资源缺失
+
+建议：
+- 不要单独复制 exe
+- 发给他人时压缩整个 MemoryEvalUI 文件夹
+- 从命令行运行 exe 查看具体报错
+
+2. 页面能打开，但提示 No module named src
+
+说明打包时没有把 src 目录复制进去。
+需要确认 dist/MemoryEvalUI/_internal/src 是否存在。
+
+3. 测试连接失败：authentication fail
+
+可能原因：
+- Token 错误
+- Token 过期
+- Token 没有带 Bearer
+- API Base URL 填错
+- 当前网络无法访问该服务
+
+建议填写完整 Token，例如：
+
+Bearer movie-sk-XXX
+
+4. 测试连接成功，但执行评测全是 0 分
+
+需要查看 result 文件中的 raw_response。
+
+如果 raw_response 是：
+- authentication fail：鉴权失败
+- QPS limit exceeded：接口限流
+- 非 JSON 文本：Judge 没有按格式输出
+- 输出被截断：max_tokens 可能太小
+
+5. QPS limit exceeded
+
+说明请求太快。
+建议：
+- request_interval 设置为 12
+- qps_backoff 设置为 12
+- max_retries 设置为 5
+
+6. 只有少数 case 成功，大部分失败
+
+如果失败 raw_response 是 QPS limit exceeded，说明是限流。
+不是模型不会评测，而是请求过快。
+
+7. 结果总览里被评测模型只有 unknown
+
+说明生成 case 时没有填写 model_name 和 prompt_version。
+
+解决方式：
+- 在数据输入页上传 run_user.py 输出 Excel 时填写“被评测模型名”和“生成 Prompt 版本”
+- 或重新生成 case 文件
+
+8. 维度均分为空
+
+可能原因：
+- 没有成功评测结果
+- 所有结果都是 fatal_error
+- Judge 返回格式不符合要求
+- result 文件中 scores 字段为空
+
+9. 切换页面后进度条消失
+
+这是当前版本的已知限制。
+建议评测过程中不要切换页面。
+等评测完成后再查看其他页面。
+
+10. 导出的 CSV 打开乱码
+
+建议使用 Excel 打开 UTF-8 BOM 格式的 CSV。
+如果仍乱码，可以优先导出 Excel。
+
+
+十、推荐演示流程
+----------------
+
+给他人演示时，建议按以下流程：
+
+1. 双击 MemoryEvalUI.exe
+2. 进入“配置”页
+3. 先开启 Mock 模式
+4. 进入“数据输入”页
+5. 选择已有 cases.jsonl，或上传 run_user.py 输出 Excel
+6. 进入“执行评测”页
+7. limit 设置为 3
+8. 点击开始评测
+9. 进入“结果总览”页查看统计
+10. 进入“Case 详情”页查看单条 case、diff 和评语
+11. 如果需要真实 Judge，再回到配置页填写 API 信息并关闭 Mock 模式
+
+
+十一、真实 Judge 推荐配置
+-------------------------
+
+如果接口限制为 0.10 QPS，推荐配置：
+
+Mock 模式：
+    关闭
+
+Judge 模型名：
+    使用接口实际支持的模型名，例如 AGENT-GLM5-PERF
+
+API Base URL：
+    填写完整 chat/completions 地址
+
+API Token：
+    填写完整 Bearer Token
+
+max_tokens：
+    2000 或更高
+
+timeout：
+    120
+
+max_retries：
+    5
+
+request_interval：
+    12
+
+qps_backoff：
+    12
+
+首次测试：
+    limit = 1 或 3
+
+全量评测：
+    确认小批量成功后再运行
+
+
+十二、数据安全说明
+------------------
+
+当前工具设计为本地运行：
+- 上传文件默认保存在本地 data/raw/uploads
+- case 文件保存在 data/cases
+- 评测结果保存在 data/results
+- 人工复核保存在 data/results/human_reviews.jsonl
+- API 配置保存在 config/local_config.json
+
+注意：
+- 不要把真实 API Token 提交到代码仓库
+- 不要把包含敏感信息的 data/raw、data/cases、data/results 随意外发
+- 发给他人演示时，建议使用脱敏数据或 mock 数据
+- 打包分发前检查 config/local_config.json 中是否包含真实 Token
+
+
+十三、目录说明
+--------------
+
+常用目录：
+
+data/raw/
+    原始上传文件
+
+data/raw/uploads/
+    UI 上传后的临时保存文件
+
+data/cases/
+    标准评测 case，jsonl 格式
+
+data/results/
+    评测结果、人工复核结果
+
+prompts/judge/
+    Judge Prompt 文件
+
+rules/
+    Rubric 评测规则文件
+
+config/
+    本地配置文件
+
+logs/
+    运行日志目录，如有
+
+
+十四、当前版本已知限制
+----------------------
+
+1. 评测过程中切换页面会导致进度条显示丢失。
+2. 真实 Judge 评测速度受接口 QPS 限制影响。
+3. 当前主要完成 USER.md 更新评测，其他任务类型预留了扩展入口。
+4. 如果 Judge 输出不是严格 JSON，会被标记为 fatal_error。
+5. 当前没有多用户权限管理，不适合作为多人在线平台直接部署。
+6. 当前没有后台任务队列，长时间评测建议保持页面打开。
+
+
+十五、问题排查建议
+------------------
+
+如果出现异常，建议按顺序检查：
+
+1. 是否能正常启动 UI
+2. 是否能加载 case 文件
+3. Mock 模式能否跑通
+4. API 测试连接是否成功
+5. limit=1 的真实 Judge 是否成功
+6. result 文件中的 raw_response 是什么
+7. 是否出现 authentication fail
+8. 是否出现 QPS limit exceeded
+9. Judge 是否返回合法 JSON
+10. 是否加载了正确的 result 文件和 case 文件
+
+如果需要定位问题，优先查看：
+
+data/results/eval_results_xxx.jsonl
+
+其中 raw_response 字段通常能说明具体失败原因。

@@ -1,0 +1,560 @@
+from __future__ import annotations
+
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.extraction.memory_extractor import (
+    EXTRACTION_OUTPUT_DIR,
+    MemoryExtractionConfig,
+    MemoryExtractionRunner,
+    load_generation_prompt,
+    sanitize_filename,
+)
+from src.ui.config_store import build_eval_config, load_config
+from src.ui.data_service import (
+    prepare_cases_from_run_output,
+    save_cases,
+    save_uploaded_file,
+)
+from src.ui.prompt_editor import (
+    get_default_extraction_prompt_file,
+    infer_prompt_version,
+    list_extraction_prompt_files,
+    load_prompt,
+    prompt_text_hash,
+)
+from src.ui.memory_extraction_job_runner import (
+    MemoryExtractionJobConfig,
+    list_memory_extraction_job_ids,
+    memory_extraction_job_is_running,
+    read_memory_extraction_job_state,
+    request_memory_extraction_stop,
+    run_memory_extraction_job,
+)
+
+
+CONFIG_PROMPT = "使用配置页当前编辑文本"
+SAVED_PROMPT = "选择已保存的提取提示词文件"
+LOCAL_PROMPT = "读取本地提示词文件"
+
+EXTRACTION_CORE_COLUMNS = [
+    "评测人",
+    "session_id",
+    "chunk_id",
+    "轮次",
+    "query",
+    "answer",
+    "status",
+    "error",
+    "user.md",
+]
+EXTRACTION_DETAIL_COLUMNS = EXTRACTION_CORE_COLUMNS + ["reasoning", "result"]
+
+
+def existing_columns(df: pd.DataFrame, columns: list[str]) -> list[str]:
+    return [col for col in columns if col in df.columns]
+
+
+def chunk_result_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    markers = [col for col in ["status", "user.md", "error", "result", "reasoning"] if col in df.columns]
+    if not markers:
+        return df
+    mask = pd.Series(False, index=df.index)
+    for col in markers:
+        mask = mask | df[col].fillna("").astype(str).str.strip().ne("")
+    filtered = df[mask].copy()
+    return filtered if not filtered.empty else df
+
+
+def core_extraction_view(df: pd.DataFrame, *, detail: bool = False) -> pd.DataFrame:
+    columns = existing_columns(df, EXTRACTION_DETAIL_COLUMNS if detail else EXTRACTION_CORE_COLUMNS)
+    return df[columns].copy() if columns else df.copy()
+
+
+def render_extraction_dataframe_preview(df: pd.DataFrame, *, max_rows: int = 80) -> None:
+    result_df = chunk_result_rows(df.fillna(""))
+    st.dataframe(
+        core_extraction_view(result_df.head(max_rows)),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_extraction_detail_view(output_path: str, key_prefix: str) -> None:
+    path = Path(output_path)
+    if not output_path or not path.exists():
+        return
+
+    with st.expander("详细查看提取结果", expanded=False):
+        full_df = pd.read_excel(path).fillna("")
+        result_df = chunk_result_rows(full_df)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Excel总行数", len(full_df))
+        c2.metric("chunk结果行", len(result_df))
+        if "status" in result_df.columns:
+            c3.metric("成功chunk", int((result_df["status"].astype(str) == "SUCCESS").sum()))
+        else:
+            c3.metric("成功chunk", "-")
+
+        filter_df = result_df.copy()
+        f1, f2 = st.columns(2)
+        if "评测人" in filter_df.columns:
+            reviewers = ["全部"] + sorted([x for x in filter_df["评测人"].astype(str).unique() if x])
+            selected_reviewer = f1.selectbox("筛选评测人", reviewers, key=f"{key_prefix}_reviewer")
+            if selected_reviewer != "全部":
+                filter_df = filter_df[filter_df["评测人"].astype(str) == selected_reviewer]
+        if "status" in filter_df.columns:
+            statuses = ["全部"] + sorted([x for x in filter_df["status"].astype(str).unique() if x])
+            selected_status = f2.selectbox("筛选状态", statuses, key=f"{key_prefix}_status")
+            if selected_status != "全部":
+                filter_df = filter_df[filter_df["status"].astype(str) == selected_status]
+
+        st.markdown("**chunk结果列表**")
+        st.dataframe(core_extraction_view(filter_df, detail=False), use_container_width=True, hide_index=True)
+
+        if not filter_df.empty:
+            labels = []
+            index_values = list(filter_df.index)
+            for idx, row in filter_df.iterrows():
+                labels.append(
+                    f"行{idx + 2} | {row.get('评测人', '')} | session {row.get('session_id', '')} | "
+                    f"chunk {row.get('chunk_id', '')} | {row.get('status', '')}"
+                )
+            selected_label = st.selectbox("查看单个chunk详情", labels, key=f"{key_prefix}_chunk_select")
+            selected_index = index_values[labels.index(selected_label)]
+            row = full_df.loc[selected_index]
+
+            st.markdown("**本chunk对话**")
+            chunk_df = full_df.copy()
+            for col in ["评测人", "session_id", "chunk_id"]:
+                if col in chunk_df.columns and col in row.index:
+                    chunk_df = chunk_df[chunk_df[col].astype(str) == str(row.get(col, ""))]
+            dialogue_cols = existing_columns(chunk_df, ["轮次", "query", "answer"])
+            if dialogue_cols:
+                st.dataframe(chunk_df[dialogue_cols], use_container_width=True, hide_index=True)
+
+            t1, t2 = st.columns(2)
+            with t1:
+                st.text_area("提取后的 USER.md", value=str(row.get("user.md", "")), height=220, disabled=True, key=f"{key_prefix}_user_md")
+                if str(row.get("error", "")).strip():
+                    st.text_area("错误信息", value=str(row.get("error", "")), height=120, disabled=True, key=f"{key_prefix}_error")
+            with t2:
+                st.text_area("模型 reasoning", value=str(row.get("reasoning", "")), height=160, disabled=True, key=f"{key_prefix}_reasoning")
+                st.text_area("模型原始输出", value=str(row.get("result", "")), height=180, disabled=True, key=f"{key_prefix}_result")
+
+        with st.expander("排查用：查看完整Excel原始列", expanded=False):
+            st.caption("这里保留所有原始列，例如 soul.md 检索召回、研发说明、备注摘要等，只在排查输入数据时查看。")
+            st.dataframe(full_df.head(300), use_container_width=True, hide_index=True)
+
+
+def resolve_sheet_name(raw: str) -> str | int | None:
+    raw = str(raw or "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def resolve_prompt_text(source: str, saved_file: str, local_path: str) -> tuple[str, str]:
+    local_path = str(local_path or "").strip().strip('"')
+    if source == LOCAL_PROMPT:
+        if not local_path:
+            return "", ""
+        return load_generation_prompt(local_path), Path(local_path).stem
+
+    if source == CONFIG_PROMPT:
+        text = st.session_state.get("extraction_prompt_text", "")
+        version = infer_prompt_version(
+            st.session_state.get("selected_extraction_prompt_file", "")
+            or get_default_extraction_prompt_file("user_md_update")
+        )
+        return text, version
+
+    if not saved_file:
+        return "", ""
+    return load_prompt(saved_file, prompt_kind="extraction"), infer_prompt_version(saved_file)
+
+
+def load_input_excel(uploaded_file, local_path: str) -> str:
+    if uploaded_file is not None:
+        return save_uploaded_file(uploaded_file, suffix=Path(uploaded_file.name).suffix)
+    local_path = str(local_path or "").strip().strip('"')
+    if not local_path:
+        raise ValueError("请上传原始对话 Excel，或填写本地 Excel 路径。")
+    if not Path(local_path).is_file():
+        raise FileNotFoundError(f"本地 Excel 文件不存在：{local_path}")
+    return local_path
+
+
+def ensure_memory_extraction_threads() -> dict[str, threading.Thread]:
+    if "memory_extraction_threads" not in st.session_state:
+        st.session_state.memory_extraction_threads = {}
+    return st.session_state.memory_extraction_threads
+
+
+def render_memory_extraction_job_state(job_id: str) -> None:
+    state = read_memory_extraction_job_state(job_id)
+    if not state:
+        st.info("暂无这个记忆提取任务的状态。")
+        return
+
+    status = str(state.get("status") or "")
+    done = int(state.get("done", 0) or 0)
+    total = int(state.get("total", 0) or 0)
+    fraction = done / total if total else 0.0
+
+    st.subheader("后台记忆提取进度")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("状态", status or "-")
+    c2.metric("阶段", state.get("stage", "-"))
+    c3.metric("进度", f"{done}/{total}" if total else "准备中")
+    c4.metric("更新时间", str(state.get("updated_at", ""))[:19])
+    st.progress(fraction)
+    st.write(state.get("message", ""))
+
+    if status == "running":
+        if st.button("请求终止记忆提取", type="secondary", use_container_width=True, key=f"{job_id}_stop"):
+            request_memory_extraction_stop(job_id)
+            st.warning("已写入终止请求。当前 API 调用返回后会在下一个检查点停止。")
+            st.rerun()
+
+    output_path = state.get("output_path", "")
+    if output_path:
+        st.caption(f"输出 Excel：{output_path}")
+    if state.get("cases_path"):
+        st.caption(f"完整 case：{state.get('cases_path')}")
+        st.session_state.cases_file = state.get("cases_path", "")
+    if state.get("missed_cases_path"):
+        st.caption(f"漏抽 case：{state.get('missed_cases_path')}")
+        st.session_state.missed_cases_file = state.get("missed_cases_path", "")
+
+    stats = state.get("stats") or {}
+    if stats:
+        with st.expander("查看提取统计", expanded=False):
+            st.json(stats)
+    case_stats = state.get("case_stats") or {}
+    if case_stats:
+        with st.expander("查看 case 生成统计", expanded=False):
+            st.json(case_stats)
+
+    preview_rows = state.get("preview_rows") or []
+    if preview_rows:
+        st.markdown("**提取结果预览（核心列）**")
+        st.caption("默认只展示 chunk 结果行和关键列；完整原始列可在下方“详细查看提取结果”中展开。")
+        render_extraction_dataframe_preview(pd.DataFrame(preview_rows), max_rows=50)
+
+    if status in {"completed", "stopped"} and output_path and Path(output_path).exists():
+        st.download_button(
+            "下载提取结果 Excel",
+            data=Path(output_path).read_bytes(),
+            file_name=Path(output_path).name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"{job_id}_download_output",
+        )
+        render_extraction_detail_view(output_path, key_prefix=f"{job_id}_detail")
+
+    if state.get("traceback"):
+        with st.expander("错误堆栈", expanded=True):
+            st.code(state.get("traceback", ""), language="text")
+
+
+@st.fragment(run_every="10s")
+def render_memory_extraction_job_state_auto(job_id: str) -> None:
+    render_memory_extraction_job_state(job_id)
+
+
+st.title("记忆提取")
+st.caption("单独运行 USER.md 记忆提取，输出 run_user.py 兼容 Excel；可选继续生成评测 case。")
+
+if "ui_config" not in st.session_state:
+    st.session_state.ui_config = load_config()
+if "cases" not in st.session_state:
+    st.session_state.cases = []
+if "cases_file" not in st.session_state:
+    st.session_state.cases_file = ""
+
+cfg = dict(st.session_state.ui_config)
+
+with st.expander("使用说明", expanded=True):
+    st.markdown(
+        """
+1. 上传或填写原始对话 Excel，列至少包含：`轮次`、`query`、`answer`、`评测人`。
+2. 选择真实的 USER.md 提取提示词。提取结果只写在每个 chunk 的最后一行，格式兼容后续 case 生成。
+3. 同一评测人内部串行继承旧 USER.md；不同评测人之间可以并发，不会互相继承画像。
+4. 运行完成后会生成 Excel，可直接下载，也可以自动转换成普通“执行评测”所需的 case 文件。
+        """.strip()
+    )
+
+st.subheader("1. 输入数据")
+with st.container(border=True):
+    uploaded = st.file_uploader("上传原始对话 Excel", type=["xlsx", "xls"], key="standalone_memory_extract_upload")
+    local_excel_path = st.text_input(
+        "或填写本地 Excel 路径",
+        value="",
+        placeholder=r"C:\Users\...\dialogues.xlsx",
+        help="单人本地使用时可以直接填写路径，绕过浏览器上传。",
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        sheet_name_raw = st.text_input("Sheet 名称或序号", value="", help="留空默认第一个 sheet。")
+    with c2:
+        chunk_size = st.number_input("chunk_size", min_value=1, max_value=200, value=10, step=1)
+    with c3:
+        reviewer_filter = st.text_input("评测人筛选", value="", help="可选。多个评测人用逗号分隔。")
+
+st.subheader("2. 提取提示词")
+with st.container(border=True):
+    extraction_prompt_files = list_extraction_prompt_files()
+    default_extraction_prompt = get_default_extraction_prompt_file("user_md_update")
+    if default_extraction_prompt and default_extraction_prompt not in extraction_prompt_files:
+        extraction_prompt_files = [default_extraction_prompt] + extraction_prompt_files
+
+    prompt_source = st.radio(
+        "提示词来源",
+        [SAVED_PROMPT, CONFIG_PROMPT, LOCAL_PROMPT],
+        horizontal=True,
+        help="推荐使用已保存文件，便于记录版本和复现。",
+    )
+
+    selected_prompt_file = ""
+    local_prompt_path = ""
+    if prompt_source == SAVED_PROMPT:
+        if extraction_prompt_files:
+            default_index = extraction_prompt_files.index(default_extraction_prompt) if default_extraction_prompt in extraction_prompt_files else 0
+            selected_prompt_file = st.selectbox("提取提示词文件", extraction_prompt_files, index=default_index)
+        else:
+            st.warning("prompts/generation 下暂无提取提示词文件。")
+    elif prompt_source == LOCAL_PROMPT:
+        local_prompt_path = st.text_input(
+            "本地提取 prompt 路径",
+            value="",
+            placeholder=r"C:\Users\...\user_10.1.2.yaml",
+            help="支持 .md/.yaml/.yml。",
+        )
+
+    try:
+        extraction_prompt_text, extraction_prompt_version = resolve_prompt_text(
+            prompt_source,
+            selected_prompt_file,
+            local_prompt_path,
+        )
+    except Exception as exc:
+        extraction_prompt_text, extraction_prompt_version = "", ""
+        st.error(f"提取提示词读取失败：{exc}")
+
+    prompt_hash = prompt_text_hash(extraction_prompt_text)
+    c1, c2 = st.columns(2)
+    c1.metric("提取提示词版本", extraction_prompt_version or "未识别")
+    c2.metric("提取提示词 Hash", prompt_hash[:12] if prompt_hash else "空")
+
+    with st.expander("查看提取提示词全文", expanded=False):
+        st.text_area("提取提示词", value=extraction_prompt_text, height=260, disabled=True)
+
+st.subheader("3. 运行参数")
+with st.container(border=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        extract_model = st.text_input("提取模型", value=cfg.get("judge_model", "") or "AGENT-GLM5-PERF")
+        max_tokens = st.number_input("最大输出长度", min_value=1000, max_value=100000, value=50000, step=1000)
+        timeout = st.number_input("单次请求超时秒数", min_value=10, max_value=600, value=int(cfg.get("judge_timeout", 120) or 120), step=10)
+    with c2:
+        request_interval = st.number_input(
+            "请求间隔秒数",
+            min_value=0.0,
+            max_value=300.0,
+            value=float(cfg.get("judge_request_interval", 10.0) or 10.0),
+            step=0.5,
+        )
+        max_retries = st.number_input(
+            "失败重试次数",
+            min_value=0,
+            max_value=10,
+            value=max(0, int(cfg.get("judge_max_retries", 3) or 3) - 1),
+            step=1,
+            help="这里表示失败后额外重试几次；总尝试次数 = 1 + 失败重试次数。",
+        )
+        retry_sleep = st.number_input(
+            "失败后重试等待秒数",
+            min_value=0.0,
+            max_value=300.0,
+            value=float(cfg.get("judge_qps_backoff", 15.0) or 15.0),
+            step=1.0,
+        )
+    with c3:
+        extraction_concurrency = st.number_input(
+            "提取并发数",
+            min_value=1,
+            max_value=100,
+            value=min(100, max(1, int(cfg.get("judge_concurrency", 1) or 1))),
+            step=1,
+            help="不同评测人之间可以并发；同一评测人内部仍串行，避免 USER.md 继承错乱。",
+        )
+        send_enable_thinking = st.checkbox("发送 enable_thinking 字段", value=True)
+        enable_thinking = st.checkbox("enable_thinking=true", value=True, disabled=not send_enable_thinking)
+        mock = st.checkbox(
+            "模拟模式",
+            value=bool(cfg.get("mock", False)),
+            help="开启后不调用真实模型接口，用于检查页面流程、后台进度和 case 生成。",
+        )
+
+    with st.expander("查看复用的接口核心配置", expanded=False):
+        st.write({
+            "接口地址": cfg.get("api_base", ""),
+            "模型": extract_model,
+            "模拟模式": mock,
+            "温度": cfg.get("judge_temperature", 0),
+            "top_p": cfg.get("judge_top_p", 1.0),
+            "top_k": cfg.get("judge_top_k", None),
+            "请求间隔": request_interval,
+            "并发数": extraction_concurrency,
+            "重试等待": retry_sleep,
+        })
+
+st.subheader("4. 输出设置")
+with st.container(border=True):
+    auto_make_cases = st.checkbox("提取完成后自动生成评测 case", value=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        model_name_for_case = st.text_input("case 的模型名", value=extract_model)
+    with c2:
+        prompt_version_for_case = st.text_input("case 的提示词版本", value=extraction_prompt_version or "unknown")
+
+input_ready = uploaded is not None or bool(local_excel_path.strip())
+
+job_ids = list_memory_extraction_job_ids()
+last_job_id = st.session_state.get("memory_extraction_job_id", "")
+active_running = bool(last_job_id and memory_extraction_job_is_running(last_job_id))
+
+if st.button("开始记忆提取", type="primary", use_container_width=True, disabled=not input_ready or active_running):
+    try:
+        if not extraction_prompt_text.strip():
+            raise ValueError("提取提示词为空，请先选择或填写提取 prompt。")
+
+        input_path = load_input_excel(uploaded, local_excel_path)
+        eval_config = build_eval_config({**cfg, "mock": mock}, mock=mock)
+        errors = eval_config.validate()
+        if errors:
+            raise ValueError("接口配置错误：\n" + "\n".join([f"- {item}" for item in errors]))
+
+        extraction_config = MemoryExtractionConfig.from_eval_config(
+            eval_config,
+            model=extract_model,
+            max_tokens=int(max_tokens),
+            request_interval=float(request_interval),
+            max_retries=int(max_retries),
+            retry_sleep=float(retry_sleep),
+            enable_thinking=bool(enable_thinking),
+            timeout=int(timeout),
+        )
+        extraction_config.send_enable_thinking = bool(send_enable_thinking)
+        extraction_config.concurrency = int(extraction_concurrency)
+
+        EXTRACTION_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        job_id = f"memory_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        output_name = (
+            f"memory_extract_{sanitize_filename(extract_model)}_"
+            f"{sanitize_filename(extraction_prompt_version or 'prompt')}_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        output_path = EXTRACTION_OUTPUT_DIR / output_name
+
+        job_config = MemoryExtractionJobConfig(
+            job_id=job_id,
+            input_path=input_path,
+            output_path=str(output_path),
+            prompt_text=extraction_prompt_text,
+            prompt_version=extraction_prompt_version or "unknown",
+            sheet_name=resolve_sheet_name(sheet_name_raw),
+            reviewer_filter=reviewer_filter.strip(),
+            chunk_size=int(chunk_size),
+            auto_make_cases=bool(auto_make_cases),
+            case_model_name=model_name_for_case,
+            case_prompt_version=prompt_version_for_case,
+            extraction_config=extraction_config,
+        )
+        thread = threading.Thread(
+            target=run_memory_extraction_job,
+            args=(job_config,),
+            daemon=True,
+            name=f"memory-extraction-{job_id}",
+        )
+        thread.start()
+        ensure_memory_extraction_threads()[job_id] = thread
+        st.session_state.memory_extraction_job_id = job_id
+        st.success(f"已启动后台记忆提取任务：{job_id}")
+        st.rerun()
+    except Exception as exc:
+        st.error(f"记忆提取失败：{exc}")
+
+st.divider()
+st.subheader("后台任务")
+job_ids = list_memory_extraction_job_ids()
+last_job_id = st.session_state.get("memory_extraction_job_id", "")
+if not last_job_id and job_ids:
+    last_job_id = job_ids[0]
+    st.session_state.memory_extraction_job_id = last_job_id
+
+if job_ids:
+    index = job_ids.index(last_job_id) if last_job_id in job_ids else 0
+    selected_job_id = st.selectbox("查看记忆提取任务", job_ids, index=index)
+    if selected_job_id != last_job_id:
+        st.session_state.memory_extraction_job_id = selected_job_id
+        last_job_id = selected_job_id
+    state = read_memory_extraction_job_state(last_job_id)
+    if state.get("status") == "running":
+        auto_refresh = st.checkbox(
+            "运行中每10秒自动刷新进度区",
+            value=True,
+            key=f"{last_job_id}_auto_refresh",
+            help="只刷新下面的任务状态区域，不刷新整个页面。",
+        )
+        if auto_refresh:
+            render_memory_extraction_job_state_auto(last_job_id)
+        else:
+            render_memory_extraction_job_state(last_job_id)
+    else:
+        render_memory_extraction_job_state(last_job_id)
+else:
+    st.info("暂无后台记忆提取任务。")
+
+st.divider()
+st.subheader("历史提取结果")
+
+if EXTRACTION_OUTPUT_DIR.exists():
+    files = sorted(EXTRACTION_OUTPUT_DIR.glob("*.xlsx"), key=lambda path: path.stat().st_mtime, reverse=True)
+else:
+    files = []
+
+if files:
+    labels = [path.name for path in files]
+    selected_label = st.selectbox("选择历史提取 Excel", labels)
+    selected_path = files[labels.index(selected_label)]
+    st.caption(str(selected_path))
+    if st.button("预览历史提取结果", use_container_width=True):
+        st.markdown("**历史提取结果预览（核心列）**")
+        render_extraction_dataframe_preview(pd.read_excel(selected_path).fillna(""), max_rows=80)
+        render_extraction_detail_view(str(selected_path), key_prefix=f"history_{selected_path.stem}")
+    st.download_button(
+        "下载历史提取 Excel",
+        data=selected_path.read_bytes(),
+        file_name=selected_path.name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+else:
+    st.info("暂无历史提取结果。")

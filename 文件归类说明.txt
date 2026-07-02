@@ -1,0 +1,83 @@
+MemoryEvalUI 文件归类说明
+==========================
+
+本压缩包根据你提供的文件树，把本轮上传的核心文件重新归类到项目目录。
+
+一、根目录
+----------
+app.py                         Streamlit 首页入口
+run.py                         命令行一键交互入口
+requirements.txt               Python 依赖
+MemoryEvalUI.spec              PyInstaller 打包配置
+MemoryEvalUI_使用说明.txt       使用说明文档
+.gitignore                     本次新增，避免提交本地配置、结果、缓存
+
+二、pages/
+---------
+pages/1_配置.py                API、Judge Prompt、Rubric 配置页
+pages/2_数据输入.py            数据上传、Case 生成与加载页
+pages/3_执行评测.py            执行 LLM Judge / Mock 评测页
+pages/4_结果总览.py            结果统计、筛选、导出页
+pages/5_Case详情.py            单条 Case 详情、diff、人工复核页
+
+三、src/
+-------
+src/schema.py                  Case、DialogueTurn、EvalConfig、EvalResult 等核心数据结构
+src/eval/eval_runner.py         评测流程编排
+src/eval/judge_client.py        Mock/Real Judge 调用、JSON 解析、限流重试
+src/eval/metrics.py             汇总统计、错误标签、维度标签
+src/loaders/base_loader.py      Loader 基类、列名别名识别
+src/loaders/excel_loader.py     Excel 转 Case
+src/loaders/json_loader.py      JSON/JSONL 转 Case
+src/loaders/md_loader.py        Markdown case 目录转 Case
+src/loaders/__init__.py         loaders 包导出
+src/ui/config_store.py          UI 配置读写和 EvalConfig 构造
+src/ui/data_service.py          data 目录、case/result 文件管理
+src/ui/prompt_editor.py         Prompt/Rubric 文件读取与版本保存
+src/ui/components.py            UI 展示组件、diff、结果卡片
+src/ui/review_store.py          人工复核记录读写
+src/ui/__init__.py             ui 包初始化
+
+四、scripts/
+-----------
+scripts/convert_to_cases.py                  通用 Excel/JSON/JSONL/MD 转标准 Case CLI
+scripts/prepare_eval_from_run_output.py      run_user.py 输出 Excel 转 USER.md 评测 Case CLI
+scripts/run_eval.py                          命令行执行评测
+scripts/analyze_results.py                   命令行分析结果
+
+五、prompts/ 与 rules/
+--------------------
+prompts/judge/judge_user_md_v1.md     USER.md Judge Prompt
+rules/rubric_user_md.md               USER.md 评测规则
+rules/rubric_day_memory.md            天级记忆规则占位
+rules/rubric_long_memory.md           长期记忆规则占位
+rules/rubric_summary.md               摘要规则占位
+
+六、tests/
+---------
+tests/test_schema.py           数据结构与 JSONL 往返测试
+tests/test_judge_client.py     Judge Client 解析和 Mock 测试
+tests/test_eval_runner.py      EvalRunner 流程测试
+tests/test_metrics.py          汇总统计测试
+tests/test_excel_loader.py     Excel Loader 测试
+tests/test_json_loader.py      JSON/JSONL Loader 测试
+tests/test_md_loader.py        Markdown Loader 测试
+
+七、config/ 与 data/
+------------------
+config/local_config.example.json       脱敏示例配置，真实 local_config.json 未打包
+data/cases/                            标准 case 输出目录
+data/raw/uploads/                      UI 上传文件保存目录
+data/results/                          评测结果与人工复核目录
+logs/                                  日志目录
+
+八、本次做的轻量整理
+------------------
+1. 没有打包真实 config/local_config.json，避免泄露 API token。
+2. 新增 config/local_config.example.json 作为示例配置。
+3. 新增 .gitignore。
+4. 新增空的 src/__init__.py 与 src/eval/__init__.py，增强包导入稳定性。
+5. 修正两个测试文件中与当前代码结构不一致的小断言：
+   - tests/test_md_loader.py：MdLoader.load 返回 list[Case]，测试改为取 cases[0]。
+   - tests/test_schema.py：DialogueTurn.to_dict 会包含 metadata 字段，测试断言同步更新。
+6. 修正 pages/3_执行评测.py 中 Mock 模式下 interval 未定义的问题。
