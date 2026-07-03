@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from src.eval.eval_runner import EvalRunner
-from src.schema import Case, EvalConfig, EvalResult, TaskType, results_to_jsonl
+from src.schema import Case, EvalConfig, EvalResult, TaskType, append_result_to_jsonl, results_to_jsonl
 from src.ui.data_service import (
     RESULTS_DIR,
     case_resume_key,
@@ -284,7 +284,8 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                 },
             )
 
-        results_to_jsonl(list(results_by_key.values()), str(output_path))
+        if not output_path.exists():
+            results_to_jsonl(list(results_by_key.values()), str(output_path))
 
         with ThreadPoolExecutor(max_workers=min(concurrency, max(1, len(tasks)))) as executor:
             futures = {
@@ -309,7 +310,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                     )
 
                 results_by_key[eval_result_resume_key(result)] = result
-                results_to_jsonl(list(results_by_key.values()), str(output_path))
+                append_result_to_jsonl(result, str(output_path))
                 evaluated_count += 1
                 done = skipped_count + evaluated_count
                 fatal_count = sum(1 for item in results_by_key.values() if item.fatal_error)

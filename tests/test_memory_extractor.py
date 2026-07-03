@@ -18,6 +18,7 @@ from src.extraction.memory_extractor import (
     extract_user_md,
     split_sessions,
 )
+from src.persistence import read_jsonl
 from src.ui.data_service import prepare_cases_from_run_output
 from src.ui.memory_extraction_job_runner import MemoryExtractionJobConfig, estimate_total_chunks
 
@@ -137,6 +138,10 @@ def test_memory_extraction_runner_outputs_run_user_compatible_excel():
         assert stats["chunks"] == 2
         assert stats["api_calls"] == 2
         assert stats["status_counts"] == {"SUCCESS": 2}
+        assert Path(stats["journal_path"]).exists()
+        journal_rows = read_jsonl(stats["journal_path"])
+        assert len(journal_rows) == 3
+        assert [row.get("status") for row in journal_rows] == ["", "SUCCESS", "SUCCESS"]
 
         out = pd.read_excel(output_path).fillna("")
         assert out.loc[0, "user.md"] == ""

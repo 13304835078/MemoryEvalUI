@@ -34,7 +34,9 @@ from src.ui.prompt_editor import (
 from src.ui.memory_extraction_job_runner import (
     MemoryExtractionJobConfig,
     list_memory_extraction_job_ids,
+    mark_memory_extraction_job_interrupted,
     memory_extraction_job_is_running,
+    memory_extraction_job_is_stale,
     read_memory_extraction_job_state,
     request_memory_extraction_stop,
     run_memory_extraction_job,
@@ -207,6 +209,8 @@ def ensure_memory_extraction_threads() -> dict[str, threading.Thread]:
 
 def render_memory_extraction_job_state(job_id: str) -> None:
     state = read_memory_extraction_job_state(job_id)
+    if memory_extraction_job_is_stale(state):
+        state = mark_memory_extraction_job_interrupted(job_id)
     if not state:
         st.info("暂无这个记忆提取任务的状态。")
         return
@@ -230,10 +234,15 @@ def render_memory_extraction_job_state(job_id: str) -> None:
             request_memory_extraction_stop(job_id)
             st.warning("已写入终止请求。当前 API 调用返回后会在下一个检查点停止。")
             st.rerun()
+    elif status == "interrupted":
+        st.warning("任务状态为已中断。通常是程序关闭、后台线程退出或长时间没有心跳导致；可以重新启动任务，或使用已生成文件继续后续流程。")
 
     output_path = state.get("output_path", "")
     if output_path:
         st.caption(f"输出 Excel：{output_path}")
+    journal_path = state.get("journal_path", "")
+    if journal_path and Path(journal_path).exists():
+        st.caption(f"增量 journal：{journal_path}")
     if state.get("cases_path"):
         st.caption(f"完整 case：{state.get('cases_path')}")
         st.session_state.cases_file = state.get("cases_path", "")
@@ -256,7 +265,7 @@ def render_memory_extraction_job_state(job_id: str) -> None:
         st.caption("默认只展示 chunk 结果行和关键列；完整原始列可在下方“详细查看提取结果”中展开。")
         render_extraction_dataframe_preview(pd.DataFrame(preview_rows), max_rows=50)
 
-    if status in {"completed", "stopped"} and output_path and Path(output_path).exists():
+    if status in {"completed", "stopped", "interrupted", "failed"} and output_path and Path(output_path).exists():
         st.download_button(
             "下载提取结果 Excel",
             data=Path(output_path).read_bytes(),

@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.ui.config_store import build_eval_config, load_config
-from src.ui.data_service import list_result_files, load_results, save_uploaded_file
+from src.ui.data_service import list_result_files, load_results, load_results_bytes, save_uploaded_file
 from src.ui.prompt_advisor import (
     call_prompt_advisor,
     collect_absolute_eval_evidence,
@@ -20,7 +20,6 @@ from src.ui.prompt_advisor import (
     load_prompt_advisor_table,
 )
 from src.ui.prompt_patch import apply_prompt_patch
-from src.eval.stability import results_from_jsonl_text
 from src.ui.prompt_editor import (
     get_default_extraction_prompt_file,
     get_default_prompt_file,
@@ -57,6 +56,18 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str) -> Non
         "risks": result.get("risks", []),
         "validation_plan": result.get("validation_plan", []),
     })
+    evidence_usage = result.get("evidence_usage") or {}
+    if evidence_usage:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("已选择证据", int(evidence_usage.get("selected_count") or 0))
+        c2.metric("首次实际使用", int(evidence_usage.get("initial_used_count") or 0))
+        c3.metric("请求次数", int(evidence_usage.get("request_count") or 0))
+        if not evidence_usage.get("all_selected_used_initially", False):
+            st.warning("首次请求没有使用全部已选择证据；请展开请求明细查看重试压缩情况。")
+        usage_requests = evidence_usage.get("request_metrics") or []
+        if usage_requests:
+            with st.expander("证据实际使用与请求明细", expanded=False):
+                st.dataframe(pd.DataFrame(usage_requests), use_container_width=True, hide_index=True)
     if result.get("error"):
         st.error(f"生成失败原因：{result.get('error')}")
 
@@ -273,7 +284,7 @@ with tab_absolute:
         "注意：没有人工复核时，这些建议是待人工确认的诊断，不应直接当成正确修复。"
     )
 
-    result_source = st.radio("结果来源", ["历史结果文件", "上传 JSONL"], horizontal=True, key="abs_result_source")
+    result_source = st.radio("结果来源", ["历史结果文件", "上传结果文件"], horizontal=True, key="abs_result_source")
     absolute_results = []
     absolute_source_name = ""
     if result_source == "历史结果文件":
@@ -287,10 +298,15 @@ with tab_absolute:
         else:
             st.warning("data/results 下暂无普通评测结果文件。")
     else:
-        uploaded_results = st.file_uploader("上传普通评测结果 JSONL", type=["jsonl", "txt"], key="abs_upload")
+        uploaded_results = st.file_uploader(
+            "上传普通评测结果",
+            type=["jsonl", "csv", "xlsx"],
+            key="abs_upload",
+            help="支持执行评测 JSONL，以及结果总览导出的 CSV/Excel。",
+        )
         if uploaded_results is not None:
             try:
-                absolute_results = results_from_jsonl_text(uploaded_results.getvalue().decode("utf-8-sig"))
+                absolute_results = load_results_bytes(uploaded_results.getvalue(), uploaded_results.name)
                 absolute_source_name = uploaded_results.name
                 st.success(f"已读取 {len(absolute_results)} 条结果。")
             except Exception as exc:
@@ -320,18 +336,21 @@ with tab_absolute:
         )
         max_items = st.number_input("最多使用证据条数", min_value=1, max_value=200, value=40, step=1, key="abs_max_items")
 
-    absolute_evidence = collect_absolute_eval_evidence(
+    absolute_candidates = collect_absolute_eval_evidence(
         absolute_results,
-        max_items=int(max_items),
+        max_items=max(1, len(absolute_results)),
         score_threshold=float(score_threshold),
         include_all=bool(no_gate_extraction_loop),
     ) if absolute_results else []
+    absolute_evidence = absolute_candidates[:int(max_items)]
 
     if absolute_results:
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("结果总数", len(absolute_results))
-        c2.metric("可用证据", len(absolute_evidence))
-        c3.metric("来源", absolute_source_name or "未命名")
+        c2.metric("符合条件", len(absolute_candidates))
+        c3.metric("本次已选择", len(absolute_evidence))
+        c4.metric("设置上限", int(max_items))
+        st.caption(f"来源：{absolute_source_name or '未命名'}。证据按问题严重程度排序后取前 {int(max_items)} 条。")
 
     if no_gate_extraction_loop:
         st.caption(f"当前会用于生成提取提示词候选的结果上下文：{len(absolute_evidence)} 条")
@@ -394,6 +413,13 @@ with tab_absolute:
                 "candidate_extraction_prompt": "",
                 "risks": ["Mock 结果不能用于真实调参。", "无门槛闭环可能沿着 Judge 偏差自我强化。"],
                 "validation_plan": ["用同一批结果重新跑稳定性对比，并抽样人工复核。"],
+                "evidence_usage": {
+                    "selected_count": len(absolute_evidence),
+                    "initial_used_count": len(absolute_evidence),
+                    "all_selected_used_initially": True,
+                    "request_count": 0,
+                    "request_metrics": [],
+                },
             }
             if no_gate_extraction_loop and absolute_extraction_prompt.strip():
                 result["extraction_prompt_patch"] = {

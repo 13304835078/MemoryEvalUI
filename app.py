@@ -9,6 +9,8 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.build_info import format_build_label, get_build_info
+
 
 st.set_page_config(
     page_title="记忆评测工具",
@@ -17,6 +19,11 @@ st.set_page_config(
 )
 
 st.title("记忆评测工具")
+build_info = get_build_info()
+st.caption(f"版本：{format_build_label(build_info)}")
+
+with st.expander("版本和构建信息", expanded=False):
+    st.json(build_info)
 
 st.markdown(
     """

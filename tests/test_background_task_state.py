@@ -3,7 +3,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from src.loop import closed_loop
-from src.ui import eval_job_runner
+from src.ui import eval_job_runner, memory_extraction_job_runner
 
 
 def _stale_time() -> str:
@@ -73,6 +73,38 @@ def test_loop_is_running_marks_stale_loop_interrupted(tmp_path, monkeypatch):
     assert updated["heartbeat_at"]
     assert updated["events"]
     assert updated["events"][-1]["level"] == "warning"
+
+
+def test_memory_extraction_job_is_running_marks_stale_job_interrupted(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory_extraction_job_runner, "MEMORY_EXTRACTION_JOBS_DIR", tmp_path)
+    path = tmp_path / "memory-1" / "state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "status": "running",
+            "heartbeat_at": _stale_time(),
+            "done": 3,
+            "total": 8,
+            "config": {
+                "extraction_config": {
+                    "timeout": 1,
+                    "max_retries": 1,
+                    "retry_sleep": 1,
+                    "request_interval": 0,
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    assert memory_extraction_job_runner.memory_extraction_job_is_running("memory-1") is False
+
+    updated = memory_extraction_job_runner.read_memory_extraction_job_state("memory-1")
+    assert updated["status"] == "interrupted"
+    assert updated["stage"] == "已中断"
+    assert updated["done"] == 3
+    assert updated["total"] == 8
+    assert updated["finished_at"]
 
 
 def test_closed_loop_state_updates_are_serialized_under_parallel_progress(tmp_path, monkeypatch):

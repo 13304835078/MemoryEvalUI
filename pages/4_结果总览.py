@@ -12,13 +12,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.schema import cases_from_jsonl
 from src.eval.metrics import compute_aggregations, summarize_by_field, TAG_LABELS, DIM_LABELS
-from src.eval.stability import compare_eval_stability, results_from_jsonl_text
+from src.eval.stability import compare_eval_stability
 from src.ui.data_service import (
     RESULTS_DIR,
     eval_result_resume_key,
     list_case_files,
     list_result_files,
     load_results,
+    load_results_bytes,
     merge_cases_results,
     results_to_dataframe,
     dataframe_to_excel_bytes,
@@ -46,6 +47,8 @@ if "results" not in st.session_state:
 
 
 st.sidebar.subheader("加载文件")
+st.sidebar.caption(f"读取目录：{RESULTS_DIR}")
+st.sidebar.caption("自动列表识别该目录第一层的 JSONL、CSV 和 Excel 结果。")
 
 result_files = list_result_files()
 if result_files:
@@ -58,7 +61,25 @@ if result_files:
         st.session_state.results_file = selected_result_path
         st.rerun()
 else:
-    st.sidebar.warning("data/results 下暂无结果文件。")
+    st.sidebar.warning(f"{RESULTS_DIR} 下暂无 JSONL、CSV 或 Excel 结果文件。")
+
+uploaded_result = st.sidebar.file_uploader(
+    "或直接上传结果文件",
+    type=["jsonl", "csv", "xlsx"],
+    key="overview_result_upload",
+    help="支持执行评测的 JSONL，以及结果总览导出的 CSV/Excel。",
+)
+if uploaded_result is not None and st.sidebar.button(
+    "加载上传的结果",
+    use_container_width=True,
+    key="load_overview_result_upload",
+):
+    try:
+        st.session_state.results = load_results_bytes(uploaded_result.getvalue(), uploaded_result.name)
+        st.session_state.results_file = uploaded_result.name
+        st.rerun()
+    except Exception as exc:
+        st.sidebar.error(f"结果文件解析失败：{exc}")
 
 case_files = list_case_files()
 if case_files:
@@ -271,16 +292,24 @@ with st.expander("选择对照结果并生成稳定性报告", expanded=False):
         else:
             st.warning("data/results 下暂无可对照的结果文件。")
     else:
-        uploaded_result = st.file_uploader("上传对照结果 JSONL", type=["jsonl", "txt"])
+        uploaded_result = st.file_uploader(
+            "上传对照结果",
+            type=["jsonl", "csv", "xlsx"],
+            help="支持执行评测 JSONL，以及结果总览导出的 CSV/Excel。",
+        )
         if uploaded_result is not None:
             uploaded_bytes = uploaded_result.getvalue()
             try:
-                baseline_results = results_from_jsonl_text(uploaded_bytes.decode("utf-8-sig"))
+                baseline_results = load_results_bytes(uploaded_bytes, uploaded_result.name)
                 baseline_name = uploaded_result.name
                 st.success(f"已读取 {len(baseline_results)} 条对照结果。")
                 if st.button("保存上传结果到 data/results", use_container_width=True):
                     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-                    saved_name = f"{_safe_upload_name(uploaded_result.name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+                    uploaded_suffix = Path(uploaded_result.name).suffix.lower()
+                    saved_name = (
+                        f"{_safe_upload_name(uploaded_result.name)}_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}{uploaded_suffix}"
+                    )
                     saved_path = RESULTS_DIR / saved_name
                     saved_path.write_bytes(uploaded_bytes)
                     st.success(f"已保存：{saved_path}")

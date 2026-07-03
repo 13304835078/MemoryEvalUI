@@ -20,7 +20,7 @@ from src.extraction.memory_extractor import (
     split_sessions,
 )
 from src.ui.data_service import prepare_cases_from_run_output, save_cases
-from src.ui.state_io import atomic_write_json
+from src.ui.state_io import atomic_write_json, state_file_lock
 
 
 MEMORY_EXTRACTION_JOBS_DIR = EXTRACTION_OUTPUT_DIR / "jobs"
@@ -44,6 +44,15 @@ class MemoryExtractionJobConfig:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def job_dir(job_id: str) -> Path:
@@ -70,8 +79,9 @@ def read_memory_extraction_job_state(job_id: str) -> dict[str, Any]:
 
 def write_memory_extraction_job_state(job_id: str, state: dict[str, Any]) -> None:
     path = state_path(job_id)
-    state["heartbeat_at"] = utc_now()
-    atomic_write_json(path, state)
+    with state_file_lock(path):
+        state["heartbeat_at"] = utc_now()
+        atomic_write_json(path, state)
 
 
 def list_memory_extraction_job_ids() -> list[str]:
@@ -93,7 +103,46 @@ def memory_extraction_stop_requested(job_id: str) -> bool:
 
 
 def memory_extraction_job_is_running(job_id: str) -> bool:
-    return read_memory_extraction_job_state(job_id).get("status") == "running"
+    state = read_memory_extraction_job_state(job_id)
+    if memory_extraction_job_is_stale(state):
+        mark_memory_extraction_job_interrupted(job_id)
+        return False
+    return state.get("status") == "running"
+
+
+def memory_extraction_job_stale_after_seconds(state: dict[str, Any]) -> float:
+    config = state.get("config") or {}
+    extraction_config = config.get("extraction_config") if isinstance(config.get("extraction_config"), dict) else {}
+    timeout = float(extraction_config.get("timeout") or 120)
+    retries = float(extraction_config.get("max_retries") or 2)
+    backoff = float(extraction_config.get("retry_sleep") or 15)
+    interval = float(extraction_config.get("request_interval") or 0)
+    return max(300.0, timeout * 2 + (retries + 1) * max(backoff, 5.0) + interval + 120.0)
+
+
+def memory_extraction_job_is_stale(state: dict[str, Any]) -> bool:
+    if state.get("status") != "running":
+        return False
+    heartbeat = _parse_time(str(state.get("heartbeat_at") or state.get("updated_at") or ""))
+    if heartbeat is None:
+        return False
+    if heartbeat.tzinfo is None:
+        heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+    elapsed = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+    return elapsed > memory_extraction_job_stale_after_seconds(state)
+
+
+def mark_memory_extraction_job_interrupted(job_id: str) -> dict[str, Any]:
+    state = read_memory_extraction_job_state(job_id)
+    if not state or state.get("status") != "running":
+        return state
+    state["status"] = "interrupted"
+    state["stage"] = "已中断"
+    state["message"] = "后台记忆提取任务可能已中断：长时间没有心跳。可以重新启动任务，或使用已生成的中间文件继续后续流程。"
+    state["finished_at"] = utc_now()
+    state["updated_at"] = utc_now()
+    write_memory_extraction_job_state(job_id, state)
+    return state
 
 
 def _safe_config(config: MemoryExtractionJobConfig) -> dict[str, Any]:
@@ -125,6 +174,7 @@ def _write_state(
         "message": message,
         "input_path": config.input_path,
         "output_path": config.output_path,
+        "journal_path": str(Path(config.output_path).with_suffix(".journal.jsonl")),
         "started_at": started_at,
         "updated_at": utc_now(),
         "config": _safe_config(config),

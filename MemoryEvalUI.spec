@@ -30,6 +30,7 @@ datas = [
 # local tokens, uploaded Excel files, or evaluation results to collaborators.
 add_data_if_exists("config/.gitkeep", "config")
 add_data_if_exists("config/local_config.example.json", "config")
+add_data_if_exists(".tmp/build_info.json", ".")
 add_data_if_exists("data/cases/.gitkeep", "data/cases")
 add_data_if_exists("data/raw/uploads/.gitkeep", "data/raw/uploads")
 add_data_if_exists("data/results/.gitkeep", "data/results")

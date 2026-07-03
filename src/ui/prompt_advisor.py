@@ -11,7 +11,14 @@ import pandas as pd
 import requests
 
 from src.eval.judge_client import RealJudgeClient
+from src.llm_api import retry_wait_seconds
 from src.schema import EvalConfig, EvalResult
+from src.ui.prompt_advisor_prompts import (
+    ABSOLUTE_ADVISOR_SYSTEM_PROMPT,
+    EXTRACTION_INTENT_SYSTEM_PROMPT,
+    EXTRACTION_PATCH_SYSTEM_PROMPT,
+    GSB_ADVISOR_SYSTEM_PROMPT,
+)
 from src.ui.prompt_patch import PromptSection, apply_prompt_patch, prompt_sections_for_model, split_prompt_sections
 
 
@@ -21,72 +28,12 @@ MAX_ADVISOR_REPLACE_TEXT_CHARS = 700
 MAX_ADVISOR_TOTAL_PATCH_TEXT_CHARS = 900
 ADVISOR_PATCH_MAX_CHANGE_RATIO = 0.06
 ADVISOR_PATCH_MIN_CHANGE_CHARS = 400
-ADVISOR_STAGE1_BATCH_SIZE = 4
+ADVISOR_STAGE1_BATCH_SIZE = 2
 ADVISOR_STAGE1_MAX_TOKENS = 1200
 ADVISOR_STAGE2_MAX_TOKENS = 1000
 ADVISOR_SECTION_BLOCK_CHARS = 2400
 ADVISOR_SECTION_BLOCK_PREVIEW_CHARS = 180
 ADVISOR_MAX_EDITABLE_BLOCKS = 2
-
-
-ABSOLUTE_ADVISOR_SYSTEM_PROMPT = """你是一个 USER.md 绝对评测诊断助手。你的任务是根据单模型评测结果，诊断当前评测链路、Judge Prompt 和提取 Prompt 中可能需要澄清的部分。
-
-硬性约束：
-1. 只能基于用户提供的评测结果证据提出建议，不允许凭空猜测。
-2. 每条建议必须引用 evidence 中的 case_id。
-3. 不要把 Judge 的结论当作人工真值；没有人工复核时，必须把建议标注为“待人工确认”。
-4. 必须区分三类问题：模型输出本身的问题、Judge Prompt 口径不清的问题、提取 Prompt 规则边界不清的问题。
-5. 不要为了提高分数而放宽质量标准；建议应服务于稳定性、可解释性和规则一致性。
-6. 不要自动覆盖原 prompt，只输出候选文本和修改理由。
-7. 修改提取 Prompt 时默认输出 extraction_prompt_patch，不要完整重写；patch 必须引用提供的 section_id 和 evidence_refs。
-8. 如果没有原始提取 prompt，只能给 extraction_prompt_notes 或片段建议，不能编造完整提取 prompt。
-9. 如果用户开启了无门槛实验模式，必须在 risks 中明确说明：这不是人工确认的改进，可能沿着 Judge 偏差自我强化；候选提取 prompt 只能作为下一轮实验版本。
-10. 提取 Prompt 修改必须是通用规则澄清，不要针对某个具体 case 写专门补丁；不要重复、冗余、堆砌示例。
-
-严格输出 JSON，不要输出 Markdown 代码块。
-输出尽量短：修改提取 Prompt 时只输出 extraction_prompt_patch，不要输出完整提取 Prompt。"""
-
-
-EXTRACTION_INTENT_SYSTEM_PROMPT = """你是提示词改进的第一阶段定位器。你的任务不是改写 prompt，而是根据评测证据定位可能需要澄清的提取 Prompt 章节。
-
-硬性约束：
-1. 只输出 JSON，不要 Markdown。
-2. 不生成最终 patch，不输出完整 prompt。
-3. patch_intents 中的 section_id 必须来自 prompt_global_outline。
-4. 每个 intent 必须引用 evidence 中真实存在的 case_id/row_id。
-5. 没有足够证据时 patch_intents 输出空数组，并在 risks 中说明原因。
-6. 如果只是 Judge 误判或样本证据不足，不要强行要求修改提取 Prompt。
-7. intent 必须抽象成问题类型和规则边界，不要按单个 case 生成细碎修改。"""
-
-
-EXTRACTION_PATCH_SYSTEM_PROMPT = """你是提示词改进的第二阶段章节编辑器。你的任务是基于目标章节全文和同组证据，生成一个小而精确的增量 patch。
-
-硬性约束：
-1. 只输出 JSON，不要 Markdown。
-2. 只能修改 target_section_blocks 指定的章节；替换原文时只能使用 editable_blocks 中提供的完整逻辑块。
-3. 不输出完整 prompt；candidate_extraction_prompt 必须留空。
-4. 优先 append_to_section；只有 old_text 能从章节全文中精确复制时才用 replace_within_section。
-5. 同一章节的相似修改必须合并成一条规则，不能按 case 重复追加。
-6. 每条 edit 必须包含 evidence_refs，且引用本请求 evidence 中真实存在的 case_id/row_id。
-7. 不删除原有核心约束；不为了提高分数放宽质量标准。
-8. 生成通用规则，不要写“针对 case_xxx”这种专门补丁；不要把证据里的具体人名、剧名、地点照搬进新规则。
-9. 每条新增规则尽量 1-3 行，总字数保持精简；如果现有规则已经能覆盖，输出空 edits 并说明无需修改。"""
-
-
-GSB_ADVISOR_SYSTEM_PROMPT = """你是一个评测 Prompt 诊断助手。你的任务是根据人工 GSB 标注/人工复核证据，提出如何修改 Judge Prompt 或提取 Prompt。
-
-硬性约束：
-1. 只能基于用户提供的人工证据提出建议，不允许凭空猜测。
-2. 每条建议必须引用 evidence 中的 row_id/case_id/pair_id。
-3. 如果证据不足，请明确输出 can_suggest=false，不要生成候选 prompt。
-4. 不要为了提高一致率而迎合明显错误的人工标签；如果人工标注可能有歧义，要在 risks 中说明。
-5. 不要自动覆盖原 prompt，只输出候选文本和修改理由。
-6. 修改提取 Prompt 时默认输出 extraction_prompt_patch，不要完整重写；patch 必须引用提供的 section_id 和 evidence_refs。
-7. 如果没有原始提取 prompt，只能给 extraction_prompt_notes 或 extraction_prompt_patch，不能编造完整提取 prompt。
-8. 修改必须是通用口径澄清，不要针对单个 case 写过细补丁；不要让 prompt 体积明显膨胀。
-
-严格输出 JSON，不要输出 Markdown 代码块。
-输出尽量短：修改提取 Prompt 时只输出 extraction_prompt_patch，不要输出完整提取 Prompt。"""
 
 
 def load_prompt_advisor_table(path: str | Path) -> pd.DataFrame:
@@ -423,12 +370,11 @@ def _compact_extraction_advisor_evidence(
 
 
 def _advisor_retry_wait_seconds(config: EvalConfig, last_error: str, attempt: int) -> float:
-    client = RealJudgeClient(config)
-    if RealJudgeClient._is_rate_limit_error(last_error):
-        return client._get_rate_limit_backoff(last_error)
-    if RealJudgeClient._is_retryable_transient_error(last_error):
-        return max(float(getattr(config, "judge_qps_backoff", 12.0) or 12.0), float(2 ** attempt))
-    return float(2 ** attempt)
+    return retry_wait_seconds(
+        last_error,
+        attempt,
+        float(getattr(config, "judge_qps_backoff", 12.0) or 12.0),
+    )
 
 
 def _advisor_attempt_profile(
@@ -442,7 +388,7 @@ def _advisor_attempt_profile(
     floor = max(1, int(min_evidence or 0))
 
     if attempt <= 1:
-        cap = 12 if is_extraction_target else 20
+        cap = max(floor, evidence_count)
         profile = {
             "max_items": cap,
             "text_limit": 420,
@@ -483,6 +429,22 @@ def _advisor_attempt_profile(
 
     profile["max_items"] = min(evidence_count, max(floor, profile["max_items"]))
     return profile
+
+
+def _evidence_usage(
+    selected_count: int,
+    used_count: int,
+    *,
+    request_metrics: list[dict[str, Any]] | None = None,
+    attempts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "selected_count": int(selected_count),
+        "initial_used_count": int(used_count),
+        "all_selected_used_initially": int(selected_count) == int(used_count),
+        "request_count": len(request_metrics or attempts or []),
+        "request_metrics": request_metrics or attempts or [],
+    }
 
 
 def _advisor_max_tokens(config: EvalConfig, profile: dict[str, int]) -> int:
@@ -572,7 +534,8 @@ def _call_advisor_json(
             "max_tokens": attempt_max_tokens,
             "temperature": 0.0,
             "top_p": 1.0,
-            "stream": False,
+            "stream": True,
+            "stream_options": {"include_usage": False},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": attempt_message},
@@ -590,6 +553,16 @@ def _call_advisor_json(
                 timeout=config.judge_timeout,
             )
             raw_text = response.text
+            if hasattr(response, "iter_lines"):
+                response.raise_for_status()
+                content, stream_error = client._extract_stream_content(response)
+                parsed = RealJudgeClient._parse_json_response(content)
+                if isinstance(parsed, dict):
+                    return parsed, content or raw_text, stream_error
+                last_error = stream_error or f"提示词建议流式输出不是可解析 JSON: {content[:1000]}"
+                if attempt < max_attempts:
+                    time.sleep(_advisor_retry_wait_seconds(config, last_error, attempt))
+                continue
             try:
                 data = response.json()
             except Exception:
@@ -1378,10 +1351,46 @@ def _call_two_stage_extraction_advisor(
     request_metrics: list[dict[str, Any]] = []
     stage1_results: list[dict[str, Any]] = []
     stage1_errors: list[dict[str, Any]] = []
+    prelocalized_intents = _local_patch_intents_from_evidence(stage1_evidence, sections, max_intents=12)
+    prelocalized_refs = {
+        ref
+        for intent in prelocalized_intents
+        for ref in (intent.get("evidence_refs") or [])
+    }
+    unresolved_evidence = [
+        item for item in stage1_evidence
+        if _evidence_ref_id(item) not in prelocalized_refs
+    ]
+    if prelocalized_intents:
+        stage1_results.append({
+            "can_suggest": True,
+            "evidence_summary": f"系统根据 rule_refs 在本地定位了 {len(prelocalized_refs)} 条证据，无需让模型重复定位这些章节。",
+            "diagnoses": [],
+            "judge_prompt_changes": [],
+            "candidate_judge_prompt": "",
+            "candidate_extraction_prompt": "",
+            "extraction_prompt_notes": "已优先使用评测结果中的规则引用做确定性章节定位。",
+            "patch_intents": prelocalized_intents,
+            "risks": [],
+            "validation_plan": [],
+        })
+        raw_payload["stage1_raw"].append({
+            "mode": "local_rule_ref_localization",
+            "evidence_refs": sorted(prelocalized_refs),
+            "intent_count": len(prelocalized_intents),
+        })
+        request_metrics.append({
+            "stage": "1_本地规则定位",
+            "unit": "local",
+            "request_chars": 0,
+            "evidence_count": len(prelocalized_refs),
+            "success": True,
+            "error": "",
+        })
     stage1_batches = [
-        stage1_evidence[index:index + ADVISOR_STAGE1_BATCH_SIZE]
-        for index in range(0, len(stage1_evidence), ADVISOR_STAGE1_BATCH_SIZE)
-    ] or [[]]
+        unresolved_evidence[index:index + ADVISOR_STAGE1_BATCH_SIZE]
+        for index in range(0, len(unresolved_evidence), ADVISOR_STAGE1_BATCH_SIZE)
+    ]
     for batch_index, batch in enumerate(stage1_batches, 1):
         if batch_index > 1:
             interval = float(getattr(config, "judge_request_interval", 0.0) or 0.0)
@@ -1395,7 +1404,7 @@ def _call_two_stage_extraction_advisor(
             target=target,
             retry_note=f"分批定位第 {batch_index}/{len(stage1_batches)} 批：只定位问题簇和目标章节，不生成最终 patch。",
             max_sections=min(120, max(len(sections), 1)),
-            section_preview_chars=100,
+            section_preview_chars=60,
             judge_prompt_limit=0 if target == "extraction_prompt" else 1200,
         )
         batch_result, batch_raw, batch_error = _call_advisor_json(
@@ -1449,6 +1458,11 @@ def _call_two_stage_extraction_advisor(
             "error": "；".join(item.get("error", "") for item in stage1_errors) or "第1阶段定位失败。",
             "extraction_prompt_request_metrics": request_metrics,
             "extraction_prompt_stage_errors": stage1_errors,
+            "evidence_usage": _evidence_usage(
+                len(evidence),
+                len(stage1_evidence),
+                request_metrics=request_metrics,
+            ),
         }, json.dumps(raw_payload, ensure_ascii=False, indent=2)
 
     base_result: dict[str, Any] = {
@@ -1581,6 +1595,11 @@ def _call_two_stage_extraction_advisor(
     base_result["extraction_prompt_patch_conflicts"] = merged.get("conflicts") or []
     base_result["extraction_prompt_patch_skipped_before_apply"] = (merged.get("skipped") or []) + (plan.get("skipped_intents") or [])
     base_result["extraction_prompt_stage_errors"] = stage_errors
+    base_result["evidence_usage"] = _evidence_usage(
+        len(evidence),
+        len(stage1_evidence),
+        request_metrics=request_metrics,
+    )
     base_result["extraction_prompt_patch"] = {
         "mode": "incremental_patch",
         "edits": merged.get("edits") or [],
@@ -1622,6 +1641,7 @@ def call_prompt_advisor(
             "candidate_extraction_prompt": "",
             "risks": ["证据不足"],
             "validation_plan": plan,
+            "evidence_usage": _evidence_usage(len(evidence), 0),
         }, ""
 
     if config.mock:
@@ -1653,6 +1673,7 @@ def call_prompt_advisor(
             "candidate_extraction_prompt": "",
             "risks": ["模拟模式结果不可用于真实闭环"],
             "validation_plan": ["关闭模拟模式后重新生成建议"],
+            "evidence_usage": _evidence_usage(len(evidence), len(evidence)),
         }
         mock_result = _finalize_advisor_result(mock_result, extraction_prompt=extraction_prompt, target=target)
         return mock_result, json.dumps(mock_result, ensure_ascii=False)
@@ -1677,6 +1698,7 @@ def call_prompt_advisor(
 
     last_error = ""
     used_compact_retry = False
+    attempt_metrics: list[dict[str, Any]] = []
 
     max_attempts = max(1, int(config.judge_max_retries or 1))
     for attempt in range(1, max_attempts + 1):
@@ -1732,6 +1754,13 @@ def call_prompt_advisor(
                 "skip_special_tokens": False,
             },
         }
+        attempt_metric = {
+            "attempt": attempt,
+            "evidence_count": len(attempt_evidence),
+            "request_chars": len(user_message) + len(system_prompt),
+            "success": False,
+            "error": "",
+        }
         try:
             response = requests.post(
                 url,
@@ -1757,6 +1786,13 @@ def call_prompt_advisor(
                     parsed = RealJudgeClient._parse_json_response(content)
                     if isinstance(parsed, dict):
                         parsed = _finalize_advisor_result(parsed, extraction_prompt=extraction_prompt, target=target)
+                        attempt_metric["success"] = True
+                        attempt_metrics.append(attempt_metric)
+                        parsed["evidence_usage"] = _evidence_usage(
+                            len(evidence),
+                            attempt_metrics[0]["evidence_count"],
+                            attempts=attempt_metrics,
+                        )
                         return parsed, content or raw_text
                     last_error = f"提示词建议输出不是可解析 JSON: {content[:1000]}"
 
@@ -1767,6 +1803,8 @@ def call_prompt_advisor(
         except Exception as exc:
             last_error = f"未知错误 ({attempt}/{max_attempts}): {exc}"
 
+        attempt_metric["error"] = last_error
+        attempt_metrics.append(attempt_metric)
         if attempt < max_attempts:
             time.sleep(_advisor_retry_wait_seconds(config, last_error, attempt))
 
@@ -1786,6 +1824,11 @@ def call_prompt_advisor(
         ],
         "error": last_error,
         "used_compact_retry": used_compact_retry,
+        "evidence_usage": _evidence_usage(
+            len(evidence),
+            attempt_metrics[0]["evidence_count"] if attempt_metrics else 0,
+            attempts=attempt_metrics,
+        ),
     }, last_error
 
 

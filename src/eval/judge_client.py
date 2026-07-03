@@ -5,17 +5,29 @@ import random
 import requests
 from typing import Any, Callable, Optional
 
+from ..llm_api import (
+    ChatPayloadOptions,
+    build_auth_header,
+    build_chat_payload,
+    build_headers,
+    is_api_error,
+    is_rate_limit_error,
+    is_retryable_transient_error,
+    LLMChatClient,
+    normalize_chat_completions_url,
+    parse_qps_limit,
+    rate_limit_backoff,
+)
 from ..schema import EvalConfig
-
-JUDGE_RESULT_SCHEMA = {
-    "required_fields": ["score_total", "scores", "comment", "error_tags", "fatal_error"],
-    "dimension_keys": ["correctness", "coverage", "update_logic", "memory_boundary", "conciseness", "format"],
-    "valid_tags": {
-        "hallucination", "wrong_fact", "missing_key_info", "over_memory",
-        "short_term_pollution", "conflict_not_resolved", "duplicate_memory",
-        "verbose_or_noisy", "format_error", "privacy_sensitive", "unclear_update",
-    },
-}
+from .judge_validation import (
+    JUDGE_RESULT_SCHEMA,
+    extract_extraction_prompt,
+    is_number,
+    is_valid_judge_result,
+    parse_json_object,
+    reference_exists_in_prompt,
+    validate_string_list,
+)
 
 
 class JudgeClient:
@@ -30,155 +42,92 @@ class JudgeClient:
 class RealJudgeClient(JudgeClient):
     """通过 OpenAI-compatible API 调用 LLM Judge"""
 
+    def __init__(self, config: EvalConfig):
+        super().__init__(config)
+        self.chat_client = LLMChatClient(
+            config.judge_api_base_url,
+            getattr(config, "judge_api_bearer_token", ""),
+            timeout=getattr(config, "judge_timeout", 120),
+        )
+
     @staticmethod
     def _normalize_chat_completions_url(url: str) -> str:
-        url = (url or "").strip().rstrip("/")
-        if not url:
-            return url
-        if url.endswith("/chat/completions"):
-            return url
-        return url + "/chat/completions"
+        return normalize_chat_completions_url(url)
 
     @staticmethod
     def _build_auth_header(token: str) -> str:
-        token = (token or "").strip()
-        if not token:
-            return ""
-        if token.lower().startswith("bearer "):
-            return token
-        return f"Bearer {token}"
+        return build_auth_header(token)
 
     @staticmethod
     def _parse_json_object(text: str, field_name: str) -> dict:
-        if not text:
-            return {}
-        try:
-            value = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{field_name} 不是合法 JSON object: {exc}") from exc
-        if not isinstance(value, dict):
-            raise ValueError(f"{field_name} 必须是 JSON object")
-        return value
+        return parse_json_object(text, field_name)
 
     def _build_headers(self) -> dict:
-        headers = {"Content-Type": "application/json"}
-        token = getattr(self.config, "judge_api_bearer_token", "")
-        if token:
-            headers["Authorization"] = self._build_auth_header(token)
-        return headers
+        return build_headers(getattr(self.config, "judge_api_bearer_token", ""))
 
     def _build_payload(self, system_prompt: str, user_message: str) -> dict:
-        payload = {
-            "model": self.config.judge_model,
-            "max_tokens": self.config.judge_max_tokens,
-            "temperature": float(getattr(self.config, "judge_temperature", 0.0) or 0.0),
-            "top_p": float(getattr(self.config, "judge_top_p", 1.0) or 1.0),
-            "stream": False,
-            "messages": [
+        return build_chat_payload(
+            [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-        }
-
-        top_k = getattr(self.config, "judge_top_k", None)
-        if top_k not in (None, ""):
-            payload["top_k"] = int(top_k)
-
-        extra_body = {
-            "skip_special_tokens": False,
-        }
-        if getattr(self.config, "judge_send_enable_thinking", True):
-            extra_body["enable_thinking"] = bool(getattr(self.config, "judge_enable_thinking", False))
-        payload["extra_body"] = extra_body
-
-        return payload
+            ChatPayloadOptions(
+                model=self.config.judge_model,
+                max_tokens=self.config.judge_max_tokens,
+                temperature=float(getattr(self.config, "judge_temperature", 0.0) or 0.0),
+                top_p=float(getattr(self.config, "judge_top_p", 1.0) or 1.0),
+                top_k=getattr(self.config, "judge_top_k", None),
+                stream=False,
+                enable_thinking=bool(getattr(self.config, "judge_enable_thinking", False)),
+                send_enable_thinking=bool(getattr(self.config, "judge_send_enable_thinking", True)),
+                skip_special_tokens=False,
+            ),
+        )
 
     @staticmethod
     def _is_api_error(data: dict) -> tuple[bool, str]:
         """判断 API 是否返回了错误 JSON。"""
-        if not isinstance(data, dict):
-            return False, ""
-
-        if "error" in data:
-            err = data.get("error")
-            if isinstance(err, dict):
-                msg = err.get("message") or err.get("msg") or str(err)
-            else:
-                msg = str(err)
-            return True, msg
-
-        # 兼容一些内部服务可能用 code/msg 表示错误
-        code = data.get("code")
-        if code not in (None, 0, "0", "success", "SUCCESS"):
-            msg = data.get("message") or data.get("msg") or str(data)
-            return True, msg
-
-        return False, ""
+        return is_api_error(data)
 
     @staticmethod
-    def _is_valid_judge_result(data: dict) -> tuple[bool, str]:
-        """判断返回的 JSON 是否真的是 Judge 评分结果。"""
-        if not isinstance(data, dict):
-            return False, "返回不是 JSON object"
+    def _is_number(value: Any) -> bool:
+        return is_number(value)
 
-        required = ["score_total", "scores", "comment", "error_tags", "fatal_error"]
-        missing = [k for k in required if k not in data]
-        if missing:
-            return False, f"Judge JSON 缺少字段: {missing}"
+    @classmethod
+    def _validate_string_list(cls, value: Any, field_name: str) -> str:
+        return validate_string_list(value, field_name)
 
-        if not isinstance(data.get("scores"), dict):
-            return False, "scores 不是 dict"
+    @classmethod
+    def _is_valid_judge_result(
+        cls,
+        data: dict,
+        *,
+        require_references: bool = False,
+        extraction_prompt_text: str = "",
+    ) -> tuple[bool, str]:
+        return is_valid_judge_result(
+            data,
+            require_references=require_references,
+            extraction_prompt_text=extraction_prompt_text,
+        )
 
-        return True, ""
+    @staticmethod
+    def _reference_exists_in_prompt(reference: str, prompt_text: str) -> bool:
+        return reference_exists_in_prompt(reference, prompt_text)
+
+    @staticmethod
+    def _extract_extraction_prompt(user_message: str) -> str:
+        return extract_extraction_prompt(user_message)
 
     def judge(self, system_prompt: str, user_message: str) -> tuple[Optional[dict], Optional[str]]:
-        url = self._normalize_chat_completions_url(self.config.judge_api_base_url)
-        payload = json.dumps(self._build_payload(system_prompt, user_message), ensure_ascii=False)
-        headers = self._build_headers()
+        payload = self._build_payload(system_prompt, user_message)
 
         last_error = None
 
         for attempt in range(1, self.config.judge_max_retries + 1):
             try:
-                response = requests.post(
-                    url,
-                    headers=headers,
-                    data=payload.encode("utf-8"),
-                    timeout=self.config.judge_timeout,
-                    stream=False,
-                )
-
-                raw_text = response.text
-
-                # 有些内部服务即使鉴权失败也可能返回 200，所以不能只靠 status_code
-                try:
-                    data = response.json()
-                except Exception:
-                    response.raise_for_status()
-                    last_error = f"响应不是 JSON: {raw_text[:500]}"
-                    if attempt < self.config.judge_max_retries:
-                        time.sleep(2 ** attempt)
-                        continue
-                    return None, last_error
-
-                is_err, err_msg = self._is_api_error(data)
-                if is_err:
-                    last_error = f"API error: {err_msg}. raw={raw_text[:1000]}"
-
-                    if attempt < self.config.judge_max_retries:
-                        if self._is_rate_limit_error(err_msg):
-                            time.sleep(self._get_rate_limit_backoff(err_msg))
-                            if self.rate_limit_wait_callback is not None:
-                                self.rate_limit_wait_callback()
-                        elif self._is_retryable_transient_error(err_msg):
-                            time.sleep(max(float(getattr(self.config, "judge_qps_backoff", 12.0) or 12.0), 2 ** attempt))
-                        else:
-                            time.sleep(2 ** attempt)
-                        continue
-
-                    return None, last_error
-
-                response.raise_for_status()
+                completion = self.chat_client.post_json(payload, stream=False)
+                data = completion.data
 
                 content = self._extract_content(data)
                 parsed = self._parse_json_response(content)
@@ -187,11 +136,31 @@ class RealJudgeClient(JudgeClient):
                     last_error = f"Judge 输出不是可解析 JSON: {content[:1000]}"
                 else:
                     parsed = self._normalize_judge_result(parsed)
-                    valid, reason = self._is_valid_judge_result(parsed)
+                    extraction_prompt_text = self._extract_extraction_prompt(user_message)
+                    valid, reason = self._is_valid_judge_result(
+                        parsed,
+                        require_references=bool(extraction_prompt_text),
+                        extraction_prompt_text=extraction_prompt_text,
+                    )
                     if valid:
                         return parsed, content
                     last_error = f"Judge JSON 不符合评分格式: {reason}. raw={content[:1000]}"
 
+            except RuntimeError as e:
+                last_error = str(e)
+                if attempt < self.config.judge_max_retries:
+                    if self._is_rate_limit_error(last_error):
+                        time.sleep(self._get_rate_limit_backoff(last_error))
+                        if self.rate_limit_wait_callback is not None:
+                            self.rate_limit_wait_callback()
+                    elif self._is_retryable_transient_error(last_error):
+                        time.sleep(max(float(getattr(self.config, "judge_qps_backoff", 12.0) or 12.0), 2 ** attempt))
+                    else:
+                        time.sleep(2 ** attempt)
+                    continue
+                return None, last_error
+            except ValueError as e:
+                last_error = str(e)
             except requests.exceptions.Timeout:
                 last_error = f"请求超时 ({attempt}/{self.config.judge_max_retries})"
             except requests.exceptions.RequestException as e:
@@ -361,15 +330,10 @@ class RealJudgeClient(JudgeClient):
         }
         normalized_scores = {}
         for dim, aliases in score_aliases.items():
-            value = None
             for alias in aliases:
                 if isinstance(scores, dict) and alias in scores:
-                    value = scores.get(alias)
+                    normalized_scores[dim] = scores.get(alias)
                     break
-            try:
-                normalized_scores[dim] = float(value)
-            except (TypeError, ValueError):
-                normalized_scores[dim] = 0.0
         normalized["scores"] = normalized_scores
 
         if "comment" not in normalized:
@@ -411,56 +375,23 @@ class RealJudgeClient(JudgeClient):
                     normalized[target] = normalized.get(alias)
                     break
 
-        normalized.setdefault("comment", "")
-        normalized.setdefault("error_tags", [])
-        normalized.setdefault("fatal_error", False)
         return normalized
 
     @staticmethod
     def _is_rate_limit_error(message: str) -> bool:
-        msg = (message or "").lower()
-        return (
-            "qps limit" in msg
-            or "rate limit" in msg
-            or "too many requests" in msg
-            or "429" in msg
-        )
+        return is_rate_limit_error(message)
 
     @staticmethod
     def _is_retryable_transient_error(message: str) -> bool:
-        msg = (message or "").lower()
-        return (
-            "idle timeout" in msg
-            or "connection idle" in msg
-            or "websocket" in msg
-            or "going away" in msg
-            or "connection reset" in msg
-            or "temporarily unavailable" in msg
-            or "bad gateway" in msg
-            or "gateway timeout" in msg
-            or " 502" in msg
-            or " 503" in msg
-            or " 504" in msg
-        )
+        return is_retryable_transient_error(message)
 
     @staticmethod
     def _parse_qps_limit(message: str) -> float | None:
-        match = re.search(r"limit\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", message or "", flags=re.IGNORECASE)
-        if not match:
-            return None
-        try:
-            value = float(match.group(1))
-        except ValueError:
-            return None
-        return value if value > 0 else None
+        return parse_qps_limit(message)
 
     def _get_rate_limit_backoff(self, message: str = "") -> float:
         configured = float(getattr(self.config, "judge_qps_backoff", 12.0) or 12.0)
-        qps_limit = self._parse_qps_limit(message)
-        if not qps_limit:
-            return configured
-        # Example: "QPS limit exceeded, limit:0.10" means one request per 10 seconds.
-        return max(configured, (1.0 / qps_limit) + 1.0)
+        return rate_limit_backoff(message, configured)
 
 
 class MockJudgeClient(JudgeClient):

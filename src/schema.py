@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 import json
 import os
 
+from .persistence import append_jsonl, atomic_write_jsonl, read_jsonl
+
 
 class TaskType(str, Enum):
     RAW_DIALOGUE = "raw_dialogue"
@@ -61,20 +63,11 @@ class Case:
 
 
 def cases_to_jsonl(cases: list[Case], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for case in cases:
-            f.write(json.dumps(case.to_dict(), ensure_ascii=False) + "\n")
+    atomic_write_jsonl(path, (case.to_dict() for case in cases))
 
 
 def cases_from_jsonl(path: str) -> list[Case]:
-    cases = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            cases.append(Case.from_dict(json.loads(line)))
-    return cases
+    return [Case.from_dict(row) for row in read_jsonl(path)]
 
 
 def validate_case(case: Case) -> list[str]:
@@ -273,18 +266,24 @@ class EvalResult:
 
 
 def results_to_jsonl(results: list[EvalResult], path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for r in results:
-            f.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
+    atomic_write_jsonl(path, (result.to_dict() for result in results))
+
+
+def append_result_to_jsonl(result: EvalResult, path: str) -> None:
+    append_jsonl(path, result.to_dict())
 
 
 def results_from_jsonl(path: str) -> list[EvalResult]:
-    results = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            results.append(EvalResult.from_dict(json.loads(line)))
-    return results
+    results_by_key: dict[tuple[str, str, str, str, str, str], EvalResult] = {}
+    for row in read_jsonl(path):
+        result = EvalResult.from_dict(row)
+        key = (
+            result.case_id,
+            result.model_name or "unknown",
+            result.prompt_version or "unknown",
+            result.judge_model or "",
+            result.judge_prompt_version or "",
+            result.extraction_prompt_hash or "",
+        )
+        results_by_key[key] = result
+    return list(results_by_key.values())

@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime
 from pathlib import Path
 
+from src import runtime_paths
+from src.persistence import atomic_write_text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PROMPTS_DIR = PROJECT_ROOT / "prompts" / "judge"
-GENERATION_PROMPTS_DIR = PROJECT_ROOT / "prompts" / "generation"
-RULES_DIR = PROJECT_ROOT / "rules"
+USER_PROMPTS_ROOT = runtime_paths.PROMPTS_DIR
+BUNDLED_PROMPTS_ROOT = runtime_paths.BUNDLED_PROMPTS_DIR
+PROMPTS_DIR = USER_PROMPTS_ROOT / "judge"
+GENERATION_PROMPTS_DIR = USER_PROMPTS_ROOT / "generation"
+BUNDLED_JUDGE_PROMPTS_DIR = BUNDLED_PROMPTS_ROOT / "judge"
+BUNDLED_GENERATION_PROMPTS_DIR = BUNDLED_PROMPTS_ROOT / "generation"
+RULES_DIR = runtime_paths.BUNDLED_ROOT / "rules"
 
 
 TASK_PROMPT_DEFAULTS = {
@@ -34,13 +41,11 @@ TASK_RUBRIC_DEFAULTS = {
 
 
 def list_prompt_files() -> list[str]:
-    PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-    return sorted([p.name for p in PROMPTS_DIR.glob("*.md")])
+    return _list_prompt_files(PROMPTS_DIR, BUNDLED_JUDGE_PROMPTS_DIR)
 
 
 def list_extraction_prompt_files() -> list[str]:
-    GENERATION_PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-    return sorted([p.name for p in GENERATION_PROMPTS_DIR.glob("*.md")])
+    return _list_prompt_files(GENERATION_PROMPTS_DIR, BUNDLED_GENERATION_PROMPTS_DIR)
 
 
 def get_default_prompt_file(task_type: str) -> str:
@@ -69,12 +74,11 @@ def load_prompt(prompt_file: str, prompt_kind: str = "judge") -> str:
     if not prompt_file:
         return ""
 
-    path = get_extraction_prompt_path(prompt_file) if prompt_kind == "extraction" else get_prompt_path(prompt_file)
+    path = _resolve_prompt_path(prompt_file, prompt_kind)
     if not path.exists():
         return ""
 
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+    return path.read_text(encoding="utf-8")
 
 
 def save_prompt_version(task_type: str, content: str, version_name: str = "", prompt_kind: str = "judge") -> str:
@@ -90,9 +94,10 @@ def save_prompt_version(task_type: str, content: str, version_name: str = "", pr
     if not version_name.endswith(".md"):
         version_name += ".md"
 
+    version_name = Path(version_name).name
     path = target_dir / version_name
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    atomic_write_text(path, content, encoding="utf-8")
+    _write_prompt_metadata(path, task_type, prompt_kind, content)
 
     return version_name
 
@@ -120,3 +125,46 @@ def load_rubric(task_type: str) -> str:
 
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def _list_prompt_files(user_dir: Path, bundled_dir: Path) -> list[str]:
+    user_dir.mkdir(parents=True, exist_ok=True)
+    names: set[str] = set()
+    if bundled_dir.exists():
+        names.update(p.name for p in bundled_dir.glob("*.md"))
+    names.update(p.name for p in user_dir.glob("*.md"))
+    return sorted(names)
+
+
+def _resolve_prompt_path(prompt_file: str, prompt_kind: str) -> Path:
+    requested = Path(prompt_file)
+    if requested.is_absolute():
+        return requested
+
+    if prompt_kind == "extraction":
+        user_path = GENERATION_PROMPTS_DIR / prompt_file
+        bundled_path = BUNDLED_GENERATION_PROMPTS_DIR / prompt_file
+    else:
+        user_path = PROMPTS_DIR / prompt_file
+        bundled_path = BUNDLED_JUDGE_PROMPTS_DIR / prompt_file
+
+    if user_path.exists():
+        return user_path
+    return bundled_path
+
+
+def _write_prompt_metadata(path: Path, task_type: str, prompt_kind: str, content: str) -> None:
+    metadata = {
+        "filename": path.name,
+        "task_type": task_type,
+        "prompt_kind": prompt_kind,
+        "sha1": prompt_text_hash(content),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "storage": "user_prompt_dir",
+    }
+    metadata_path = path.with_name(f"{path.name}.meta.json")
+    atomic_write_text(
+        metadata_path,
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )

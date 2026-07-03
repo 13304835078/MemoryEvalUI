@@ -10,7 +10,8 @@
 4. 同类问题同等扣分，不因表达方式、样本顺序、模型名称或主观印象改变尺度。
 5. 没有明确证据时不重扣分；没有明确规则依据时不把规则理解当作严重错误。
 6. comment 只写短摘要，但当输入包含提取规则时，comment 必须引用提取 prompt 中真实存在的主要规则编号、标题或短句。
-7. 当输入包含提取规则时，每条结果都要输出顶层 rule_refs、evidence_refs、output_refs；扣分样本还要输出 diagnostics。
+7. 当输入包含提取规则时，每条结果都要输出顶层 rule_refs、evidence_refs、output_refs。
+8. 任一维度低于 5 分或 error_tags 非空时，都必须输出至少一项 diagnostics；不要只扣分而不说明结构化原因。
 
 ## 评分维度
 
@@ -75,7 +76,7 @@ comment 必须短，并引用主要规则，例如：
 - `符合“## 1. 只基于 user 提取 / A. 允许记录”；无明显边界污染。`
 - `违反“## 3. 单次任务和稳定偏好要拆开判断”：一次性查询被写入画像。`
 
-如果有主要扣分点，还必须给出 diagnostics。每个 diagnostics 项包含：
+任一维度低于 5 分或 error_tags 非空时，必须给出至少一项 diagnostics。每个 diagnostics 项包含：
 
 - dimension：受影响的维度，例如 correctness、coverage、memory_boundary。
 - severity：low、medium、high。

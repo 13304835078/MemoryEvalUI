@@ -5,6 +5,7 @@ import re
 import time
 from datetime import datetime, timezone
 
+from .. import runtime_paths
 from ..schema import (
     Case, TaskType, EvalConfig, EvalResult,
     SCORING_DIMENSIONS, DIMENSION_WEIGHTS, VALID_ERROR_TAGS,
@@ -123,10 +124,7 @@ class EvalRunner:
     ):
         self.config = config
         self.task_type = task_type
-        self.prompts_dir = prompts_dir or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "prompts", "judge",
-        )
+        self.prompts_dir = prompts_dir or str(runtime_paths.PROMPTS_DIR / "judge")
         self.prompt_file = prompt_file
         self.judge_prompt_version = judge_prompt_version
         self.system_prompt_override = system_prompt_override
@@ -158,7 +156,7 @@ class EvalRunner:
 - 保持原有必需 JSON 字段：score_total、scores、comment、error_tags、fatal_error。
 - comment 必须简短引用提取 prompt 中真实存在的章节标题、编号或原文短句，例如“符合‘## 1. 只基于 user 提取 / A. 允许记录’；无明显边界污染”。
 - 每条结果都必须填写顶层 rule_refs、evidence_refs、output_refs；即使满分也要引用支持“合规”的规则、事实证据和候选输出片段。
-- 若存在主要扣分点，必须补充 diagnostics；每项包含 dimension、severity、rule_refs、evidence_refs、output_refs、reason。
+- 任一维度低于 5 分或 error_tags 非空时，必须补充至少一项 diagnostics；每项包含 dimension、severity、rule_refs、evidence_refs、output_refs、reason。
 - rule_refs 引用提取规则；evidence_refs 引用旧 USER.md、对话或 reasoning；output_refs 引用新 USER.md。
 - rule_refs 必须逐字来自提取 prompt 中真实存在的编号、标题或短句；如果提取 prompt 没有 R1/R2/R3/R4 这类编号，禁止输出这类编号。
 - 对同类错误使用相同扣分尺度，不因措辞或样本顺序改变评分。
@@ -181,7 +179,11 @@ class EvalRunner:
             prompt_path = os.path.join(self.prompts_dir, filename)
 
         if not os.path.isfile(prompt_path):
-            raise FileNotFoundError(f"Judge prompt 文件不存在: {prompt_path}")
+            bundled_path = runtime_paths.BUNDLED_PROMPTS_DIR / "judge" / filename
+            if bundled_path.is_file():
+                prompt_path = str(bundled_path)
+            else:
+                raise FileNotFoundError(f"Judge prompt 文件不存在: {prompt_path}")
 
         with open(prompt_path, "r", encoding="utf-8") as f:
             return f.read()
@@ -247,7 +249,8 @@ class EvalRunner:
                 "- output_refs: 引用新 USER.md 中对应的输出片段；如果新 USER.md 为空但合理，请写“新 USER.md 为空”。\n"
                 "- comment: 必须包含主要规则引用，例如“符合‘## 1. 只基于 user 提取 / A. 允许记录’；无明显边界污染”。\n"
                 "如果提取规则中没有 R1/R2/R3/R4 这类编号，禁止在 rule_refs、diagnostics 或 comment 中输出这类编号。\n"
-                "如果扣分，还必须在 diagnostics 中给出：dimension、severity、rule_refs、evidence_refs、output_refs、reason。\n"
+                "任一维度低于 5 分或 error_tags 非空时，必须在 diagnostics 中至少给出一项："
+                "dimension、severity、rule_refs、evidence_refs、output_refs、reason。\n"
                 "如果没有明确证据，不要重扣分，但仍要引用支持当前判断的规则和证据。\n\n"
             )
 

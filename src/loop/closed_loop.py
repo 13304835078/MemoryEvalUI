@@ -17,15 +17,16 @@ from src.extraction.memory_extractor import (
     MemoryExtractionRunner,
     sanitize_filename,
 )
-from src.schema import EvalConfig, EvalResult, TaskType, results_to_jsonl
+from src.runtime_paths import APP_HOME, DATA_DIR
+from src.schema import EvalConfig, EvalResult, TaskType, append_result_to_jsonl, results_to_jsonl
 from src.ui.data_service import prepare_cases_from_run_output, save_cases
 from src.ui.prompt_advisor import call_prompt_advisor, collect_absolute_eval_evidence
 from src.ui.prompt_editor import prompt_text_hash, save_prompt_version
 from src.ui.state_io import atomic_write_json, state_file_lock
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CLOSED_LOOP_DIR = PROJECT_ROOT / "data" / "closed_loop"
+PROJECT_ROOT = APP_HOME
+CLOSED_LOOP_DIR = DATA_DIR / "closed_loop"
 
 
 @dataclass
@@ -255,12 +256,10 @@ def _evaluate_cases(
     backoff_interval = float(getattr(config.eval_config, "judge_qps_backoff", 0.0) or 0.0)
     if concurrency > 1 and not config.eval_config.mock:
         request_interval = max(request_interval, backoff_interval)
-    if result_path.exists():
-        result_path.unlink()
-
     if not run_cases:
         results_to_jsonl([], str(result_path))
         return []
+    results_to_jsonl([], str(result_path))
 
     update_state(config.run_id, lambda state: (
         state.update({"stage": f"第 {round_index} 轮：评测 0/{len(run_cases)}"}),
@@ -342,8 +341,7 @@ def _evaluate_cases(
 
                     results_by_index[idx] = result
                     completed += 1
-                    ordered_results = [results_by_index[i] for i in sorted(results_by_index)]
-                    results_to_jsonl(ordered_results, str(result_path))
+                    append_result_to_jsonl(result, str(result_path))
                     update_state(config.run_id, lambda state: (
                         state.update({"stage": f"第 {round_index} 轮：评测 {completed}/{len(run_cases)}"}),
                         _round_record(state, round_index).update({
@@ -357,7 +355,9 @@ def _evaluate_cases(
             future.cancel()
         raise
 
-    return [results_by_index[i] for i in sorted(results_by_index)]
+    ordered_results = [results_by_index[i] for i in sorted(results_by_index)]
+    results_to_jsonl(ordered_results, str(result_path))
+    return ordered_results
 
 
 def run_closed_loop(config: ClosedLoopConfig) -> None:

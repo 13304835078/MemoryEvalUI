@@ -297,6 +297,22 @@ class _FakeAdvisorResponse:
         return None
 
 
+class _FakeAdvisorStreamResponse:
+    def __init__(self, content: str):
+        chunks = [
+            {"choices": [{"delta": {"content": content}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]
+        self._lines = [f"data: {json.dumps(chunk, ensure_ascii=False)}" for chunk in chunks] + ["data: [DONE]"]
+        self.text = "\n".join(self._lines)
+
+    def iter_lines(self, decode_unicode=True):
+        return iter(self._lines)
+
+    def raise_for_status(self):
+        return None
+
+
 def test_prompt_advisor_caps_extraction_advisor_tokens_and_payload(monkeypatch):
     advisor_result = {
         "can_suggest": True,
@@ -591,7 +607,7 @@ def test_extraction_advisor_batches_stage1_evidence(monkeypatch):
         EvalConfig(judge_max_retries=1, judge_request_interval=0),
         evidence=[
             {"case_id": f"case_{index}", "comment": "评语" * 300}
-            for index in range(9)
+            for index in range(15)
         ],
         current_judge_prompt="judge",
         extraction_prompt="## 规则\n- 原规则。\n",
@@ -599,14 +615,17 @@ def test_extraction_advisor_batches_stage1_evidence(monkeypatch):
         min_evidence=1,
     )
 
-    assert len(sent_payloads) == 3
+    assert len(sent_payloads) == 8
     batch_sizes = [
         len(json.loads(payload["messages"][1]["content"])["evidence"])
         for payload in sent_payloads
     ]
-    assert batch_sizes == [4, 4, 1]
+    assert batch_sizes == [2, 2, 2, 2, 2, 2, 2, 1]
     assert all(payload["max_tokens"] == 1200 for payload in sent_payloads)
-    assert len(result["extraction_prompt_request_metrics"]) == 3
+    assert len(result["extraction_prompt_request_metrics"]) == 8
+    assert result["evidence_usage"]["selected_count"] == 15
+    assert result["evidence_usage"]["initial_used_count"] == 15
+    assert result["evidence_usage"]["all_selected_used_initially"] is True
 
 
 def test_stage2_uses_complete_target_blocks_instead_of_whole_sections(monkeypatch):
@@ -692,7 +711,7 @@ def test_extraction_stage_retry_reduces_same_batch_payload(monkeypatch):
         EvalConfig(judge_max_retries=2, judge_qps_backoff=0),
         evidence=[
             {"case_id": f"case_{index}", "comment": "较长评语" * 100}
-            for index in range(4)
+            for index in range(2)
         ],
         current_judge_prompt="judge",
         extraction_prompt="\n\n".join(f"## 规则{index}\n- 内容。" for index in range(20)),
@@ -707,3 +726,76 @@ def test_extraction_stage_retry_reduces_same_batch_payload(monkeypatch):
     assert payloads[0]["max_tokens"] == 1200
     assert payloads[1]["max_tokens"] == 800
     assert len(json.loads(second_message)["evidence"]) == 2
+
+
+def test_matching_rule_refs_skip_model_localization_call(monkeypatch):
+    sent_messages = []
+
+    def fake_post(_url, headers, data, timeout):
+        payload = json.loads(data.decode("utf-8"))
+        message = json.loads(payload["messages"][1]["content"])
+        sent_messages.append(message)
+        assert message["stage"] == "2_section_patch"
+        result = {
+            "can_suggest": True,
+            "section_id": "S001",
+            "extraction_prompt_patch": {"mode": "incremental_patch", "edits": []},
+            "section_notes": "无需修改",
+            "risks": [],
+        }
+        return _FakeAdvisorResponse({
+            "choices": [{"message": {"content": json.dumps(result, ensure_ascii=False)}}]
+        })
+
+    monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
+
+    result, _raw = call_prompt_advisor(
+        EvalConfig(judge_max_retries=1, judge_request_interval=0),
+        evidence=[{
+            "case_id": "case_1",
+            "comment": "兴趣爱好规则边界可能不清",
+            "rule_refs": ["## A4 兴趣爱好"],
+        }],
+        current_judge_prompt="judge",
+        extraction_prompt="## A4 兴趣爱好\n- 仅记录长期偏好。\n\n## A5 排除规则\n- 排除瞬时信息。\n",
+        target="extraction_prompt",
+        min_evidence=1,
+    )
+
+    assert len(sent_messages) == 1
+    assert result["extraction_prompt_request_metrics"][0]["stage"] == "1_本地规则定位"
+    assert result["extraction_prompt_request_metrics"][0]["request_chars"] == 0
+
+
+def test_extraction_advisor_accepts_streaming_json(monkeypatch):
+    stage2_result = {
+        "can_suggest": True,
+        "section_id": "S001",
+        "extraction_prompt_patch": {"mode": "incremental_patch", "edits": []},
+        "section_notes": "无需修改",
+        "risks": [],
+    }
+    captured = {}
+
+    def fake_post(_url, headers, data, timeout):
+        captured["payload"] = json.loads(data.decode("utf-8"))
+        return _FakeAdvisorStreamResponse(json.dumps(stage2_result, ensure_ascii=False))
+
+    monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
+
+    result, _raw = call_prompt_advisor(
+        EvalConfig(judge_max_retries=1, judge_request_interval=0),
+        evidence=[{
+            "case_id": "case_1",
+            "comment": "规则边界可能不清",
+            "rule_refs": ["## A4 兴趣爱好"],
+        }],
+        current_judge_prompt="judge",
+        extraction_prompt="## A4 兴趣爱好\n- 仅记录长期偏好。\n",
+        target="extraction_prompt",
+        min_evidence=1,
+    )
+
+    assert captured["payload"]["stream"] is True
+    assert result["can_suggest"] is True
+    assert result["extraction_prompt_stage2_summaries"][0]["section_notes"] == "无需修改"

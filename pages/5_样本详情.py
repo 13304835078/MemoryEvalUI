@@ -13,6 +13,7 @@ from src.ui.data_service import (
     list_case_files,
     list_result_files,
     load_results,
+    load_results_bytes,
     find_case_for_result,
 )
 from src.ui.components import (
@@ -53,6 +54,27 @@ with st.sidebar:
             st.session_state.results = load_results(selected_path)
             st.session_state.results_file = selected_path
             st.rerun()
+
+    uploaded_result = st.file_uploader(
+        "或上传结果文件",
+        type=["jsonl", "csv", "xlsx"],
+        key="detail_result_upload",
+        help="支持执行评测 JSONL，以及结果总览导出的 CSV/Excel。",
+    )
+    if uploaded_result is not None and st.button(
+        "加载上传结果",
+        use_container_width=True,
+        key="detail_load_uploaded_result",
+    ):
+        try:
+            st.session_state.results = load_results_bytes(
+                uploaded_result.getvalue(),
+                uploaded_result.name,
+            )
+            st.session_state.results_file = uploaded_result.name
+            st.rerun()
+        except Exception as exc:
+            st.error(f"结果文件解析失败：{exc}")
 
     case_files = list_case_files()
     if case_files:

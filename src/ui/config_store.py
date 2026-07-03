@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from src.schema import EvalConfig
+from src.runtime_paths import APP_HOME, CONFIG_DIR, ensure_writable_layout
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_DIR = PROJECT_ROOT / "config"
+PROJECT_ROOT = APP_HOME
 CONFIG_PATH = CONFIG_DIR / "local_config.json"
 
 
@@ -59,6 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 def load_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
     """读取本地 UI 配置。不存在时返回默认配置。"""
+    ensure_writable_layout()
     path = Path(path)
     config = dict(DEFAULT_CONFIG)
 
@@ -82,6 +83,7 @@ def load_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
 
 def save_config(config: dict[str, Any], path: str | Path = CONFIG_PATH) -> None:
     """保存本地 UI 配置。注意 config/local_config.json 应加入 .gitignore。"""
+    ensure_writable_layout()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 

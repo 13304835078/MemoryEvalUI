@@ -387,7 +387,10 @@ with st.expander("当前接口配置", expanded=False):
 
 st.subheader("输出与断点续跑")
 
-resume_files = list_result_files()
+resume_files = [
+    path for path in list_result_files()
+    if Path(path).suffix.lower() == ".jsonl"
+]
 if "resume_enabled" not in st.session_state:
     st.session_state.resume_enabled = False
 if "resume_strategy" not in st.session_state:
@@ -419,7 +422,7 @@ if resume_enabled:
         st.session_state.resume_result_path = resume_result_path
         st.caption(f"将继续写入：{resume_result_path}")
     else:
-        st.warning("data/results 下暂无可续跑的结果文件，将新建结果文件。")
+        st.warning("data/results 下暂无可续跑的 JSONL 结果文件，将新建结果文件。")
 
 
 st.divider()

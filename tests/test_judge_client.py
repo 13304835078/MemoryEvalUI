@@ -85,6 +85,16 @@ def test_real_judge_normalize_common_aliases():
         "reason": "整体可用",
         "errors": "over_memory, missing_key_info",
         "fatal": "false",
+        "diagnostics": [
+            {
+                "dimension": "coverage",
+                "severity": "medium",
+                "rule_refs": [],
+                "evidence_refs": ["用户事实"],
+                "output_refs": ["候选输出"],
+                "reason": "存在遗漏。",
+            }
+        ],
     }
     result = RealJudgeClient._normalize_judge_result(raw)
     valid, reason = RealJudgeClient._is_valid_judge_result(result)
@@ -118,11 +128,158 @@ def test_real_judge_normalize_optional_reference_aliases():
     }
     result = RealJudgeClient._normalize_judge_result(raw)
     valid, reason = RealJudgeClient._is_valid_judge_result(result)
-    assert valid, reason
+    assert not valid
+    assert "diagnostics[0] 缺少字段" in reason
     assert result["diagnostics"] == [{"维度": "memory_boundary", "规则引用": ["R2"]}]
     assert result["rule_refs"] == ["R2"]
     assert result["evidence_refs"] == ["帮我查天气"]
     assert result["output_refs"] == ["喜欢晴天"]
+
+
+def _valid_judge_result() -> dict:
+    return {
+        "score_total": 5.0,
+        "scores": {key: 5 for key in JUDGE_RESULT_SCHEMA["dimension_keys"]},
+        "comment": "结果符合规则。",
+        "error_tags": [],
+        "fatal_error": False,
+    }
+
+
+def test_real_judge_validation_rejects_missing_dimension():
+    result = _valid_judge_result()
+    result["scores"].pop("coverage")
+
+    valid, reason = RealJudgeClient._is_valid_judge_result(result)
+
+    assert not valid
+    assert "缺少维度" in reason
+
+
+def test_real_judge_validation_rejects_invalid_score_and_tag():
+    result = _valid_judge_result()
+    result["scores"]["coverage"] = 6
+    valid, reason = RealJudgeClient._is_valid_judge_result(result)
+    assert not valid
+    assert "0 到 5" in reason
+
+    result = _valid_judge_result()
+    result["error_tags"] = ["made_up_tag"]
+    valid, reason = RealJudgeClient._is_valid_judge_result(result)
+    assert not valid
+    assert "未知标签" in reason
+
+
+def test_real_judge_validation_requires_diagnostics_for_deduction():
+    result = _valid_judge_result()
+    result["scores"]["coverage"] = 4
+
+    valid, reason = RealJudgeClient._is_valid_judge_result(result)
+
+    assert not valid
+    assert "diagnostics" in reason
+
+
+def test_real_judge_validation_checks_extraction_rule_references():
+    prompt = "## 1. 只基于 user 提取\n只记录用户明确表达的事实。"
+    result = _valid_judge_result()
+    result.update({
+        "comment": "符合“## 1. 只基于 user 提取”。",
+        "rule_refs": ["## 1. 只基于 user 提取"],
+        "evidence_refs": ["用户明确表达"],
+        "output_refs": ["- 用户事实"],
+    })
+
+    valid, reason = RealJudgeClient._is_valid_judge_result(
+        result,
+        require_references=True,
+        extraction_prompt_text=prompt,
+    )
+    assert valid, reason
+
+    result["rule_refs"] = ["R3"]
+    valid, reason = RealJudgeClient._is_valid_judge_result(
+        result,
+        require_references=True,
+        extraction_prompt_text=prompt,
+    )
+    assert not valid
+    assert "不存在的引用" in reason
+
+
+def test_real_judge_validation_requires_nonempty_refs_when_extraction_prompt_is_used():
+    prompt = "## 1. 只基于 user 提取\n只记录用户明确表达的事实。"
+    result = _valid_judge_result()
+    result.update({
+        "comment": "符合“## 1. 只基于 user 提取”。",
+        "rule_refs": [],
+        "evidence_refs": ["用户明确表达"],
+        "output_refs": ["- 用户事实"],
+    })
+
+    valid, reason = RealJudgeClient._is_valid_judge_result(
+        result,
+        require_references=True,
+        extraction_prompt_text=prompt,
+    )
+
+    assert not valid
+    assert "rule_refs 不能为空" in reason
+
+
+def test_real_judge_validation_checks_diagnostic_rule_refs_against_extraction_prompt():
+    prompt = "## 1. 只基于 user 提取\n只记录用户明确表达的事实。"
+    result = _valid_judge_result()
+    result["scores"]["coverage"] = 4
+    result.update({
+        "comment": "违反“## 1. 只基于 user 提取”。",
+        "rule_refs": ["## 1. 只基于 user 提取"],
+        "evidence_refs": ["用户明确表达"],
+        "output_refs": ["新 USER.md 缺失"],
+        "diagnostics": [
+            {
+                "dimension": "coverage",
+                "severity": "medium",
+                "rule_refs": ["R3"],
+                "evidence_refs": ["用户明确表达"],
+                "output_refs": ["新 USER.md 缺失"],
+                "reason": "遗漏用户明确事实。",
+            }
+        ],
+    })
+
+    valid, reason = RealJudgeClient._is_valid_judge_result(
+        result,
+        require_references=True,
+        extraction_prompt_text=prompt,
+    )
+
+    assert not valid
+    assert "diagnostics[0].rule_refs" in reason
+    assert "不存在的引用" in reason
+
+    result["diagnostics"][0]["rule_refs"] = ["## 1. 只基于 user 提取"]
+    valid, reason = RealJudgeClient._is_valid_judge_result(
+        result,
+        require_references=True,
+        extraction_prompt_text=prompt,
+    )
+    assert valid, reason
+
+
+def test_real_judge_normalization_does_not_invent_missing_scores():
+    result = RealJudgeClient._normalize_judge_result({
+        "score_total": 5,
+        "scores": {"correctness": 5},
+        "comment": "ok",
+        "error_tags": [],
+        "fatal_error": False,
+    })
+
+    assert set(result["scores"]) == {"correctness"}
+    valid, reason = RealJudgeClient._is_valid_judge_result(result)
+    assert not valid
+    assert "缺少维度" in reason
 
 
 def test_real_judge_build_payload_uses_core_options_only():
@@ -207,6 +364,14 @@ class _FakeJsonResponse:
         return None
 
 
+class _FakeSession:
+    def __init__(self, responses):
+        self.responses = responses
+
+    def post(self, *args, **kwargs):
+        return self.responses.pop(0)
+
+
 def test_real_judge_rate_limit_retry_uses_global_wait_callback(monkeypatch):
     ok_result = {
         "score_total": 5.0,
@@ -222,7 +387,7 @@ def test_real_judge_rate_limit_retry_uses_global_wait_callback(monkeypatch):
     sleeps = []
     waits = []
 
-    monkeypatch.setattr("src.eval.judge_client.requests.post", lambda *args, **kwargs: responses.pop(0))
+    monkeypatch.setattr("src.llm_api.requests.Session", lambda: _FakeSession(responses))
     monkeypatch.setattr("src.eval.judge_client.time.sleep", lambda seconds: sleeps.append(seconds))
 
     config = EvalConfig(judge_max_retries=2, judge_qps_backoff=1.0)

@@ -13,16 +13,18 @@ from src.schema import (
     Case,
     DialogueTurn,
     EvalResult,
+    SCORING_DIMENSIONS,
     TaskType,
     cases_from_jsonl,
     cases_to_jsonl,
+    append_result_to_jsonl,
     results_from_jsonl,
 )
 from src.eval.metrics import flatten_results
+from src.runtime_paths import APP_HOME, DATA_DIR, ensure_writable_layout
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data"
+PROJECT_ROOT = APP_HOME
 RAW_DIR = DATA_DIR / "raw"
 CASES_DIR = DATA_DIR / "cases"
 RESULTS_DIR = DATA_DIR / "results"
@@ -30,6 +32,7 @@ UPLOAD_DIR = RAW_DIR / "uploads"
 
 
 def ensure_dirs() -> None:
+    ensure_writable_layout()
     for d in [RAW_DIR, CASES_DIR, RESULTS_DIR, UPLOAD_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -39,10 +42,14 @@ def list_files(dir_path: str | Path, suffix: str | tuple[str, ...] = ".jsonl") -
     if not dir_path.exists():
         return []
     if isinstance(suffix, str):
-        suffixes = (suffix,)
+        suffixes = (suffix.lower(),)
     else:
-        suffixes = suffix
-    return sorted([str(p) for p in dir_path.glob("*") if p.is_file() and p.name.endswith(suffixes)])
+        suffixes = tuple(item.lower() for item in suffix)
+    return sorted([
+        str(p)
+        for p in dir_path.glob("*")
+        if p.is_file() and p.name.lower().endswith(suffixes)
+    ])
 
 
 def list_case_files() -> list[str]:
@@ -52,7 +59,7 @@ def list_case_files() -> list[str]:
 
 def list_result_files() -> list[str]:
     ensure_dirs()
-    return list_files(RESULTS_DIR, ".jsonl")
+    return list_files(RESULTS_DIR, (".jsonl", ".csv", ".xlsx"))
 
 
 def load_cases(path: str | Path) -> list[Case]:
@@ -60,7 +67,133 @@ def load_cases(path: str | Path) -> list[Case]:
 
 
 def load_results(path: str | Path) -> list[EvalResult]:
-    return results_from_jsonl(str(path))
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        return results_from_jsonl(str(path))
+    if suffix == ".csv":
+        return results_from_dataframe(pd.read_csv(path, encoding="utf-8-sig").fillna(""))
+    if suffix == ".xlsx":
+        return results_from_dataframe(pd.read_excel(path).fillna(""))
+    raise ValueError(f"不支持的结果文件格式：{suffix}")
+
+
+def load_results_bytes(content: bytes, filename: str) -> list[EvalResult]:
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".jsonl":
+        rows = [
+            EvalResult.from_dict(json.loads(line))
+            for line in content.decode("utf-8-sig").splitlines()
+            if line.strip()
+        ]
+        return rows
+    if suffix == ".csv":
+        return results_from_dataframe(pd.read_csv(BytesIO(content), encoding="utf-8-sig").fillna(""))
+    if suffix == ".xlsx":
+        return results_from_dataframe(pd.read_excel(BytesIO(content)).fillna(""))
+    raise ValueError(f"不支持的结果文件格式：{suffix}")
+
+
+def results_from_dataframe(df: pd.DataFrame) -> list[EvalResult]:
+    if df.empty:
+        return []
+    required = {"case_id", "score_total"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"结果表缺少必要列：{missing}")
+
+    dimensions = sorted({dimension for values in SCORING_DIMENSIONS.values() for dimension in values})
+    results: list[EvalResult] = []
+    row_errors: list[str] = []
+    for index, row in df.fillna("").iterrows():
+        case_id = _cell_text(row.get("case_id"))
+        if not case_id:
+            row_errors.append(f"第 {index + 2} 行缺少 case_id")
+            continue
+        try:
+            score_total = float(row.get("score_total"))
+        except (TypeError, ValueError):
+            row_errors.append(f"第 {index + 2} 行 score_total 不是数字")
+            continue
+
+        scores: dict[str, float] = {}
+        for dimension in dimensions:
+            value = row.get(f"score_{dimension}", "")
+            if value in ("", None):
+                continue
+            try:
+                scores[dimension] = float(value)
+            except (TypeError, ValueError):
+                row_errors.append(f"第 {index + 2} 行 score_{dimension} 不是数字")
+
+        results.append(EvalResult(
+            case_id=case_id,
+            task_type=_cell_text(row.get("task_type")) or TaskType.USER_MD.value,
+            score_total=score_total,
+            scores=scores,
+            comment=_cell_text(row.get("comment")),
+            error_tags=_parse_table_list(row.get("error_tags"), primary_separator=","),
+            fatal_error=_parse_table_bool(row.get("fatal_error")),
+            model_name=_cell_text(row.get("model_name")) or "unknown",
+            prompt_version=_cell_text(row.get("prompt_version")) or "unknown",
+            judge_model=_cell_text(row.get("judge_model")),
+            judge_prompt_version=_cell_text(row.get("judge_prompt_version")),
+            extraction_prompt_version=_cell_text(row.get("extraction_prompt_version")),
+            extraction_prompt_hash=_cell_text(row.get("extraction_prompt_hash")),
+            diagnostics=_parse_diagnostics(row.get("diagnostics")),
+            rule_refs=_parse_table_list(row.get("rule_refs"), primary_separator=";"),
+            evidence_refs=_parse_table_list(row.get("evidence_refs"), primary_separator=";"),
+            output_refs=_parse_table_list(row.get("output_refs"), primary_separator=";"),
+            timestamp=_cell_text(row.get("timestamp")),
+        ))
+
+    if row_errors:
+        preview = "；".join(row_errors[:5])
+        suffix = f"；另有 {len(row_errors) - 5} 个错误" if len(row_errors) > 5 else ""
+        raise ValueError(f"结果表存在无法还原的行：{preview}{suffix}")
+    return results
+
+
+def _cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() == "nan" else text
+
+
+def _parse_table_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return _cell_text(value).lower() in {"true", "1", "yes", "y", "是"}
+
+
+def _parse_table_list(value: Any, *, primary_separator: str) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = _cell_text(value)
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+    return [item.strip() for item in text.split(primary_separator) if item.strip()]
+
+
+def _parse_diagnostics(value: Any) -> list[dict]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    text = _cell_text(value)
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
 
 
 def resume_result_key(
@@ -109,10 +242,7 @@ def eval_result_resume_key(result: EvalResult) -> tuple[str, str, str, str, str,
 
 
 def append_result(path: str | Path, result: EvalResult) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
+    append_result_to_jsonl(result, str(path))
 
 
 def save_uploaded_file(uploaded_file, suffix: str = "") -> str:

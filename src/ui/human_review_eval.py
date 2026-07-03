@@ -9,12 +9,13 @@ from typing import Any
 
 import pandas as pd
 
+from src.runtime_paths import APP_HOME, DATA_DIR
 from src.schema import Case, DialogueTurn, EvalResult, TaskType
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-HUMAN_REVIEW_CACHE_PATH = PROJECT_ROOT / "data" / "results" / "human_review_judge_cache.json"
-HUMAN_REVIEW_RUNS_DIR = PROJECT_ROOT / "data" / "results" / "human_review_runs"
+PROJECT_ROOT = APP_HOME
+HUMAN_REVIEW_CACHE_PATH = DATA_DIR / "results" / "human_review_judge_cache.json"
+HUMAN_REVIEW_RUNS_DIR = DATA_DIR / "results" / "human_review_runs"
 
 
 @dataclass

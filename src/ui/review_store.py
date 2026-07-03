@@ -7,9 +7,10 @@ from typing import Any
 
 import pandas as pd
 
+from src.runtime_paths import APP_HOME, DATA_DIR
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_REVIEW_PATH = PROJECT_ROOT / "data" / "results" / "human_reviews.jsonl"
+PROJECT_ROOT = APP_HOME
+DEFAULT_REVIEW_PATH = DATA_DIR / "results" / "human_reviews.jsonl"
 
 
 def review_key(case_id: str, model_name: str = "unknown", prompt_version: str = "unknown") -> str:
