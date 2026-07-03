@@ -1,6 +1,6 @@
 import json
 from collections import Counter
-from ..schema import EvalResult, SCORING_DIMENSIONS
+from ..schema import EvalResult
 
 DIM_LABELS = {
     "correctness": "正确性",

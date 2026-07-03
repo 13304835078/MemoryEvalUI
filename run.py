@@ -41,25 +41,6 @@ def pick_file(prompt: str, base_dir: str, pattern: str = "*") -> str:
     return input("请输入文件路径: ").strip()
 
 
-def pick_dir(prompt: str, base_dir: str) -> str:
-    """列出子目录供用户选择"""
-    dirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
-    print(f"\n{prompt}")
-    if dirs:
-        for i, d in enumerate(dirs, 1):
-            print(f"  {i}. {d}")
-        print(f"  0. 手动输入路径")
-    else:
-        print("  (目录为空)")
-
-    choice = input("请选择序号: ").strip()
-    if choice.isdigit():
-        idx = int(choice)
-        if 1 <= idx <= len(dirs):
-            return os.path.join(base_dir, dirs[idx - 1])
-    return input("请输入目录路径: ").strip()
-
-
 def run_cmd(cmd: list[str]) -> None:
     print(f"\n>>> 执行: {' '.join(cmd)}")
     subprocess.run(cmd, cwd=PROJECT_ROOT)

@@ -17,7 +17,7 @@ import argparse
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from src.schema import results_from_jsonl, TaskType
+from src.schema import results_from_jsonl
 from src.eval.metrics import compute_aggregations, group_by, print_summary, DIM_LABELS
 
 TASK_TITLES = {

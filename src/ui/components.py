@@ -278,10 +278,3 @@ def render_raw_response(result: EvalResult) -> None:
             st.json(parsed)
         except Exception:
             st.code(raw or "（无）", language="text")
-
-
-def render_result_table(df: pd.DataFrame) -> None:
-    if df.empty:
-        st.info("暂无数据")
-        return
-    st.dataframe(df, use_container_width=True, hide_index=True)

@@ -4,7 +4,7 @@ from typing import Optional
 
 from ..schema import Case, DialogueTurn, TaskType
 from .base_loader import (
-    BaseLoader, COLUMN_ALIASES, DIALOGUE_SPLIT_COLS,
+    BaseLoader, COLUMN_ALIASES,
     fuzzy_match, fuzzy_match_dialogue, InvalidColumnError,
 )
 
@@ -39,15 +39,6 @@ class ExcelLoader(BaseLoader):
 
         has_query = "query" in column_map and "answer" in column_map
 
-        required = ["case_id"]
-        missing = [r for r in required if r not in column_map]
-        if not missing:
-            pass
-        elif "session_id" not in column_map:
-            pass
-        else:
-            pass
-
         cases = []
         dialogue_buffer: list[DialogueTurn] = []
 
@@ -76,7 +67,7 @@ class ExcelLoader(BaseLoader):
             case = self._build_case(len(df) - 1, df.iloc[-1].to_dict(), column_map, dialogue_buffer.copy())
             cases.append(case)
 
-        missing_req = [r for r in required if r not in column_map]
+        missing_req = [r for r in ("case_id",) if r not in column_map]
         if missing_req and not cases:
             raise InvalidColumnError(missing_req, list(df.columns))
 

@@ -10,7 +10,7 @@ from ..schema import (
     Case, TaskType, EvalConfig, EvalResult,
     SCORING_DIMENSIONS, DIMENSION_WEIGHTS, VALID_ERROR_TAGS,
 )
-from .judge_client import RealJudgeClient, MockJudgeClient, JudgeClient, JUDGE_RESULT_SCHEMA
+from .judge_client import RealJudgeClient, MockJudgeClient, JudgeClient
 
 logger = logging.getLogger(__name__)
 RULE_ID_RE = re.compile(r"(?<![A-Za-z0-9])R\d+(?![A-Za-z0-9])")

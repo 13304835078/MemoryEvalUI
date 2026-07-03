@@ -2,7 +2,6 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 from enum import Enum
 from datetime import datetime, timezone
-import json
 import os
 
 from .persistence import append_jsonl, atomic_write_jsonl, read_jsonl
