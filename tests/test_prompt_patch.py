@@ -93,3 +93,72 @@ def test_apply_prompt_patch_skips_unverified_or_oversized_edits():
     assert result["applied_edits"] == []
     assert len(result["skipped_edits"]) == 2
     assert result["candidate_prompt"] == prompt
+
+
+def test_append_patch_removes_duplicate_heading_and_diff_markers():
+    prompt = "## 基本原则\n- 只记录长期稳定信息。\n"
+    patch = {
+        "edits": [
+            {
+                "op": "append_to_section",
+                "target_id": "S001",
+                "text": "+## 基本原则\n+-严格过滤瞬时信息。",
+                "reason": "模型误把 diff 和标题放进 patch",
+                "evidence_refs": ["case_1"],
+            }
+        ]
+    }
+
+    result = apply_prompt_patch(prompt, patch)
+
+    assert len(result["applied_edits"]) == 1
+    assert result["candidate_prompt"].count("## 基本原则") == 1
+    assert "+##" not in result["candidate_prompt"]
+    assert "+-" not in result["candidate_prompt"]
+    assert "- 严格过滤瞬时信息。" in result["candidate_prompt"]
+    assert "章节标题" in result["applied_edits"][0]["message"]
+
+
+def test_append_patch_aligns_with_target_section_indent():
+    prompt = "      ## 基本原则\n      - 只记录长期稳定信息。\n"
+    patch = {
+        "edits": [
+            {
+                "op": "append_to_section",
+                "target_id": "S001",
+                "text": "## 基本原则\n- 严格过滤瞬时信息。",
+                "reason": "模型返回了重复标题且没有缩进",
+                "evidence_refs": ["case_1"],
+            }
+        ]
+    }
+
+    result = apply_prompt_patch(prompt, patch)
+
+    assert len(result["applied_edits"]) == 1
+    assert result["candidate_prompt"].count("## 基本原则") == 1
+    assert "\n      - 严格过滤瞬时信息。" in result["candidate_prompt"]
+    assert "\n- 严格过滤瞬时信息。" not in result["candidate_prompt"]
+    assert result["applied_edits"][0]["applied_text"] == "      - 严格过滤瞬时信息。"
+
+
+def test_append_patch_skips_when_only_duplicate_heading_remains():
+    prompt = "## 基本原则\n- 只记录长期稳定信息。\n"
+    patch = {
+        "edits": [
+            {
+                "op": "append_to_section",
+                "target_id": "S001",
+                "text": "## 基本原则",
+                "reason": "只有重复标题",
+                "evidence_refs": ["case_1"],
+            }
+        ]
+    }
+
+    result = apply_prompt_patch(prompt, patch)
+
+    assert result["applied_edits"] == []
+    assert len(result["skipped_edits"]) == 1
+    assert result["candidate_prompt"] == prompt
+    assert "章节标题" in result["skipped_edits"][0]["message"]

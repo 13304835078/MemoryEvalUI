@@ -162,6 +162,7 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str) -> Non
         diff_text = result.get("extraction_prompt_diff") or patch_result.get("diff") or ""
         if diff_text:
             with st.expander("查看提取提示词 diff", expanded=True):
+                st.caption("说明：diff 中行首的 + 表示新增行，- 表示删除行，不会作为提示词正文写入。下方“应用 patch 后的候选提取提示词内容”才是最终候选正文。")
                 st.code(diff_text, language="diff")
         else:
             st.info("增量 patch 未造成文本差异。")

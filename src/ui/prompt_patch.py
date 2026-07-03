@@ -8,7 +8,10 @@ from typing import Any
 
 
 HEADING_RE = re.compile(r"(?m)^(#{1,6})\s+(.+?)\s*$")
+HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)、]\s+)")
+LIST_ITEM_INDENT_RE = re.compile(r"^(\s*)(?:[-*+]\s+|\d+[.)、]\s+)")
+HEADING_INDENT_RE = re.compile(r"^(\s*)#{1,6}\s+.+?\s*$")
 ALLOWED_OPS = {
     "insert_before_section",
     "insert_after_section",
@@ -179,8 +182,9 @@ def apply_prompt_patch(
         applied_edits.append({
             **edit,
             "status": "applied",
-            "message": "已应用",
+            "message": op_result.get("message") or "已应用",
             "change_chars": op_result["change_chars"],
+            "applied_text": op_result.get("applied_text", ""),
         })
 
     candidate = _apply_operations(original, operations)
@@ -271,34 +275,50 @@ def _build_operation(original: str, section: PromptSection, edit: dict[str, Any]
         }
 
     if op == "insert_before_section":
-        replacement = _format_insert_text(edit["text"], before_text=original[:section.start], after_text=original[section.start:])
+        sanitized = _sanitize_insert_text(edit["text"], strip_headings=False, section=section)
+        if not sanitized["text"]:
+            return {"ok": False, "message": sanitized["message"] or "插入文本规范化后为空。"}
+        replacement = _format_insert_text(sanitized["text"], before_text=original[:section.start], after_text=original[section.start:])
         return {
             "ok": True,
             "start": section.start,
             "end": section.start,
             "replacement": replacement,
             "change_chars": len(replacement),
+            "message": sanitized["message"] or "已应用",
+            "applied_text": sanitized["text"],
         }
 
     if op == "insert_after_section":
-        replacement = _format_insert_text(edit["text"], before_text=original[:section.end], after_text=original[section.end:])
+        sanitized = _sanitize_insert_text(edit["text"], strip_headings=False, section=section)
+        if not sanitized["text"]:
+            return {"ok": False, "message": sanitized["message"] or "插入文本规范化后为空。"}
+        replacement = _format_insert_text(sanitized["text"], before_text=original[:section.end], after_text=original[section.end:])
         return {
             "ok": True,
             "start": section.end,
             "end": section.end,
             "replacement": replacement,
             "change_chars": len(replacement),
+            "message": sanitized["message"] or "已应用",
+            "applied_text": sanitized["text"],
         }
 
     if op == "append_to_section":
         insert_at = _section_content_end(section)
-        replacement = _format_insert_text(edit["text"], before_text=original[:insert_at], after_text=original[insert_at:])
+        sanitized = _sanitize_insert_text(edit["text"], strip_headings=True, section=section)
+        if not sanitized["text"]:
+            return {"ok": False, "message": sanitized["message"] or "追加文本规范化后为空。"}
+        applied_text = _align_append_text_to_section(sanitized["text"], section)
+        replacement = _format_insert_text(applied_text, before_text=original[:insert_at], after_text=original[insert_at:])
         return {
             "ok": True,
             "start": insert_at,
             "end": insert_at,
             "replacement": replacement,
             "change_chars": len(replacement),
+            "message": sanitized["message"] or "已应用",
+            "applied_text": applied_text,
         }
 
     return {"ok": False, "message": f"不支持的操作：{op}"}
@@ -312,12 +332,105 @@ def _section_content_end(section: PromptSection) -> int:
 
 
 def _format_insert_text(text: str, *, before_text: str, after_text: str) -> str:
-    value = text.strip()
+    value = _strip_outer_blank_lines(text)
     if not value:
         return ""
     prefix = "" if not before_text or before_text.endswith("\n") else "\n"
     suffix = "" if not after_text or after_text.startswith("\n") else "\n"
     return f"{prefix}{value}{suffix}"
+
+
+def _strip_outer_blank_lines(text: str) -> str:
+    lines = str(text or "").splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _sanitize_insert_text(text: str, *, strip_headings: bool, section: PromptSection) -> dict[str, str]:
+    lines: list[str] = []
+    removed_headings = 0
+    stripped_diff_markers = 0
+    fixed_list_markers = 0
+
+    for raw_line in str(text or "").splitlines():
+        normalized, stripped_diff = _strip_diff_added_marker(raw_line)
+        if stripped_diff:
+            stripped_diff_markers += 1
+        normalized, fixed_list = _normalize_list_marker(normalized)
+        if fixed_list:
+            fixed_list_markers += 1
+        if not normalized.strip():
+            continue
+        if strip_headings and HEADING_LINE_RE.match(normalized.strip()):
+            removed_headings += 1
+            continue
+        lines.append(normalized.strip())
+
+    sanitized = "\n".join(lines).strip()
+    messages = []
+    if removed_headings:
+        messages.append("已移除追加文本中的章节标题，避免重复或嵌套标题。")
+    if stripped_diff_markers:
+        messages.append("已移除追加文本中的 diff 新增行标记。")
+    if fixed_list_markers:
+        messages.append("已规范化列表符号格式。")
+    if not sanitized and removed_headings:
+        messages.append(f"追加内容只包含章节标题，未写入 {section.title}。")
+    return {"text": sanitized, "message": "；".join(messages)}
+
+
+def _strip_diff_added_marker(line: str) -> tuple[str, bool]:
+    stripped = str(line or "").strip()
+    if stripped.startswith("+") and not stripped.startswith("+++"):
+        return stripped[1:].lstrip(), True
+    return stripped, False
+
+
+def _normalize_list_marker(line: str) -> tuple[str, bool]:
+    stripped = str(line or "").strip()
+    fixed = False
+    if re.match(r"^\+\s+", stripped):
+        stripped = "- " + stripped[1:].lstrip()
+        fixed = True
+    new_value = re.sub(r"^([-*])(?=\S)", r"\1 ", stripped)
+    if new_value != stripped:
+        fixed = True
+    return new_value, fixed
+
+
+def _align_append_text_to_section(text: str, section: PromptSection) -> str:
+    indent = _infer_section_append_indent(section)
+    if not indent:
+        return _strip_outer_blank_lines(text)
+    lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        if not raw_line.strip():
+            lines.append("")
+            continue
+        line = raw_line.lstrip()
+        lines.append(f"{indent}{line}")
+    return _strip_outer_blank_lines("\n".join(lines))
+
+
+def _infer_section_append_indent(section: PromptSection) -> str:
+    list_indent_counts: dict[str, int] = {}
+    for raw_line in str(section.text or "").splitlines():
+        match = LIST_ITEM_INDENT_RE.match(raw_line)
+        if not match:
+            continue
+        indent = match.group(1)
+        list_indent_counts[indent] = list_indent_counts.get(indent, 0) + 1
+    if list_indent_counts:
+        return sorted(list_indent_counts.items(), key=lambda item: (-item[1], len(item[0])))[0][0]
+
+    for raw_line in str(section.text or "").splitlines():
+        match = HEADING_INDENT_RE.match(raw_line)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def _apply_operations(original: str, operations: list[dict[str, Any]]) -> str:

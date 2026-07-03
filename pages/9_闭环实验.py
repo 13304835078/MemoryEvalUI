@@ -142,6 +142,7 @@ def render_advisor_details(round_item: dict) -> None:
     diff_text = result.get("extraction_prompt_diff") or patch_result.get("diff") or ""
     if diff_text:
         with st.expander("候选提示词 diff", expanded=False):
+            st.caption("说明：diff 中行首的 + 表示新增行，- 表示删除行，不会作为提示词正文写入。候选提示词正文请看本轮候选文件内容。")
             st.code(diff_text, language="diff")
 
     summary = {
