@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import re
@@ -26,6 +27,7 @@ MAX_ADVISOR_PATCH_EDITS = 5
 MAX_ADVISOR_EDIT_TEXT_CHARS = 420
 MAX_ADVISOR_REPLACE_TEXT_CHARS = 700
 MAX_ADVISOR_TOTAL_PATCH_TEXT_CHARS = 900
+MAX_ADVISOR_APPEND_TEXT_CHARS = 360
 ADVISOR_PATCH_MAX_CHANGE_RATIO = 0.06
 ADVISOR_PATCH_MIN_CHANGE_CHARS = 400
 ADVISOR_STAGE1_BATCH_SIZE = 2
@@ -611,35 +613,6 @@ def _section_outline(sections: list[PromptSection], *, max_sections: int = 120, 
     return rows
 
 
-def _section_context(
-    sections: list[PromptSection],
-    target_id: str,
-    *,
-    neighbor_count: int = 1,
-    text_limit: int = 6000,
-) -> list[dict[str, Any]]:
-    index_by_id = {section.section_id: idx for idx, section in enumerate(sections)}
-    if target_id not in index_by_id:
-        return []
-    target_index = index_by_id[target_id]
-    start = max(0, target_index - neighbor_count)
-    end = min(len(sections), target_index + neighbor_count + 1)
-    rows: list[dict[str, Any]] = []
-    for idx in range(start, end):
-        section = sections[idx]
-        text = section.text.strip()
-        rows.append({
-            "section_id": section.section_id,
-            "title": section.title,
-            "level": section.level,
-            "hash": _section_hash(section.text),
-            "role": "target" if section.section_id == target_id else "neighbor",
-            "is_truncated": len(text) > text_limit,
-            "full_text": text[:text_limit],
-        })
-    return rows
-
-
 def _split_complete_blocks(text: str, *, max_chars: int = ADVISOR_SECTION_BLOCK_CHARS) -> list[dict[str, Any]]:
     source = str(text or "").strip()
     if not source:
@@ -1012,7 +985,8 @@ def _build_section_patch_message(
             "如 has_oversized_uneditable_block=true，不得改写该块，只能在确有必要时向章节末尾追加一条通用规则。",
             "同一章节的相似规则必须合并，不能按 case 重复追加。",
             "只写通用规则，不要把证据中的具体实体、人名、作品名、地点写进 prompt。",
-            "每条新增规则保持短小，优先 1 条合并规则；不要添加多条细碎规则。",
+            "优先澄清/合并已有规则；只有没有可承载规则时才追加 1 条短规则。",
+            "不要为了单个样本补丁式追加；如果只是已有规则换一种说法，输出空 edits。",
             f"每条 edit 文本不超过 {MAX_ADVISOR_EDIT_TEXT_CHARS} 字；本章节 patch 总文本不超过 {MAX_ADVISOR_TOTAL_PATCH_TEXT_CHARS} 字。",
             "如果现有章节已经覆盖该规则，输出空 edits 并说明原因。",
             "candidate_extraction_prompt 必须为空。",
@@ -1043,6 +1017,76 @@ def _build_section_patch_message(
 
 def _normalize_text_key(value: str) -> str:
     return "".join(str(value or "").lower().split())
+
+
+_RULE_PREFIX_RE = re.compile(r"^\s*(?:#{1,6}\s*)?(?:[-*+]\s+|\d+[.)、]\s*)?")
+_RULE_SIMILARITY_DROP_RE = re.compile(r"[\s`*_#>\-+•·\d.、,，。；;：:!?！？（）()\[\]【】《》“”\"'/\\|=]+")
+
+
+def _normalize_rule_similarity_key(value: str) -> str:
+    text = _RULE_PREFIX_RE.sub("", str(value or "").strip().lower())
+    return _RULE_SIMILARITY_DROP_RE.sub("", text)
+
+
+def _prompt_rule_units(prompt_text: str) -> list[dict[str, str]]:
+    units: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_line in str(prompt_text or "").splitlines():
+        line = _clean(raw_line)
+        if not line or line.startswith("#"):
+            continue
+        key = _normalize_rule_similarity_key(line)
+        if len(key) < 8 or key in seen:
+            continue
+        seen.add(key)
+        units.append({"text": line, "key": key})
+    return units
+
+
+def _is_similar_rule_key(candidate: str, existing: str) -> bool:
+    if not candidate or not existing:
+        return False
+    min_len = min(len(candidate), len(existing))
+    max_len = max(len(candidate), len(existing))
+    if min_len < 8:
+        return candidate == existing
+    if candidate in existing or existing in candidate:
+        return min_len >= 12 and (min_len / max_len) >= 0.58
+    if min_len < 14:
+        return False
+    return difflib.SequenceMatcher(None, candidate, existing).ratio() >= 0.88
+
+
+def _find_similar_existing_rule(text: str, existing_units: list[dict[str, str]]) -> dict[str, str] | None:
+    key = _normalize_rule_similarity_key(text)
+    if len(key) < 8:
+        return None
+    for unit in existing_units:
+        if _is_similar_rule_key(key, unit["key"]):
+            return unit
+    return None
+
+
+def _prune_duplicate_insert_text(text: str, existing_units: list[dict[str, str]]) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
+    kept_lines: list[str] = []
+    kept_units: list[dict[str, str]] = []
+    duplicate_rows: list[dict[str, str]] = []
+    local_units = list(existing_units)
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            continue
+        duplicate = _find_similar_existing_rule(line, local_units)
+        if duplicate:
+            duplicate_rows.append({"text": line.strip(), "existing_text": duplicate["text"]})
+            continue
+        kept_lines.append(line)
+        key = _normalize_rule_similarity_key(line)
+        if key:
+            unit = {"text": line.strip(), "key": key}
+            kept_units.append(unit)
+            local_units.append(unit)
+    return "\n".join(kept_lines).strip(), kept_units, duplicate_rows
 
 
 def _dedupe_preserve_order(values: list[Any]) -> list[str]:
@@ -1192,9 +1236,39 @@ def _merge_section_patch_edits(
         edits.append({k: v for k, v in item.items() if not k.startswith("_")})
     edits.sort(key=lambda item: (item.get("target_id") or "", item.get("op") or "", item.get("edit_id") or ""))
     limited_edits: list[dict[str, Any]] = []
+    existing_rule_units = _prompt_rule_units("\n\n".join(section.text for section in sections))
     total_patch_chars = 0
+    total_append_chars = 0
     for edit in edits:
+        if edit.get("op") != "replace_within_section":
+            unique_text, new_units, duplicate_rows = _prune_duplicate_insert_text(str(edit.get("text") or ""), existing_rule_units)
+            for duplicate in duplicate_rows:
+                skipped.append({
+                    **edit,
+                    "text": duplicate["text"],
+                    "message": f"新增规则与整篇提取 prompt 已有规则高度相似，已跳过。已有规则：{_truncate(duplicate['existing_text'], 120)}",
+                })
+            if not unique_text:
+                continue
+            edit = {**edit, "text": unique_text}
+
         change_text = str(edit.get("text") or edit.get("new_text") or "")
+        if edit.get("op") != "replace_within_section" and total_append_chars + len(change_text) > MAX_ADVISOR_APPEND_TEXT_CHARS:
+            remaining_chars = MAX_ADVISOR_APPEND_TEXT_CHARS - total_append_chars
+            kept_lines: list[str] = []
+            kept_size = 0
+            for line in change_text.splitlines():
+                added = len(line) + (1 if kept_lines else 0)
+                if remaining_chars > 0 and kept_size + added <= remaining_chars:
+                    kept_lines.append(line)
+                    kept_size += added
+                else:
+                    skipped.append({**edit, "text": line, "message": f"追加文本累计超过 {MAX_ADVISOR_APPEND_TEXT_CHARS} 字，为避免提示词持续膨胀，已跳过该行。"})
+            change_text = "\n".join(kept_lines).strip()
+            if not change_text:
+                continue
+            edit = {**edit, "text": change_text}
+            new_units = _prompt_rule_units(change_text)
         change_size = len(change_text)
         if len(limited_edits) >= MAX_ADVISOR_PATCH_EDITS:
             skipped.append({**edit, "message": f"patch edit 数超过 {MAX_ADVISOR_PATCH_EDITS} 条，为避免 prompt 暴增，已跳过。"})
@@ -1204,6 +1278,9 @@ def _merge_section_patch_edits(
             continue
         limited_edits.append(edit)
         total_patch_chars += change_size
+        if edit.get("op") != "replace_within_section":
+            total_append_chars += change_size
+            existing_rule_units.extend(new_units)
     edits = limited_edits
     return {"edits": edits, "conflicts": conflicts, "skipped": skipped}
 

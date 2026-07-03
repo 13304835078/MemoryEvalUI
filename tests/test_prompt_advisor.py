@@ -511,6 +511,140 @@ def test_prompt_advisor_skips_case_specific_or_overlong_patch(monkeypatch):
     assert any("过长" in item.get("message", "") for item in skipped)
 
 
+def test_prompt_advisor_skips_append_that_duplicates_whole_prompt(monkeypatch):
+    extraction_prompt = (
+        "## A4 兴趣爱好\n"
+        "- 单次评价默认不记录。\n\n"
+        "## A5 稳定偏好\n"
+        "- 单次影视作品评价只有明确表达长期偏好或稳定审美时才沉淀。\n"
+    )
+    stage1 = {
+        "can_suggest": True,
+        "evidence_summary": "同一规则边界不清",
+        "diagnoses": [],
+        "patch_intents": [
+            {
+                "intent_id": "I001",
+                "section_id": "S001",
+                "problem_type": "missing_boundary",
+                "issue_summary": "边界不清",
+                "proposed_direction": "补充通用规则",
+                "confidence": "medium",
+                "evidence_refs": ["case_1"],
+            }
+        ],
+        "risks": [],
+        "validation_plan": [],
+    }
+    stage2 = {
+        "can_suggest": True,
+        "section_id": "S001",
+        "extraction_prompt_patch": {
+            "edits": [
+                {
+                    "op": "append_to_section",
+                    "target_id": "S001",
+                    "text": "- 单次影视作品评价只有明确表达长期偏好或稳定审美时才沉淀。",
+                    "reason": "重复规则",
+                    "evidence_refs": ["case_1"],
+                }
+            ]
+        },
+        "section_notes": "bad",
+    }
+    responses = [
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage1, ensure_ascii=False)}}]}),
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
+    ]
+
+    def fake_post(_url, headers, data, timeout):
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
+
+    result, _raw = call_prompt_advisor(
+        EvalConfig(judge_max_retries=1, judge_request_interval=0),
+        evidence=[{"case_id": "case_1", "comment": "漏记"}],
+        current_judge_prompt="judge",
+        extraction_prompt=extraction_prompt,
+        target="extraction_prompt",
+        min_evidence=1,
+    )
+
+    assert result["candidate_prompt_source"] == "no_valid_incremental_patch"
+    skipped = result["extraction_prompt_patch_skipped_before_apply"]
+    assert any("已有规则" in item.get("message", "") for item in skipped)
+
+
+def test_prompt_advisor_limits_cumulative_append_growth(monkeypatch):
+    extraction_prompt = "## A4 兴趣爱好\n- 单次评价默认不记录。\n"
+    first_rule = "长期偏好边界需要结合明确持续表达、反复出现的同类选择和稳定审美判断，避免把一次闲聊直接沉淀。" * 4
+    second_rule = "排除规则边界需要优先过滤临时情绪、一次性任务、上下文玩笑和无法复用的信息，避免写入长期画像。" * 4
+    stage1 = {
+        "can_suggest": True,
+        "evidence_summary": "同一规则边界不清",
+        "diagnoses": [],
+        "patch_intents": [
+            {
+                "intent_id": "I001",
+                "section_id": "S001",
+                "problem_type": "missing_boundary",
+                "issue_summary": "边界不清",
+                "proposed_direction": "补充通用规则",
+                "confidence": "medium",
+                "evidence_refs": ["case_1"],
+            }
+        ],
+        "risks": [],
+        "validation_plan": [],
+    }
+    stage2 = {
+        "can_suggest": True,
+        "section_id": "S001",
+        "extraction_prompt_patch": {
+            "edits": [
+                {
+                    "op": "append_to_section",
+                    "target_id": "S001",
+                    "text": f"- {first_rule}",
+                    "reason": "通用规则1",
+                    "evidence_refs": ["case_1"],
+                },
+                {
+                    "op": "append_to_section",
+                    "target_id": "S001",
+                    "text": f"- {second_rule}",
+                    "reason": "通用规则2",
+                    "evidence_refs": ["case_1"],
+                },
+            ]
+        },
+        "section_notes": "too much",
+    }
+    responses = [
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage1, ensure_ascii=False)}}]}),
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
+    ]
+
+    def fake_post(_url, headers, data, timeout):
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
+
+    result, _raw = call_prompt_advisor(
+        EvalConfig(judge_max_retries=1, judge_request_interval=0),
+        evidence=[{"case_id": "case_1", "comment": "漏记"}],
+        current_judge_prompt="judge",
+        extraction_prompt=extraction_prompt,
+        target="extraction_prompt",
+        min_evidence=1,
+    )
+
+    patch_result = result["extraction_prompt_patch_result"]
+    assert patch_result["change_chars"] <= 400
+    assert any("追加文本累计超过" in item.get("message", "") for item in result["extraction_prompt_patch_skipped_before_apply"])
+
+
 def test_prompt_advisor_retries_idle_timeout_with_compacted_payload(monkeypatch):
     evidence = [
         {
