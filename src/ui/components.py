@@ -6,7 +6,7 @@ import json
 import pandas as pd
 import streamlit as st
 
-from src.schema import Case, EvalResult
+from src.schema import Case, EvalResult, TaskType
 from src.eval.metrics import DIM_LABELS, TAG_LABELS
 from src.ui.rule_ref_validation import rule_ref_validation_rows, validate_result_rule_refs
 
@@ -72,6 +72,7 @@ def render_rule_ref_validation(result: EvalResult) -> None:
 
 def render_eval_result(result: EvalResult) -> None:
     st.subheader("评测结果")
+    document_name = "MEMORY.md" if result.task_type == TaskType.LONG_MEMORY.value else "USER.md"
 
     if result.fatal_error:
         st.error("严重失败：是")
@@ -97,7 +98,7 @@ def render_eval_result(result: EvalResult) -> None:
     st.markdown("**核心结果字段**")
     st.dataframe(pd.DataFrame(key_rows), use_container_width=True, hide_index=True)
     st.caption(
-        "output_refs / out_refs 指裁判引用的新 USER.md 候选输出片段；"
+        f"output_refs / out_refs 指裁判引用的新 {document_name} 候选输出片段；"
         "它不是事实证据，事实证据在 evidence_refs。"
     )
 
@@ -188,11 +189,13 @@ def render_dialogue(case: Case) -> None:
 
 def render_case_input(case: Case) -> None:
     st.subheader("输入与候选输出")
+    is_long_memory = case.task_type == TaskType.LONG_MEMORY
+    document_label = "长期记忆 MEMORY.md" if is_long_memory else "用户画像 USER.md"
 
     col_old, col_new = st.columns(2)
 
     with col_old:
-        st.markdown("**旧用户画像**")
+        st.markdown(f"**旧{document_label}**")
         st.text_area(
             "old_memory",
             value=case.old_memory or "",
@@ -202,7 +205,7 @@ def render_case_input(case: Case) -> None:
         )
 
     with col_new:
-        st.markdown("**候选用户画像**")
+        st.markdown(f"**候选{document_label}**")
         st.text_area(
             "candidate_output",
             value=case.candidate_output or "",
@@ -211,7 +214,7 @@ def render_case_input(case: Case) -> None:
             label_visibility="collapsed",
         )
 
-    with st.expander("旧用户画像和候选用户画像差异", expanded=False):
+    with st.expander(f"旧{document_label}和候选{document_label}差异", expanded=False):
         diff_text = make_text_diff(case.old_memory, case.candidate_output)
         st.code(diff_text or "无差异", language="diff")
 

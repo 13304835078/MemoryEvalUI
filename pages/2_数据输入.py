@@ -10,7 +10,12 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.schema import TaskType, cases_from_jsonl
+from src.schema import (
+    EVALUATABLE_TASK_TYPES,
+    TASK_TYPE_LABELS,
+    TaskType,
+    cases_from_jsonl,
+)
 from src.extraction.memory_extractor import (
     EXTRACTION_OUTPUT_DIR,
     MemoryExtractionConfig,
@@ -25,6 +30,7 @@ from src.ui.data_service import (
     save_uploaded_file,
     save_cases,
     cases_to_dataframe,
+    prepare_long_memory_cases_from_run_output,
     prepare_cases_from_run_output,
 )
 from src.ui.prompt_editor import (
@@ -37,7 +43,7 @@ from src.ui.prompt_editor import (
 
 
 def get_eval_task_choices() -> list[str]:
-    return [t.value for t in TaskType if t.value != "raw_dialogue"]
+    return [task.value for task in EVALUATABLE_TASK_TYPES]
 
 
 st.title("数据输入")
@@ -61,6 +67,7 @@ st.session_state.task_type = st.selectbox(
     task_choices,
     index=task_choices.index(st.session_state.task_type)
     if st.session_state.task_type in task_choices else 0,
+    format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
 )
 
 mode = st.radio(
@@ -69,6 +76,7 @@ mode = st.radio(
         "选择已有样本文件",
         "运行 USER.md 记忆提取",
         "上传 run_user.py 输出 Excel",
+        "上传长期记忆提取结果 Excel",
         "上传通用 Excel / JSON / JSONL",
         "读取 Markdown 样本目录",
     ],
@@ -89,6 +97,8 @@ if mode == "选择已有样本文件":
             cases = cases_from_jsonl(selected_path)
             st.session_state.cases = cases
             st.session_state.cases_file = selected_path
+            if cases:
+                st.session_state.task_type = cases[0].task_type.value
             st.success(f"已加载 {len(cases)} 条样本：{selected_path}")
 
 elif mode == "运行 USER.md 记忆提取":
@@ -436,6 +446,98 @@ elif mode == "上传 run_user.py 输出 Excel":
                     st.dataframe(pd.DataFrame(skipped), use_container_width=True, hide_index=True)
         except Exception as e:
             st.error(f"转换失败：{e}")
+
+elif mode == "上传长期记忆提取结果 Excel":
+    st.info(
+        "适用于长期记忆提取程序输出。系统按「轮次 == 1」切 session、按分块大小读取末行结果，"
+        "并兼容 `MEMORY.md` 与 `生成的MEMORY.md正文` 两种结果列名。评测人变化时，旧 MEMORY.md 从空开始。"
+    )
+
+    uploaded = st.file_uploader(
+        "上传长期记忆结果 Excel",
+        type=["xlsx", "xls"],
+        key="long_memory_result_upload",
+    )
+    local_excel_path = st.text_input(
+        "或输入本地 Excel 路径",
+        value="",
+        placeholder=r"C:\Users\...\memory_result.xlsx",
+        key="long_memory_result_path",
+    )
+    chunk_size = st.number_input(
+        "分块大小",
+        min_value=1,
+        max_value=200,
+        value=10,
+        step=1,
+        help="必须与生成该 Excel 时使用的 chunk_size 一致；当前提取程序默认为 10。",
+        key="long_memory_chunk_size",
+    )
+    model_name = st.text_input(
+        "被评测模型名",
+        value="unknown",
+        key="long_memory_model_name",
+    )
+    prompt_version = st.text_input(
+        "长期记忆提取提示词版本",
+        value=infer_prompt_version(get_default_extraction_prompt_file(TaskType.LONG_MEMORY.value)),
+        key="long_memory_prompt_version",
+    )
+
+    input_ready = uploaded is not None or bool(local_excel_path.strip())
+    if input_ready and st.button(
+        "转换为长期记忆评测样本",
+        type="primary",
+        use_container_width=True,
+        key="convert_long_memory_cases",
+    ):
+        try:
+            if uploaded is not None:
+                path = save_uploaded_file(uploaded, suffix=Path(uploaded.name).suffix)
+            else:
+                path = local_excel_path.strip().strip('"')
+                if not Path(path).is_file():
+                    raise FileNotFoundError(f"本地文件不存在：{path}")
+
+            cases, missed_cases, convert_stats = prepare_long_memory_cases_from_run_output(
+                path,
+                model=model_name,
+                prompt_version=prompt_version,
+                chunk_size=int(chunk_size),
+                return_missed=True,
+            )
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_name = (
+                f"{sanitize_filename(model_name)}_{sanitize_filename(prompt_version)}_"
+                f"long_memory_cases_{timestamp}.jsonl"
+            )
+            out_path = save_cases(cases, out_name)
+
+            missed_out_path = ""
+            if missed_cases:
+                missed_out_name = (
+                    f"{sanitize_filename(model_name)}_{sanitize_filename(prompt_version)}_"
+                    f"long_memory_missed_cases_{timestamp}.jsonl"
+                )
+                missed_out_path = save_cases(missed_cases, missed_out_name)
+
+            st.session_state.task_type = TaskType.LONG_MEMORY.value
+            st.session_state.cases = cases
+            st.session_state.cases_file = out_path
+            st.session_state.missed_cases = missed_cases
+            st.session_state.missed_cases_file = missed_out_path
+            st.session_state.case_convert_stats = convert_stats
+
+            st.success(f"转换完成：{len(cases)} 条长期记忆样本 → {out_path}")
+            st.caption(
+                f"总分块：{convert_stats.get('total_chunks', 0)} | "
+                f"完整样本：{convert_stats.get('generated_cases', 0)} | "
+                f"漏抽样本：{convert_stats.get('missed_cases', 0)}"
+            )
+            if missed_out_path:
+                st.warning(f"发现 {len(missed_cases)} 个漏抽分块，已另存为：{missed_out_path}")
+        except Exception as e:
+            st.error(f"长期记忆结果转换失败：{e}")
 
 elif mode == "上传通用 Excel / JSON / JSONL":
     uploaded = st.file_uploader("上传文件", type=["xlsx", "xls", "json", "jsonl"])

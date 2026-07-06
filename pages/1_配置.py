@@ -8,7 +8,7 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.schema import TaskType, DIMENSION_WEIGHTS
+from src.schema import DIMENSION_WEIGHTS, EVALUATABLE_TASK_TYPES, TASK_TYPE_LABELS
 from src.eval.judge_client import RealJudgeClient
 from src.ui.config_store import load_config, save_config, build_eval_config, mask_token
 from src.ui.prompt_editor import (
@@ -24,7 +24,7 @@ from src.ui.prompt_editor import (
 
 
 def get_eval_task_choices() -> list[str]:
-    return [t.value for t in TaskType if t.value != "raw_dialogue"]
+    return [task.value for task in EVALUATABLE_TASK_TYPES]
 
 
 st.title("配置")
@@ -49,6 +49,16 @@ if "extraction_prompt_text" not in st.session_state:
         st.session_state.selected_extraction_prompt_file,
         prompt_kind="extraction",
     )
+
+if st.session_state.get("selected_prompt_task_type") != st.session_state.task_type:
+    st.session_state.selected_prompt_file = get_default_prompt_file(st.session_state.task_type)
+    st.session_state.judge_prompt_text = load_prompt(st.session_state.selected_prompt_file)
+    st.session_state.selected_extraction_prompt_file = get_default_extraction_prompt_file(st.session_state.task_type)
+    st.session_state.extraction_prompt_text = load_prompt(
+        st.session_state.selected_extraction_prompt_file,
+        prompt_kind="extraction",
+    )
+    st.session_state.selected_prompt_task_type = st.session_state.task_type
 
 
 col_api, col_prompt = st.columns([1, 1])
@@ -244,6 +254,7 @@ with col_prompt:
         task_choices,
         index=task_choices.index(st.session_state.task_type)
         if st.session_state.task_type in task_choices else 0,
+        format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
     )
 
     if task_type != st.session_state.task_type:
@@ -255,8 +266,10 @@ with col_prompt:
             st.session_state.selected_extraction_prompt_file,
             prompt_kind="extraction",
         )
+        st.session_state.selected_prompt_task_type = task_type
         st.rerun()
 
+    document_name = "MEMORY.md" if task_type == "long_memory" else "USER.md"
     tab_judge, tab_extract = st.tabs(["裁判提示词", "提取提示词"])
 
     with tab_judge:
@@ -319,7 +332,7 @@ with col_prompt:
             extraction_files,
             index=extraction_files.index(st.session_state.selected_extraction_prompt_file)
             if st.session_state.selected_extraction_prompt_file in extraction_files else 0,
-            help="这里放生成 USER.md 时使用的提取 prompt。执行评测时它只作为规则来源，不作为事实来源。",
+            help=f"这里放生成 {document_name} 时使用的提取 prompt。执行评测时它只作为规则来源，不作为事实来源。",
         )
 
         if selected_extraction_prompt != st.session_state.selected_extraction_prompt_file:
@@ -346,7 +359,7 @@ with col_prompt:
             "提取提示词内容",
             value=st.session_state.extraction_prompt_text,
             height=360,
-            help="建议把真实线上提取 prompt 粘贴到这里，再另存为版本；裁判会引用这里的规则判断 USER.md 是否稳定。",
+            help=f"建议把真实线上提取 prompt 粘贴到这里，再另存为版本；裁判会引用这里的规则判断 {document_name} 是否稳定。",
         )
 
         extraction_version_name = st.text_input(

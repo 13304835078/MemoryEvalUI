@@ -10,6 +10,7 @@ from src.ui.data_service import (
     case_resume_key,
     eval_result_resume_key,
     load_results,
+    prepare_long_memory_cases_from_run_output,
     prepare_cases_from_run_output,
 )
 
@@ -193,6 +194,69 @@ def test_prepare_run_output_all_missed_does_not_raise_with_return_missed():
         assert len(missed_cases) == 1
         assert stats["generated_cases"] == 0
         assert stats["missed_cases"] == 1
+    finally:
+        os.unlink(tmp)
+
+
+def test_prepare_long_memory_cases_uses_memory_columns_and_resets_when_reviewer_changes():
+    df = pd.DataFrame({
+        "session_id": ["s1", "s1", "s2", "s3", "s4"],
+        "轮次": [1, 2, 1, 1, 1],
+        "query": ["q1", "q2", "q3", "q4", "q5"],
+        "answer": ["a1", "a2", "a3", "a4", "a5"],
+        "评测人": ["alice", "alice", "alice", "bob", "alice"],
+        "MEMORY.md": ["", "- 计划：A1", "- 计划：A2", "- 计划：B1", "- 计划：A3"],
+        "模型原始返回": ["", "raw1", "raw2", "raw3", "raw4"],
+        "reasoning": ["", "r1", "r2", "r3", "r4"],
+    })
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        tmp = f.name
+    try:
+        df.to_excel(tmp, index=False)
+        cases, missed, stats = prepare_long_memory_cases_from_run_output(
+            tmp,
+            model="memory-model",
+            prompt_version="memory-v1",
+            chunk_size=2,
+            return_missed=True,
+        )
+
+        assert not missed
+        assert stats["generated_cases"] == 4
+        assert [case.task_type for case in cases] == [TaskType.LONG_MEMORY] * 4
+        assert cases[0].old_memory is None
+        assert cases[0].candidate_output == "- 计划：A1"
+        assert cases[1].old_memory == "- 计划：A1"
+        assert cases[1].candidate_output == "- 计划：A2"
+        assert cases[2].old_memory is None
+        assert cases[2].candidate_output == "- 计划：B1"
+        assert cases[3].old_memory is None
+        assert cases[3].candidate_output == "- 计划：A3"
+        assert cases[0].metadata["candidate_source_column"] == "MEMORY.md"
+        assert cases[0].metadata["document_name"] == "MEMORY.md"
+    finally:
+        os.unlink(tmp)
+
+
+def test_prepare_long_memory_cases_accepts_existing_program_column_name():
+    df = pd.DataFrame({
+        "轮次": [1],
+        "query": ["我准备考研"],
+        "answer": ["好的"],
+        "评测人": ["alice"],
+        "生成的MEMORY.md正文": ["- 长期计划：用户正在准备考研"],
+        "模型原始返回": ["raw"],
+        "reasoning": ["reason"],
+    })
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        tmp = f.name
+    try:
+        df.to_excel(tmp, index=False)
+        cases = prepare_long_memory_cases_from_run_output(tmp)
+
+        assert len(cases) == 1
+        assert cases[0].candidate_output == "- 长期计划：用户正在准备考研"
+        assert cases[0].metadata["candidate_source_column"] == "生成的MEMORY.md正文"
     finally:
         os.unlink(tmp)
 

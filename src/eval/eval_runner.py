@@ -25,8 +25,13 @@ PROMPT_MAP = {
 JUDGE_PROMPT_VERSION = {
     TaskType.USER_MD: "judge_user_md_absolute_stable_with_rules_v1",
     TaskType.DAY_MEMORY: "v1",
-    TaskType.LONG_MEMORY: "v1",
+    TaskType.LONG_MEMORY: "judge_long_memory_v1",
     TaskType.SUMMARY: "v1",
+}
+
+TASK_DOCUMENT_NAMES = {
+    TaskType.USER_MD: "USER.md",
+    TaskType.LONG_MEMORY: "MEMORY.md",
 }
 
 
@@ -131,10 +136,14 @@ class EvalRunner:
         self.extraction_prompt_text = extraction_prompt_text.strip()
         self.extraction_prompt_version = extraction_prompt_version
         self.extraction_prompt_hash = extraction_prompt_hash or self._hash_prompt(self.extraction_prompt_text)
+        self.document_name = TASK_DOCUMENT_NAMES.get(task_type, "候选输出")
 
         self.system_prompt = self._load_judge_prompt()
         if self.extraction_prompt_text:
-            self.system_prompt = self._append_extraction_stability_contract(self.system_prompt)
+            self.system_prompt = self._append_extraction_stability_contract(
+                self.system_prompt,
+                self.document_name,
+            )
         self.judge_client: JudgeClient = self._create_judge_client()
 
     @staticmethod
@@ -144,7 +153,7 @@ class EvalRunner:
         return hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _append_extraction_stability_contract(system_prompt: str) -> str:
+    def _append_extraction_stability_contract(system_prompt: str, document_name: str = "USER.md") -> str:
         contract = """
 
 ## 提取规则辅助评测稳定契约
@@ -162,6 +171,7 @@ class EvalRunner:
 - 对同类错误使用相同扣分尺度，不因措辞或样本顺序改变评分。
 - 没有明确证据或明确规则依据时，不要重扣分。
 """.strip()
+        contract = contract.replace("USER.md", document_name)
         if "提取规则辅助评测稳定契约" in system_prompt:
             return system_prompt
         return f"{system_prompt.rstrip()}\n\n{contract}\n"
@@ -218,6 +228,7 @@ class EvalRunner:
         return results
 
     def _build_user_message(self, case: Case) -> str:
+        document_name = self.document_name
         old = case.old_memory or "（空）"
         dialogue_lines = []
         for turn in case.dialogue:
@@ -235,8 +246,9 @@ class EvalRunner:
             rule_candidates_text = "\n".join(f"- {item}" for item in rule_candidates) or "（未提取到标题，可引用提取 prompt 原文短句）"
             extraction_section = (
                 "## 提取规则（仅作为规则依据，不是事实来源）\n"
-                "下面是生成 USER.md 时使用或参考的提取 prompt。评测时只能把它作为规则来源，"
-                "不能把其中的描述当作用户事实。事实依据仍然只能来自旧 USER.md、对话记录、模型 reasoning 和新 USER.md。\n\n"
+                f"下面是生成 {document_name} 时使用或参考的提取 prompt。评测时只能把它作为规则来源，"
+                f"不能把其中的描述当作用户事实。事实依据仍然只能来自旧 {document_name}、"
+                f"对话记录、模型 reasoning 和新 {document_name}。\n\n"
                 f"{extraction_rules}\n\n"
                 "## 可引用的提取规则标题清单\n"
                 "下面这些标题来自提取 prompt。请优先在 comment、rule_refs 和 diagnostics.rule_refs 中引用这些真实标题；"
@@ -245,8 +257,9 @@ class EvalRunner:
                 "## 规则引用要求\n"
                 "只要提供了提取规则，每条结果都必须在 JSON 顶层给出 rule_refs、evidence_refs、output_refs。\n"
                 "- rule_refs: 必须逐字引用提取规则中真实存在的编号、标题或原文短片段；不要发明规则编号。\n"
-                "- evidence_refs: 引用旧 USER.md、对话记录或 reasoning 中支持判断的证据。\n"
-                "- output_refs: 引用新 USER.md 中对应的输出片段；如果新 USER.md 为空但合理，请写“新 USER.md 为空”。\n"
+                f"- evidence_refs: 引用旧 {document_name}、对话记录或 reasoning 中支持判断的证据。\n"
+                f"- output_refs: 引用新 {document_name} 中对应的输出片段；"
+                f"如果新 {document_name} 为空但合理，请写“新 {document_name} 为空”。\n"
                 "- comment: 必须包含主要规则引用，例如“符合‘## 1. 只基于 user 提取 / A. 允许记录’；无明显边界污染”。\n"
                 "如果提取规则中没有 R1/R2/R3/R4 这类编号，禁止在 rule_refs、diagnostics 或 comment 中输出这类编号。\n"
                 "任一维度低于 5 分或 error_tags 非空时，必须在 diagnostics 中至少给出一项："
@@ -256,10 +269,10 @@ class EvalRunner:
 
         return (
             f"{extraction_section}"
-            f"## 旧 USER.md\n{old}\n\n"
+            f"## 旧 {document_name}\n{old}\n\n"
             f"## 对话记录\n{dialogue_text}\n\n"
             f"## 模型 reasoning\n{reasoning_text}\n\n"
-            f"## 新 USER.md\n{candidate}"
+            f"## 新 {document_name}\n{candidate}"
         )
 
     def _parse_judge_result(self, case: Case, judge_response: dict,

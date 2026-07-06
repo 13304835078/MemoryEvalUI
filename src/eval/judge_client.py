@@ -448,8 +448,9 @@ class MockJudgeClient(JudgeClient):
 
 
 def _detect_content(user_message: str) -> bool:
-    marker = "## 新 USER.md"
-    idx = user_message.rfind(marker)
+    markers = ("## 新 USER.md", "## 新 MEMORY.md", "## 候选输出")
+    marker = next((item for item in markers if item in user_message), "")
+    idx = user_message.rfind(marker) if marker else -1
     if idx == -1:
         return True
     after = user_message[idx + len(marker):].strip()

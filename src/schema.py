@@ -15,6 +15,14 @@ class TaskType(str, Enum):
     SUMMARY = "summary"
 
 
+EVALUATABLE_TASK_TYPES = (TaskType.USER_MD, TaskType.LONG_MEMORY)
+
+TASK_TYPE_LABELS = {
+    TaskType.USER_MD.value: "用户画像 USER.md",
+    TaskType.LONG_MEMORY.value: "长期记忆 MEMORY.md",
+}
+
+
 @dataclass
 class DialogueTurn:
     role: str
@@ -88,7 +96,10 @@ SCORING_DIMENSIONS: dict[str, list[str]] = {
         "memory_boundary", "conciseness", "format",
     ],
     "day_memory": [],
-    "long_memory": [],
+    "long_memory": [
+        "correctness", "coverage", "update_logic",
+        "memory_boundary", "conciseness", "format",
+    ],
     "summary": [],
 }
 
@@ -98,7 +109,10 @@ DIMENSION_WEIGHTS: dict[str, dict[str, float]] = {
         "memory_boundary": 0.15, "conciseness": 0.10, "format": 0.05,
     },
     "day_memory": {},
-    "long_memory": {},
+    "long_memory": {
+        "correctness": 0.30, "coverage": 0.20, "update_logic": 0.20,
+        "memory_boundary": 0.15, "conciseness": 0.10, "format": 0.05,
+    },
     "summary": {},
 }
 

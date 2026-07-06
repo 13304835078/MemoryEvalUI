@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src import runtime_paths
+from src.extraction.memory_extractor import parse_generation_prompt_templates
 from src.persistence import atomic_write_text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -28,7 +29,7 @@ TASK_PROMPT_DEFAULTS = {
 TASK_EXTRACTION_PROMPT_DEFAULTS = {
     "user_md_update": "extract_user_md_rules_example_v1.md",
     "day_memory": "",
-    "long_memory": "",
+    "long_memory": "extract_long_memory_v1.yaml",
     "summary": "",
 }
 
@@ -78,7 +79,22 @@ def load_prompt(prompt_file: str, prompt_kind: str = "judge") -> str:
     if not path.exists():
         return ""
 
-    return path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    if prompt_kind == "extraction" and path.suffix.lower() in {".yaml", ".yml"}:
+        return _extract_prompt_from_yaml(text, path)
+    return text
+
+
+def load_extraction_prompt_templates(prompt_file: str) -> dict[str, str]:
+    if not prompt_file:
+        return {"create": "", "update": ""}
+    path = _resolve_prompt_path(prompt_file, "extraction")
+    if not path.exists():
+        return {"create": "", "update": ""}
+    return parse_generation_prompt_templates(
+        path.read_text(encoding="utf-8"),
+        path.suffix,
+    )
 
 
 def save_prompt_version(task_type: str, content: str, version_name: str = "", prompt_kind: str = "judge") -> str:
@@ -132,8 +148,16 @@ def _list_prompt_files(user_dir: Path, bundled_dir: Path) -> list[str]:
     names: set[str] = set()
     if bundled_dir.exists():
         names.update(p.name for p in bundled_dir.glob("*.md"))
+        names.update(p.name for p in bundled_dir.glob("*.yaml"))
+        names.update(p.name for p in bundled_dir.glob("*.yml"))
     names.update(p.name for p in user_dir.glob("*.md"))
+    names.update(p.name for p in user_dir.glob("*.yaml"))
+    names.update(p.name for p in user_dir.glob("*.yml"))
     return sorted(names)
+
+
+def _extract_prompt_from_yaml(text: str, path: Path) -> str:
+    return parse_generation_prompt_templates(text, path.suffix)["update"]
 
 
 def _resolve_prompt_path(prompt_file: str, prompt_kind: str) -> Path:

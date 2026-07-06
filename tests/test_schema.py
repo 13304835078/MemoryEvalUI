@@ -5,6 +5,8 @@ from src.schema import (
     Case,
     DialogueTurn,
     EvalResult,
+    DIMENSION_WEIGHTS,
+    SCORING_DIMENSIONS,
     TaskType,
     cases_to_jsonl,
     cases_from_jsonl,
@@ -127,3 +129,8 @@ def test_eval_result_old_json_is_compatible():
     result = EvalResult.from_dict(old)
     assert result.extraction_prompt_version == ""
     assert result.diagnostics == []
+
+
+def test_long_memory_has_complete_scoring_schema():
+    assert SCORING_DIMENSIONS["long_memory"] == SCORING_DIMENSIONS["user_md_update"]
+    assert sum(DIMENSION_WEIGHTS["long_memory"].values()) == 1.0

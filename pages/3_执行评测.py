@@ -10,7 +10,12 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.schema import TaskType, cases_from_jsonl
+from src.schema import (
+    EVALUATABLE_TASK_TYPES,
+    TASK_TYPE_LABELS,
+    TaskType,
+    cases_from_jsonl,
+)
 from src.ui.config_store import load_config, build_eval_config
 from src.ui.eval_job_runner import (
     EvalJobConfig,
@@ -43,7 +48,7 @@ from src.ui.data_service import (
 
 
 def get_eval_task_choices() -> list[str]:
-    return [t.value for t in TaskType if t.value != "raw_dialogue"]
+    return [task.value for task in EVALUATABLE_TASK_TYPES]
 
 
 NO_EXTRACTION_PROMPT = "不使用提取规则辅助评测"
@@ -254,6 +259,8 @@ else:
         cases = cases_from_jsonl(selected_path)
         st.session_state.cases = cases
         st.session_state.cases_file = selected_path
+        if cases:
+            st.session_state.task_type = cases[0].task_type.value
         st.success(f"已加载 {len(cases)} 条样本")
         st.rerun()
 
@@ -268,12 +275,25 @@ else:
 st.divider()
 st.subheader("评测配置")
 
+case_task_types = {
+    case.task_type.value if isinstance(case.task_type, TaskType) else str(case.task_type)
+    for case in cases
+}
+if len(case_task_types) == 1:
+    inferred_task_type = next(iter(case_task_types))
+    if inferred_task_type in get_eval_task_choices():
+        st.session_state.task_type = inferred_task_type
+elif len(case_task_types) > 1:
+    st.error(f"当前样本文件混合了多个任务类型：{sorted(case_task_types)}。请拆分后分别评测。")
+    st.stop()
+
 task_choices = get_eval_task_choices()
 task_type = st.selectbox(
     "任务类型",
     task_choices,
     index=task_choices.index(st.session_state.task_type)
     if st.session_state.task_type in task_choices else 0,
+    format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
 )
 st.session_state.task_type = task_type
 
@@ -294,6 +314,11 @@ if int(cfg.get("judge_concurrency", 1) or 1) > 1 and request_interval_for_warnin
         "当前并发数大于 1，但请求间隔小于 10 秒。如果接口返回 `QPS limit exceeded, limit:0.10`，"
         "说明最多约 10 秒 1 次请求；建议把“请求间隔”设为 10.5 秒以上，并把并发降到 1-2。"
     )
+
+if st.session_state.get("selected_prompt_task_type") != task_type:
+    st.session_state.selected_prompt_file = get_default_prompt_file(task_type)
+    st.session_state.selected_extraction_prompt_file = get_default_extraction_prompt_file(task_type)
+    st.session_state.selected_prompt_task_type = task_type
 
 prompt_files = list_prompt_files()
 default_prompt_file = get_default_prompt_file(task_type)

@@ -119,7 +119,11 @@ if case:
     render_case_metadata(case)
     render_dialogue(case)
 else:
-    st.warning("没有加载对应样本文件，因此只能展示评测结果，无法展示旧用户画像、对话和候选用户画像。")
+    document_name = "MEMORY.md" if result.task_type == "long_memory" else "USER.md"
+    st.warning(
+        f"没有加载对应样本文件，因此只能展示评测结果，"
+        f"无法展示旧 {document_name}、对话和候选 {document_name}。"
+    )
 
 st.divider()
 render_eval_result(result)

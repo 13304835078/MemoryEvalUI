@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from src.ui import prompt_editor
 
@@ -48,3 +49,18 @@ def test_save_prompt_version_writes_user_dir_and_metadata(monkeypatch, tmp_path)
     assert metadata["task_type"] == "user_md_update"
     assert metadata["prompt_kind"] == "extraction"
     assert metadata["sha1"] == prompt_editor.prompt_text_hash("new extraction prompt")
+
+
+def test_extract_long_memory_update_prompt_from_nested_yaml():
+    text = """
+memory_extraction:
+  create_template: |
+    create prompt
+  update_template: |
+    update prompt
+    second line
+"""
+
+    prompt = prompt_editor._extract_prompt_from_yaml(text, Path("memory.yaml"))
+
+    assert prompt == "update prompt\nsecond line"

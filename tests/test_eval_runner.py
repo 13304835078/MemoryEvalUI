@@ -90,6 +90,63 @@ def test_runner_build_user_message_with_extraction_prompt():
     assert runner.extraction_prompt_hash
 
 
+def test_long_memory_message_uses_memory_document_labels():
+    case = Case(
+        case_id="memory_case",
+        task_type=TaskType.LONG_MEMORY,
+        session_id="s1",
+        old_memory="- 计划：准备考研",
+        dialogue=[DialogueTurn(role="user", content="考研目标改为明年")],
+        candidate_output="- 计划：准备明年考研",
+        metadata={"reasoning": "用户明确修改计划时间。"},
+    )
+    runner = EvalRunner(
+        config=EvalConfig(mock=True),
+        task_type=TaskType.LONG_MEMORY,
+        extraction_prompt_text="# 记忆更新规则\n新信息优先覆盖旧信息。",
+    )
+
+    msg = runner._build_user_message(case)
+
+    assert "## 旧 MEMORY.md" in msg
+    assert "## 新 MEMORY.md" in msg
+    assert "生成 MEMORY.md 时使用" in msg
+    assert "## 旧 USER.md" not in msg
+    assert "候选 MEMORY.md" in runner.system_prompt
+
+
+def test_long_memory_score_is_recomputed_with_task_weights():
+    case = Case(
+        case_id="memory_case",
+        task_type=TaskType.LONG_MEMORY,
+        session_id="s1",
+        candidate_output="- 计划：准备考研",
+    )
+    runner = EvalRunner(
+        config=EvalConfig(mock=True),
+        task_type=TaskType.LONG_MEMORY,
+    )
+    response = {
+        "score_total": 1,
+        "scores": {
+            "correctness": 5,
+            "coverage": 4,
+            "update_logic": 3,
+            "memory_boundary": 2,
+            "conciseness": 5,
+            "format": 5,
+        },
+        "comment": "存在更新问题。",
+        "error_tags": [],
+        "fatal_error": False,
+    }
+
+    result = runner._parse_judge_result(case, response, "{}", "judge_long_memory_v1")
+
+    assert result.task_type == TaskType.LONG_MEMORY.value
+    assert result.score_total == 3.95
+
+
 def test_runner_recomputes_weighted_score_total():
     config = EvalConfig(mock=True)
     runner = EvalRunner(config, TaskType.USER_MD)

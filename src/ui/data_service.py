@@ -30,6 +30,14 @@ RESULTS_DIR = DATA_DIR / "results"
 UPLOAD_DIR = RAW_DIR / "uploads"
 
 
+def _first_nonempty_cell(row: dict, columns: tuple[str, ...]) -> str:
+    for column in columns:
+        value = str(row.get(column, "")).strip()
+        if value:
+            return value
+    return ""
+
+
 def ensure_dirs() -> None:
     ensure_writable_layout()
     for d in [RAW_DIR, CASES_DIR, RESULTS_DIR, UPLOAD_DIR]:
@@ -427,16 +435,23 @@ def prepare_cases_from_run_output(
     chunk_size: int = 10,
     return_stats: bool = False,
     return_missed: bool = False,
+    *,
+    task_type: TaskType = TaskType.USER_MD,
+    candidate_columns: tuple[str, ...] = ("user.md",),
+    raw_result_columns: tuple[str, ...] = ("result",),
+    explicit_old_columns: tuple[str, ...] = (),
+    document_name: str = "USER.md",
+    reset_on_reviewer_change: bool = False,
 ) -> list[Case] | tuple[list[Case], dict[str, Any]] | tuple[list[Case], list[Case], dict[str, Any]]:
-    """把 run_user.py 输出 Excel 转成 user_md_update cases。
+    """把按 session/chunk 生成的记忆 Excel 转成评测 cases。
 
     逻辑与 run_user.py 保持一致：
     - 先按「轮次 == 1」切 session
     - 每个 session 内按 chunk_size 分 chunk
     - 最后不足 chunk_size 的尾段也作为一个 chunk
-    - 每个 chunk 的结果只读取当前 chunk 最后一行的 user.md/result/reasoning
-    - 如果 chunk 最后一行没有 user.md/result/reasoning，视为上游漏抽，跳过该 chunk
-    - old_memory 按评测人跨 session 继承上一条 user.md
+    - 每个 chunk 的结果只读取当前 chunk 最后一行
+    - 如果末行没有候选结果、原始返回和 reasoning，视为上游漏抽
+    - USER.md 按评测人跨 session 继承；长期记忆可按上游规则在评测人切换时清空
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size 必须大于 0")
@@ -444,6 +459,7 @@ def prepare_cases_from_run_output(
     input_path = Path(input_path)
     df = pd.read_excel(input_path).fillna("")
     rows = df.to_dict("records")
+    has_explicit_old_column = any(column in df.columns for column in explicit_old_columns)
 
     if not rows:
         raise ValueError("输入 Excel 为空。")
@@ -465,6 +481,8 @@ def prepare_cases_from_run_output(
             session_ranges.append((start, end))
 
     previous_user_md_by_reviewer: dict[str, str] = {}
+    sequential_memory = ""
+    last_reviewer = ""
     cases: list[Case] = []
     missed_cases: list[Case] = []
     skipped_chunks: list[dict[str, Any]] = []
@@ -501,8 +519,8 @@ def prepare_cases_from_run_output(
                     ))
 
             boundary_row = rows[boundary]
-            current_user_md = str(boundary_row.get("user.md", "")).strip()
-            result = str(boundary_row.get("result", "")).strip()
+            current_user_md = _first_nonempty_cell(boundary_row, candidate_columns)
+            result = _first_nonempty_cell(boundary_row, raw_result_columns)
             reasoning = str(boundary_row.get("reasoning", "")).strip()
             status = str(boundary_row.get("status", "")).strip()
             error = str(boundary_row.get("error", "")).strip()
@@ -517,10 +535,21 @@ def prepare_cases_from_run_output(
             safe_reviewer = reviewer or "unknown_reviewer"
             session_label = f"session_{source_session_id}"
             chunk_label = f"chunk_{chunk_in_session + 1}"
-            previous_user_md = previous_user_md_by_reviewer.get(safe_reviewer, "")
+            if reset_on_reviewer_change:
+                if last_reviewer and safe_reviewer != last_reviewer:
+                    sequential_memory = ""
+                previous_user_md = sequential_memory
+                last_reviewer = safe_reviewer
+            else:
+                previous_user_md = previous_user_md_by_reviewer.get(safe_reviewer, "")
+            if has_explicit_old_column:
+                previous_user_md = _first_nonempty_cell(boundary_row, explicit_old_columns)
 
             has_extraction = bool(current_user_md or result or reasoning)
             if not has_extraction:
+                missing_fields = "_".join(
+                    [candidate_columns[0], raw_result_columns[0], "reasoning"]
+                ).replace(" ", "_").replace(".", "_")
                 skip_detail = {
                     "source_file": input_path.name,
                     "source_session_id": source_session_id,
@@ -532,12 +561,12 @@ def prepare_cases_from_run_output(
                     "row_end": boundary + 1,
                     "boundary_row": boundary + 1,
                     "reviewer": reviewer,
-                    "skip_reason": "chunk_last_row_missing_user_md_result_reasoning",
+                    "skip_reason": f"chunk_last_row_missing_{missing_fields}",
                 }
                 skipped_chunks.append(skip_detail)
                 missed_cases.append(Case(
                     case_id=f"missed_{safe_model}_{safe_reviewer}_{session_label}_{chunk_label}",
-                    task_type=TaskType.USER_MD,
+                    task_type=task_type,
                     session_id=source_session_id,
                     old_memory=previous_user_md if previous_user_md else None,
                     dialogue=dialogue,
@@ -551,6 +580,7 @@ def prepare_cases_from_run_output(
                         "raw_result": result,
                         "reasoning": reasoning,
                         "loader": "prepare_cases_from_run_output",
+                        "document_name": document_name,
                         "extraction_status": "missed_extraction",
                         "is_missed_case": True,
                     },
@@ -563,7 +593,7 @@ def prepare_cases_from_run_output(
 
             case = Case(
                 case_id=case_id,
-                task_type=TaskType.USER_MD,
+                task_type=task_type,
                 session_id=source_session_id,
                 old_memory=previous_user_md if previous_user_md else None,
                 dialogue=dialogue,
@@ -586,17 +616,29 @@ def prepare_cases_from_run_output(
                     "raw_result": result,
                     "reasoning": reasoning,
                     "loader": "prepare_cases_from_run_output",
-                    "extraction_status": "has_user_md",
+                    "document_name": document_name,
+                    "candidate_source_column": next(
+                        (column for column in candidate_columns if str(boundary_row.get(column, "")).strip()),
+                        candidate_columns[0],
+                    ),
+                    "extraction_status": f"has_{document_name.lower().replace('.', '_')}",
                     "is_missed_case": False,
                 },
             )
             cases.append(case)
-            previous_user_md_by_reviewer[safe_reviewer] = current_user_md
+            if reset_on_reviewer_change:
+                if current_user_md:
+                    sequential_memory = current_user_md
+            else:
+                previous_user_md_by_reviewer[safe_reviewer] = current_user_md
             global_chunk_idx += 1
             chunk_in_session += 1
 
     if not cases and not return_missed:
-        raise ValueError("未生成任何 case：所有 chunk 的最后一行都没有 user.md/result/reasoning。")
+        raise ValueError(
+            f"未生成任何 case：所有 chunk 的最后一行都没有 "
+            f"{candidate_columns[0]}/{raw_result_columns[0]}/reasoning。"
+        )
 
     stats = {
         "total_chunks": total_chunks,
@@ -612,3 +654,28 @@ def prepare_cases_from_run_output(
         return cases, stats
 
     return cases
+
+
+def prepare_long_memory_cases_from_run_output(
+    input_path: str | Path,
+    model: str = "unknown",
+    prompt_version: str = "unknown",
+    chunk_size: int = 10,
+    return_stats: bool = False,
+    return_missed: bool = False,
+) -> list[Case] | tuple[list[Case], dict[str, Any]] | tuple[list[Case], list[Case], dict[str, Any]]:
+    """把长期记忆提取程序输出 Excel 转成 long_memory cases。"""
+    return prepare_cases_from_run_output(
+        input_path,
+        model=model,
+        prompt_version=prompt_version,
+        chunk_size=chunk_size,
+        return_stats=return_stats,
+        return_missed=return_missed,
+        task_type=TaskType.LONG_MEMORY,
+        candidate_columns=("MEMORY.md", "生成的MEMORY.md正文", "memory.md"),
+        raw_result_columns=("模型原始返回", "result"),
+        explicit_old_columns=("旧MEMORY.md", "old_memory"),
+        document_name="MEMORY.md",
+        reset_on_reviewer_change=True,
+    )
