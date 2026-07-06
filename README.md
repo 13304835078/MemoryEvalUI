@@ -1,10 +1,13 @@
 # MemoryEvalUI
 
-MemoryEvalUI 是一个面向 USER.md 记忆提取的本地评测工具，覆盖数据导入、记忆提取、绝对评测、结果分析、人工复核、提示词改进和闭环实验。
+MemoryEvalUI 是一个面向 USER.md 用户画像与 MEMORY.md 长期记忆的本地评测工具，覆盖数据导入、记忆提取、绝对评测、结果分析、人工复核、提示词改进和闭环实验。
 
 ## 主要能力
 
 - 从 Excel 数据运行 USER.md 记忆提取
+- 将长期记忆提取结果 Excel 转换为 `long_memory` 评测样本
+- 直接运行 MEMORY.md 提取，并自动进入长期记忆多轮闭环
+- 分别配置 USER.md 与 MEMORY.md 的提取提示词和裁判提示词
 - 生成并管理绝对评测 case
 - 调用 Judge 模型执行结构化评分
 - 查看维度分、错误标签、规则引用和稳定性对比
