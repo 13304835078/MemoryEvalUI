@@ -19,7 +19,11 @@ from src.extraction.memory_extractor import (
 )
 from src.runtime_paths import APP_HOME, DATA_DIR
 from src.schema import EvalConfig, EvalResult, TaskType, append_result_to_jsonl, results_to_jsonl
-from src.ui.data_service import prepare_cases_from_run_output, save_cases
+from src.ui.data_service import (
+    prepare_cases_from_run_output,
+    prepare_long_memory_cases_from_run_output,
+    save_cases,
+)
 from src.ui.prompt_advisor import call_prompt_advisor, collect_absolute_eval_evidence
 from src.ui.prompt_editor import prompt_text_hash, save_prompt_version
 from src.ui.state_io import atomic_write_json, state_file_lock
@@ -38,11 +42,13 @@ class ClosedLoopConfig:
     rounds: int = 3
     chunk_size: int = 10
     max_cases_per_round: int = 0
+    task_type: str = TaskType.USER_MD.value
 
     extraction_model: str = ""
     extraction_api_base: str = ""
     extraction_api_token: str = ""
     extraction_prompt_text: str = ""
+    extraction_create_prompt_text: str = ""
     extraction_prompt_version: str = ""
     extraction_max_tokens: int = 50000
     extraction_request_interval: float = 10.0
@@ -186,6 +192,9 @@ def _make_initial_state(config: ClosedLoopConfig) -> dict[str, Any]:
     safe_config = asdict(config)
     safe_config.pop("extraction_api_token", None)
     safe_config.pop("advisor_api_token", None)
+    safe_config.pop("extraction_prompt_text", None)
+    safe_config.pop("extraction_create_prompt_text", None)
+    safe_config.pop("judge_prompt_text", None)
     if isinstance(safe_config.get("eval_config"), dict):
         safe_config["eval_config"].pop("judge_api_bearer_token", None)
     return {
@@ -221,9 +230,17 @@ def _round_record(state: dict[str, Any], round_index: int) -> dict[str, Any]:
     return rounds[round_index - 1]
 
 
-def _save_candidate_prompt(candidate_prompt: str, round_index: int) -> tuple[str, str]:
-    version_name = f"extract_closed_loop_round_{round_index}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-    saved = save_prompt_version("user_md_update", candidate_prompt, version_name, prompt_kind="extraction")
+def _save_candidate_prompt(
+    candidate_prompt: str,
+    round_index: int,
+    task_type: TaskType,
+) -> tuple[str, str]:
+    task_slug = "long_memory" if task_type == TaskType.LONG_MEMORY else "user_md"
+    version_name = (
+        f"extract_{task_slug}_closed_loop_round_{round_index}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    )
+    saved = save_prompt_version(task_type.value, candidate_prompt, version_name, prompt_kind="extraction")
     return saved, candidate_prompt
 
 
@@ -235,9 +252,10 @@ def _evaluate_cases(
     current_prompt_version: str,
     result_path: Path,
 ) -> list[EvalResult]:
+    task_type = TaskType(config.task_type)
     runner = EvalRunner(
         config=config.eval_config,
-        task_type=TaskType.USER_MD,
+        task_type=task_type,
         prompt_file=config.judge_prompt_file,
         judge_prompt_version=config.judge_prompt_version,
         system_prompt_override=config.judge_prompt_text,
@@ -329,7 +347,7 @@ def _evaluate_cases(
                     except Exception as exc:
                         result = EvalResult.from_parse_failure(
                             case_id=case.case_id,
-                            task_type=TaskType.USER_MD.value,
+                            task_type=task_type.value,
                             raw=f"{type(exc).__name__}: {exc}",
                             model_name=case.model_name,
                             prompt_version=case.prompt_version,
@@ -371,7 +389,9 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
     write_loop_state(config.run_id, state)
 
     current_prompt_text = config.extraction_prompt_text
+    current_create_prompt_text = config.extraction_create_prompt_text or current_prompt_text
     current_prompt_version = config.extraction_prompt_version or "initial_extraction_prompt"
+    task_type = TaskType(config.task_type)
     final_status = "completed"
 
     try:
@@ -421,7 +441,13 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
                     }),
                 ))
 
-            runner = MemoryExtractionRunner(extraction_config, current_prompt_text)
+            runner = MemoryExtractionRunner(
+                extraction_config,
+                current_prompt_text,
+                task_type=task_type,
+                create_prompt_text=current_create_prompt_text,
+                update_prompt_text=current_prompt_text,
+            )
             extraction_stats = runner.process_excel(
                 config.input_excel_path,
                 extraction_output,
@@ -451,7 +477,12 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
                     "latest_message": "正在把提取结果转换为评测 case",
                 }),
             ))
-            cases, missed_cases, convert_stats = prepare_cases_from_run_output(
+            converter = (
+                prepare_long_memory_cases_from_run_output
+                if task_type == TaskType.LONG_MEMORY
+                else prepare_cases_from_run_output
+            )
+            cases, missed_cases, convert_stats = converter(
                 extraction_output,
                 model=config.extraction_model or "unknown",
                 prompt_version=current_prompt_version,
@@ -546,8 +577,13 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
             ))
                 break
 
-            saved_prompt, saved_prompt_text = _save_candidate_prompt(candidate_prompt, round_index)
+            saved_prompt, saved_prompt_text = _save_candidate_prompt(
+                candidate_prompt,
+                round_index,
+                task_type,
+            )
             current_prompt_text = saved_prompt_text
+            current_create_prompt_text = saved_prompt_text
             current_prompt_version = Path(saved_prompt).stem
 
             update_state(config.run_id, lambda state: (

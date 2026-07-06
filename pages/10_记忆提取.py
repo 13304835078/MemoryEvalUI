@@ -14,9 +14,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.extraction.memory_extractor import (
     EXTRACTION_OUTPUT_DIR,
     MemoryExtractionConfig,
-    load_generation_prompt,
+    load_generation_prompt_templates,
     sanitize_filename,
 )
+from src.schema import TASK_TYPE_LABELS, TaskType
 from src.ui.config_store import build_eval_config, load_config
 from src.ui.data_service import (
     save_uploaded_file,
@@ -25,6 +26,7 @@ from src.ui.prompt_editor import (
     get_default_extraction_prompt_file,
     infer_prompt_version,
     list_extraction_prompt_files,
+    load_extraction_prompt_templates,
     load_prompt,
     prompt_text_hash,
 )
@@ -54,8 +56,11 @@ EXTRACTION_CORE_COLUMNS = [
     "status",
     "error",
     "user.md",
+    "旧MEMORY.md",
+    "MEMORY.md",
+    "当前使用的模板",
 ]
-EXTRACTION_DETAIL_COLUMNS = EXTRACTION_CORE_COLUMNS + ["reasoning", "result"]
+EXTRACTION_DETAIL_COLUMNS = EXTRACTION_CORE_COLUMNS + ["reasoning", "result", "模型原始返回"]
 
 
 def existing_columns(df: pd.DataFrame, columns: list[str]) -> list[str]:
@@ -65,7 +70,10 @@ def existing_columns(df: pd.DataFrame, columns: list[str]) -> list[str]:
 def chunk_result_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    markers = [col for col in ["status", "user.md", "error", "result", "reasoning"] if col in df.columns]
+    markers = [
+        col for col in ["status", "user.md", "MEMORY.md", "error", "result", "模型原始返回", "reasoning"]
+        if col in df.columns
+    ]
     if not markers:
         return df
     mask = pd.Series(False, index=df.index)
@@ -144,13 +152,32 @@ def render_extraction_detail_view(output_path: str, key_prefix: str) -> None:
                 st.dataframe(chunk_df[dialogue_cols], use_container_width=True, hide_index=True)
 
             t1, t2 = st.columns(2)
+            output_column = "MEMORY.md" if "MEMORY.md" in row.index else "user.md"
+            document_name = "MEMORY.md" if output_column == "MEMORY.md" else "USER.md"
+            raw_column = "模型原始返回" if "模型原始返回" in row.index else "result"
             with t1:
-                st.text_area("提取后的 USER.md", value=str(row.get("user.md", "")), height=220, disabled=True, key=f"{key_prefix}_user_md")
+                if document_name == "MEMORY.md":
+                    st.text_area(
+                        "提取前的 MEMORY.md",
+                        value=str(row.get("旧MEMORY.md", "")),
+                        height=140,
+                        disabled=True,
+                        key=f"{key_prefix}_old_memory",
+                    )
+                st.text_area(
+                    f"提取后的 {document_name}",
+                    value=str(row.get(output_column, "")),
+                    height=220,
+                    disabled=True,
+                    key=f"{key_prefix}_document",
+                )
                 if str(row.get("error", "")).strip():
                     st.text_area("错误信息", value=str(row.get("error", "")), height=120, disabled=True, key=f"{key_prefix}_error")
             with t2:
+                if document_name == "MEMORY.md":
+                    st.caption(f"本次模板：{row.get('当前使用的模板', '') or '未记录'}")
                 st.text_area("模型 reasoning", value=str(row.get("reasoning", "")), height=160, disabled=True, key=f"{key_prefix}_reasoning")
-                st.text_area("模型原始输出", value=str(row.get("result", "")), height=180, disabled=True, key=f"{key_prefix}_result")
+                st.text_area("模型原始输出", value=str(row.get(raw_column, "")), height=180, disabled=True, key=f"{key_prefix}_result")
 
         with st.expander("排查用：查看完整Excel原始列", expanded=False):
             st.caption("这里保留所有原始列，例如 soul.md 检索召回、研发说明、备注摘要等，只在排查输入数据时查看。")
@@ -167,24 +194,37 @@ def resolve_sheet_name(raw: str) -> str | int | None:
         return raw
 
 
-def resolve_prompt_text(source: str, saved_file: str, local_path: str) -> tuple[str, str]:
+def resolve_prompt_text(
+    source: str,
+    saved_file: str,
+    local_path: str,
+    task_type: str,
+) -> tuple[str, str, str]:
     local_path = str(local_path or "").strip().strip('"')
     if source == LOCAL_PROMPT:
         if not local_path:
-            return "", ""
-        return load_generation_prompt(local_path), Path(local_path).stem
+            return "", "", ""
+        templates = load_generation_prompt_templates(local_path)
+        return templates["update"], Path(local_path).stem, templates["create"]
 
     if source == CONFIG_PROMPT:
+        configured_task = st.session_state.get("selected_prompt_task_type")
+        if configured_task and configured_task != task_type:
+            raise ValueError(
+                f"配置页当前编辑的是 {TASK_TYPE_LABELS.get(configured_task, configured_task)} 提取提示词，"
+                f"与当前提取任务 {TASK_TYPE_LABELS.get(task_type, task_type)} 不一致。"
+            )
         text = st.session_state.get("extraction_prompt_text", "")
         version = infer_prompt_version(
             st.session_state.get("selected_extraction_prompt_file", "")
-            or get_default_extraction_prompt_file("user_md_update")
+            or get_default_extraction_prompt_file(task_type)
         )
-        return text, version
+        return text, version, text
 
     if not saved_file:
-        return "", ""
-    return load_prompt(saved_file, prompt_kind="extraction"), infer_prompt_version(saved_file)
+        return "", "", ""
+    templates = load_extraction_prompt_templates(saved_file)
+    return templates["update"], infer_prompt_version(saved_file), templates["create"]
 
 
 def load_input_excel(uploaded_file, local_path: str) -> str:
@@ -284,7 +324,7 @@ def render_memory_extraction_job_state_auto(job_id: str) -> None:
 
 
 st.title("记忆提取")
-st.caption("单独运行 USER.md 记忆提取，输出 run_user.py 兼容 Excel；可选继续生成评测 case。")
+st.caption("单独运行 USER.md 用户画像或 MEMORY.md 长期记忆提取；可选继续生成评测 case。")
 
 if "ui_config" not in st.session_state:
     st.session_state.ui_config = load_config()
@@ -294,13 +334,20 @@ if "cases_file" not in st.session_state:
     st.session_state.cases_file = ""
 
 cfg = dict(st.session_state.ui_config)
+extraction_task_type = st.selectbox(
+    "提取任务",
+    [TaskType.USER_MD.value, TaskType.LONG_MEMORY.value],
+    format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
+    key="standalone_extraction_task_type",
+)
+document_name = "MEMORY.md" if extraction_task_type == TaskType.LONG_MEMORY.value else "USER.md"
 
 with st.expander("使用说明", expanded=True):
     st.markdown(
-        """
+        f"""
 1. 上传或填写原始对话 Excel，列至少包含：`轮次`、`query`、`answer`、`评测人`。
-2. 选择真实的 USER.md 提取提示词。提取结果只写在每个 chunk 的最后一行，格式兼容后续 case 生成。
-3. 同一评测人内部串行继承旧 USER.md；不同评测人之间可以并发，不会互相继承画像。
+2. 选择真实的 {document_name} 提取提示词。提取结果只写在每个 chunk 的最后一行，格式兼容后续 case 生成。
+3. 同一评测人内部串行继承旧 {document_name}；不同评测人之间可以并发，不会互相继承记忆。
 4. 运行完成后会生成 Excel，可直接下载，也可以自动转换成普通“执行评测”所需的 case 文件。
         """.strip()
     )
@@ -326,7 +373,7 @@ with st.container(border=True):
 st.subheader("2. 提取提示词")
 with st.container(border=True):
     extraction_prompt_files = list_extraction_prompt_files()
-    default_extraction_prompt = get_default_extraction_prompt_file("user_md_update")
+    default_extraction_prompt = get_default_extraction_prompt_file(extraction_task_type)
     if default_extraction_prompt and default_extraction_prompt not in extraction_prompt_files:
         extraction_prompt_files = [default_extraction_prompt] + extraction_prompt_files
 
@@ -354,13 +401,14 @@ with st.container(border=True):
         )
 
     try:
-        extraction_prompt_text, extraction_prompt_version = resolve_prompt_text(
+        extraction_prompt_text, extraction_prompt_version, extraction_create_prompt_text = resolve_prompt_text(
             prompt_source,
             selected_prompt_file,
             local_prompt_path,
+            extraction_task_type,
         )
     except Exception as exc:
-        extraction_prompt_text, extraction_prompt_version = "", ""
+        extraction_prompt_text, extraction_prompt_version, extraction_create_prompt_text = "", "", ""
         st.error(f"提取提示词读取失败：{exc}")
 
     prompt_hash = prompt_text_hash(extraction_prompt_text)
@@ -369,7 +417,14 @@ with st.container(border=True):
     c2.metric("提取提示词 Hash", prompt_hash[:12] if prompt_hash else "空")
 
     with st.expander("查看提取提示词全文", expanded=False):
-        st.text_area("提取提示词", value=extraction_prompt_text, height=260, disabled=True)
+        if extraction_task_type == TaskType.LONG_MEMORY.value:
+            prompt_tabs = st.tabs(["更新模板", "新建模板"])
+            with prompt_tabs[0]:
+                st.text_area("更新模板", value=extraction_prompt_text, height=260, disabled=True)
+            with prompt_tabs[1]:
+                st.text_area("新建模板", value=extraction_create_prompt_text, height=260, disabled=True)
+        else:
+            st.text_area("提取提示词", value=extraction_prompt_text, height=260, disabled=True)
 
 st.subheader("3. 运行参数")
 with st.container(border=True):
@@ -408,7 +463,7 @@ with st.container(border=True):
             max_value=100,
             value=min(100, max(1, int(cfg.get("judge_concurrency", 1) or 1))),
             step=1,
-            help="不同评测人之间可以并发；同一评测人内部仍串行，避免 USER.md 继承错乱。",
+            help=f"不同评测人之间可以并发；同一评测人内部仍串行，避免 {document_name} 继承错乱。",
         )
         send_enable_thinking = st.checkbox("发送 enable_thinking 字段", value=True)
         enable_thinking = st.checkbox("enable_thinking=true", value=True, disabled=not send_enable_thinking)
@@ -471,9 +526,10 @@ if st.button("开始记忆提取", type="primary", use_container_width=True, dis
         extraction_config.concurrency = int(extraction_concurrency)
 
         EXTRACTION_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        job_id = f"memory_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        task_slug = "long_memory" if extraction_task_type == TaskType.LONG_MEMORY.value else "user_md"
+        job_id = f"{task_slug}_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         output_name = (
-            f"memory_extract_{sanitize_filename(extract_model)}_"
+            f"{task_slug}_extract_{sanitize_filename(extract_model)}_"
             f"{sanitize_filename(extraction_prompt_version or 'prompt')}_"
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         )
@@ -485,6 +541,9 @@ if st.button("开始记忆提取", type="primary", use_container_width=True, dis
             output_path=str(output_path),
             prompt_text=extraction_prompt_text,
             prompt_version=extraction_prompt_version or "unknown",
+            task_type=extraction_task_type,
+            create_prompt_text=extraction_create_prompt_text,
+            update_prompt_text=extraction_prompt_text,
             sheet_name=resolve_sheet_name(sheet_name_raw),
             reviewer_filter=reviewer_filter.strip(),
             chunk_size=int(chunk_size),

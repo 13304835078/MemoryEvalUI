@@ -19,7 +19,12 @@ from src.extraction.memory_extractor import (
     sanitize_filename,
     split_sessions,
 )
-from src.ui.data_service import prepare_cases_from_run_output, save_cases
+from src.schema import TaskType
+from src.ui.data_service import (
+    prepare_cases_from_run_output,
+    prepare_long_memory_cases_from_run_output,
+    save_cases,
+)
 from src.ui.state_io import atomic_write_json, state_file_lock
 
 
@@ -33,6 +38,9 @@ class MemoryExtractionJobConfig:
     output_path: str
     prompt_text: str
     prompt_version: str
+    task_type: str = TaskType.USER_MD.value
+    create_prompt_text: str = ""
+    update_prompt_text: str = ""
     sheet_name: str | int | None = 0
     reviewer_filter: str = ""
     chunk_size: int = 10
@@ -148,6 +156,8 @@ def mark_memory_extraction_job_interrupted(job_id: str) -> dict[str, Any]:
 def _safe_config(config: MemoryExtractionJobConfig) -> dict[str, Any]:
     value = asdict(config)
     value.pop("prompt_text", None)
+    value.pop("create_prompt_text", None)
+    value.pop("update_prompt_text", None)
     extraction_config = value.get("extraction_config")
     if isinstance(extraction_config, dict):
         extraction_config.pop("api_token", None)
@@ -235,6 +245,9 @@ def run_memory_extraction_job(config: MemoryExtractionJobConfig) -> None:
         runner = MemoryExtractionRunner(
             config=config.extraction_config,
             prompt_text=config.prompt_text,
+            task_type=TaskType(config.task_type),
+            create_prompt_text=config.create_prompt_text,
+            update_prompt_text=config.update_prompt_text,
         )
 
         def on_progress(done: int, total: int, message: str) -> None:
@@ -286,7 +299,12 @@ def run_memory_extraction_job(config: MemoryExtractionJobConfig) -> None:
                 started_at=started_at,
                 extra=extra,
             )
-            cases, missed_cases, convert_stats = prepare_cases_from_run_output(
+            converter = (
+                prepare_long_memory_cases_from_run_output
+                if config.task_type == TaskType.LONG_MEMORY.value
+                else prepare_cases_from_run_output
+            )
+            cases, missed_cases, convert_stats = converter(
                 config.output_path,
                 model=config.case_model_name,
                 prompt_version=config.case_prompt_version,
@@ -295,7 +313,8 @@ def run_memory_extraction_job(config: MemoryExtractionJobConfig) -> None:
             )
             case_filename = (
                 f"{sanitize_filename(config.case_model_name)}_"
-                f"{sanitize_filename(config.case_prompt_version)}_user_md_cases_"
+                f"{sanitize_filename(config.case_prompt_version)}_"
+                f"{'long_memory' if config.task_type == TaskType.LONG_MEMORY.value else 'user_md'}_cases_"
                 f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
             )
             cases_path = save_cases(cases, case_filename)
@@ -303,7 +322,8 @@ def run_memory_extraction_job(config: MemoryExtractionJobConfig) -> None:
             if missed_cases:
                 missed_filename = (
                     f"{sanitize_filename(config.case_model_name)}_"
-                    f"{sanitize_filename(config.case_prompt_version)}_user_md_missed_cases_"
+                    f"{sanitize_filename(config.case_prompt_version)}_"
+                    f"{'long_memory' if config.task_type == TaskType.LONG_MEMORY.value else 'user_md'}_missed_cases_"
                     f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
                 )
                 missed_path = save_cases(missed_cases, missed_filename)

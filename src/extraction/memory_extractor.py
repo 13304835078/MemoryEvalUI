@@ -19,6 +19,7 @@ from src.extraction.client import (
 )
 from src.persistence import append_jsonl_rows, atomic_write_jsonl
 from src.runtime_paths import APP_HOME, DATA_DIR
+from src.schema import TaskType
 
 PROJECT_ROOT = APP_HOME
 EXTRACTION_OUTPUT_DIR = DATA_DIR / "extractions"
@@ -41,7 +42,7 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|，,\s]+', "_", str(name).strip())
 
 
-def normalize_user_md_body(body: str | None) -> str:
+def normalize_memory_document_body(body: str | None, document_name: str) -> str:
     if body is None:
         return ""
 
@@ -54,9 +55,14 @@ def normalize_user_md_body(body: str | None) -> str:
         line = raw_line.strip()
         if not line:
             continue
-        if re.match(r"^---+\s*USER\.md\s*---+$", line, flags=re.IGNORECASE):
+        escaped_name = re.escape(document_name)
+        if re.match(rf"^---+\s*{escaped_name}\s*---+$", line, flags=re.IGNORECASE):
             continue
-        if re.match(r"^#{1,6}\s*(Think|Reasoning|Output|USER\.md)\s*$", line, flags=re.IGNORECASE):
+        if re.match(
+            rf"^#{{1,6}}\s*(Think|Reasoning|Output|{escaped_name})\s*$",
+            line,
+            flags=re.IGNORECASE,
+        ):
             continue
 
         line = re.sub(r"^[*•]\s+", "- ", line)
@@ -66,7 +72,11 @@ def normalize_user_md_body(body: str | None) -> str:
     return "\n".join(lines).strip()
 
 
-def extract_user_md(text: str | None) -> str | None:
+def normalize_user_md_body(body: str | None) -> str:
+    return normalize_memory_document_body(body, "USER.md")
+
+
+def extract_memory_document(text: str | None, document_name: str) -> str | None:
     if text is None:
         return None
 
@@ -78,40 +88,74 @@ def extract_user_md(text: str | None) -> str | None:
     raw = re.sub(r"\s*```\s*$", "", raw)
 
     has_think = re.search(r"(?im)^\s*#{1,6}\s*(Think|Reasoning)\b", raw)
-    has_output_or_user_md = re.search(
-        r"(?im)^\s*#{1,6}\s*Output\s*$|---+\s*USER\.md\s*---+",
+    escaped_name = re.escape(document_name)
+    marker_pattern = rf"(?im)^\s*#{{1,6}}\s*Output\s*$|---+\s*{escaped_name}\s*---+"
+    has_output_or_document = re.search(
+        marker_pattern,
         raw,
     )
-    if has_think and not has_output_or_user_md:
+    if has_think and not has_output_or_document:
         return None
 
-    markers = list(re.finditer(
-        r"(?im)^\s*#{1,6}\s*Output\s*$|---+\s*USER\.md\s*---+",
-        raw,
-    ))
+    markers = list(re.finditer(marker_pattern, raw))
     if markers:
         content = raw[markers[-1].end():].strip()
-        return normalize_user_md_body(content)
+        return normalize_memory_document_body(content, document_name)
 
     if re.search(r"(?m)^\s*[-*•]\s*\S+[:：]", raw):
-        return normalize_user_md_body(raw)
+        return normalize_memory_document_body(raw, document_name)
 
     return None
 
 
-def load_generation_prompt(prompt_file: str | Path) -> str:
-    path = Path(prompt_file)
-    text = path.read_text(encoding="utf-8")
-    if path.suffix.lower() in {".yaml", ".yml"}:
+def extract_user_md(text: str | None) -> str | None:
+    return extract_memory_document(text, "USER.md")
+
+
+def extract_long_memory(text: str | None) -> str | None:
+    return extract_memory_document(text, "MEMORY.md")
+
+
+def parse_generation_prompt_templates(text: str, suffix: str = "") -> dict[str, str]:
+    """Return create/update templates; flat prompts are used for both modes."""
+    loaded: Any = text
+    if suffix.lower() in {".yaml", ".yml"}:
         loaded = yaml.safe_load(text)
-        if isinstance(loaded, dict):
-            for key in ("user", "prompt", "system"):
-                if key in loaded:
-                    return str(loaded[key])
-        if isinstance(loaded, str):
-            return loaded
-        raise ValueError(f"无法从 YAML 提取 prompt：{path}")
-    return text
+
+    if isinstance(loaded, str):
+        prompt = loaded.strip()
+        return {"create": prompt, "update": prompt}
+    if not isinstance(loaded, dict):
+        raise ValueError("无法从提示词内容中提取模板")
+
+    prompt_config = loaded.get("memory_extraction", loaded)
+    if not isinstance(prompt_config, dict):
+        raise ValueError("提示词中的 memory_extraction 不是 object")
+
+    fallback = ""
+    for key in ("prompt", "system", "user"):
+        value = prompt_config.get(key)
+        if isinstance(value, str) and value.strip():
+            fallback = value.strip()
+            break
+    create = str(prompt_config.get("create_template") or fallback).strip()
+    update = str(prompt_config.get("update_template") or fallback or create).strip()
+    create = create or update
+    if not create or not update:
+        raise ValueError("提示词中未找到 create_template/update_template 或通用 prompt")
+    return {"create": create, "update": update}
+
+
+def load_generation_prompt_templates(prompt_file: str | Path) -> dict[str, str]:
+    path = Path(prompt_file)
+    return parse_generation_prompt_templates(
+        path.read_text(encoding="utf-8"),
+        path.suffix,
+    )
+
+
+def load_generation_prompt(prompt_file: str | Path) -> str:
+    return load_generation_prompt_templates(prompt_file)["update"]
 
 
 def _round_to_int(value: Any) -> int:
@@ -171,15 +215,33 @@ def build_user_prompt(current_user_md: str, formatted_history: str) -> str:
     )
 
 
+def build_long_memory_prompt(current_memory: str, formatted_history: str) -> str:
+    current_memory = clean_cell(current_memory)
+    if not current_memory:
+        return f"#输入：*新增对话记录*\n{formatted_history}\n输出"
+    return (
+        f"#输入：\n*现有长期记忆*\n{current_memory}\n\n"
+        f"*新增对话记录*\n{formatted_history}\n\n输出"
+    )
+
+
 class MemoryExtractionRunner:
     def __init__(
         self,
         config: MemoryExtractionConfig,
         prompt_text: str,
         client: MemoryExtractionClient | None = None,
+        *,
+        task_type: TaskType = TaskType.USER_MD,
+        create_prompt_text: str = "",
+        update_prompt_text: str = "",
     ):
         self.config = config
-        self.prompt_text = prompt_text
+        self.task_type = TaskType(task_type)
+        self.document_name = "MEMORY.md" if self.task_type == TaskType.LONG_MEMORY else "USER.md"
+        self.prompt_text = update_prompt_text or prompt_text
+        self.create_prompt_text = create_prompt_text or self.prompt_text
+        self.update_prompt_text = update_prompt_text or prompt_text or self.create_prompt_text
         self.client = client or (MockMemoryExtractionClient(config) if config.mock else MemoryExtractionClient(config))
 
     @staticmethod
@@ -220,13 +282,17 @@ class MemoryExtractionRunner:
         completed_chunks = 0
         api_call_count = 0
         final_rows: list[dict[str, Any]] = []
-        user_md_by_reviewer: dict[str, str] = {}
+        memory_by_reviewer: dict[str, str] = {}
+        last_reviewer = ""
         status_counts: dict[str, int] = {}
 
         for session_index, session_rows in enumerate(sessions, start=1):
             source_session_index = int(session_rows[0].get("__session_index", session_index)) if session_rows else session_index
             reviewer = self._find_reviewer(session_rows)
-            current_user_md = user_md_by_reviewer.get(reviewer, "")
+            if self.task_type == TaskType.LONG_MEMORY and last_reviewer and reviewer != last_reviewer:
+                memory_by_reviewer.clear()
+            current_memory = memory_by_reviewer.get(reviewer, "")
+            last_reviewer = reviewer
 
             for chunk_start in range(0, len(session_rows), chunk_size):
                 if should_stop is not None and should_stop():
@@ -239,6 +305,8 @@ class MemoryExtractionRunner:
                 llm_reasoning = ""
                 status = "UNKNOWN"
                 error = ""
+                old_memory = current_memory
+                mode_label = "create" if not current_memory else "update"
 
                 if not history:
                     status = "SKIPPED_EMPTY"
@@ -261,21 +329,32 @@ class MemoryExtractionRunner:
                             f"正在调用模型：Session {source_session_index} Chunk {chunk_id}",
                         )
                     messages = [
-                        {"role": "system", "content": self.prompt_text},
-                        {"role": "user", "content": build_user_prompt(current_user_md, history)},
+                        {
+                            "role": "system",
+                            "content": self.create_prompt_text if mode_label == "create" else self.update_prompt_text,
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                build_long_memory_prompt(current_memory, history)
+                                if self.task_type == TaskType.LONG_MEMORY
+                                else build_user_prompt(current_memory, history)
+                            ),
+                        },
                     ]
                     success, result, reasoning, error = self.client.chat_with_retry(messages)
                     llm_result = result or ""
                     llm_reasoning = reasoning or ""
                     if success:
-                        parsed = extract_user_md(llm_result)
+                        parsed = extract_memory_document(llm_result, self.document_name)
                         if parsed is None:
                             status = "PARSE_FAILED"
-                            error = error or "无法从模型输出中解析 USER.md"
+                            error = error or f"无法从模型输出中解析 {self.document_name}"
                         else:
                             status = "SUCCESS"
-                            current_user_md = parsed
-                            user_md_by_reviewer[reviewer] = current_user_md
+                            if self.task_type != TaskType.LONG_MEMORY or parsed:
+                                current_memory = parsed
+                                memory_by_reviewer[reviewer] = current_memory
                     else:
                         status = "API_FAILED"
                         error = error or llm_result
@@ -287,16 +366,27 @@ class MemoryExtractionRunner:
                 for row_index, row in enumerate(chunk):
                     is_last = row_index == len(chunk) - 1
                     output_row = dict(row)
-                    output_row.update({
+                    common_output = {
                         "session_id": source_session_index,
                         "chunk_id": chunk_id,
                         "评测人": reviewer,
                         "status": status if is_last else "",
                         "error": error if is_last else "",
-                        "result": llm_result if is_last else "",
                         "reasoning": llm_reasoning if is_last else "",
-                        "user.md": current_user_md if is_last else "",
-                    })
+                    }
+                    if self.task_type == TaskType.LONG_MEMORY:
+                        common_output.update({
+                            "当前使用的模板": mode_label if is_last else "",
+                            "旧MEMORY.md": old_memory if is_last else "",
+                            "MEMORY.md": current_memory if is_last else "",
+                            "模型原始返回": llm_result if is_last else "",
+                        })
+                    else:
+                        common_output.update({
+                            "result": llm_result if is_last else "",
+                            "user.md": current_memory if is_last else "",
+                        })
+                    output_row.update(common_output)
                     chunk_output_rows.append(output_row)
 
                 final_rows.extend(chunk_output_rows)
@@ -335,7 +425,7 @@ class MemoryExtractionRunner:
     ) -> dict[str, Any]:
         if chunk_size <= 0:
             raise ValueError("chunk_size 必须大于 0")
-        if not self.prompt_text.strip():
+        if not self.create_prompt_text.strip() or not self.update_prompt_text.strip():
             raise ValueError("提取提示词为空")
 
         output_path = Path(output_path)
@@ -433,10 +523,17 @@ class MemoryExtractionRunner:
             )
             merge_result(result)
         else:
-            groups = [
-                (str(reviewer or "未知"), group.copy())
-                for reviewer, group in df.groupby("评测人", sort=False, dropna=False)
-            ]
+            if self.task_type == TaskType.LONG_MEMORY:
+                reviewer_segments = df["评测人"].ne(df["评测人"].shift()).cumsum()
+                groups = [
+                    (f"{str(group.iloc[0]['评测人'] or '未知')}（区段 {segment_id}）", group.copy())
+                    for segment_id, group in df.groupby(reviewer_segments, sort=False)
+                ]
+            else:
+                groups = [
+                    (str(reviewer or "未知"), group.copy())
+                    for reviewer, group in df.groupby("评测人", sort=False, dropna=False)
+                ]
             if len(groups) <= 1:
                 result = self._process_sessions(
                     global_sessions,
@@ -489,5 +586,7 @@ class MemoryExtractionRunner:
             "api_calls": api_call_count,
             "status_counts": status_counts,
             "concurrency": concurrency,
+            "task_type": self.task_type.value,
+            "document_name": self.document_name,
             "stopped": bool(should_stop is not None and should_stop()),
         }

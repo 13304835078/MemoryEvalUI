@@ -12,7 +12,7 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.extraction.memory_extractor import load_generation_prompt, sanitize_filename
+from src.extraction.memory_extractor import load_generation_prompt_templates, sanitize_filename
 from src.loop import (
     CLOSED_LOOP_DIR,
     ClosedLoopConfig,
@@ -24,6 +24,7 @@ from src.loop import (
     run_closed_loop,
 )
 from src.loop.progress import compute_closed_loop_progress
+from src.schema import TASK_TYPE_LABELS, TaskType
 from src.ui.config_store import build_eval_config, load_config
 from src.ui.data_service import save_uploaded_file
 from src.ui.prompt_editor import (
@@ -32,6 +33,7 @@ from src.ui.prompt_editor import (
     infer_prompt_version,
     list_extraction_prompt_files,
     list_prompt_files,
+    load_extraction_prompt_templates,
     load_prompt,
     prompt_text_hash,
     get_extraction_prompt_path,
@@ -179,24 +181,36 @@ def resolve_sheet_name(raw: str) -> str | int | None:
         return raw
 
 
-def resolve_extraction_prompt(source: str, local_path: str) -> tuple[str, str]:
+def resolve_extraction_prompt(
+    source: str,
+    local_path: str,
+    task_type: str,
+) -> tuple[str, str, str]:
     local_path = str(local_path or "").strip().strip('"')
     if local_path:
-        return load_generation_prompt(local_path), Path(local_path).stem
+        templates = load_generation_prompt_templates(local_path)
+        return templates["update"], Path(local_path).stem, templates["create"]
     if source == USE_CONFIG_PROMPT:
+        configured_task = st.session_state.get("selected_prompt_task_type")
+        if configured_task and configured_task != task_type:
+            raise ValueError(
+                f"配置页当前编辑的是 {TASK_TYPE_LABELS.get(configured_task, configured_task)} 提取提示词，"
+                f"与当前闭环任务 {TASK_TYPE_LABELS.get(task_type, task_type)} 不一致。"
+            )
         text = st.session_state.get("extraction_prompt_text", "")
         version = infer_prompt_version(
             st.session_state.get("selected_extraction_prompt_file", "")
-            or get_default_extraction_prompt_file("user_md_update")
+            or get_default_extraction_prompt_file(task_type)
         )
-        return text, version
-    return load_prompt(source, prompt_kind="extraction"), infer_prompt_version(source)
+        return text, version, text
+    templates = load_extraction_prompt_templates(source)
+    return templates["update"], infer_prompt_version(source), templates["create"]
 
 
-def render_usage_guide() -> None:
+def render_usage_guide(document_name: str) -> None:
     with st.expander("使用说明和功能介绍", expanded=True):
         st.markdown(
-            """
+            f"""
 **这个页面做什么**
 
 把原本需要人工串起来的几步自动化：记忆提取 → 生成评测 case → 绝对评测 → 生成候选提取提示词 → 用候选提示词进入下一轮。
@@ -210,7 +224,7 @@ def render_usage_guide() -> None:
 
 **输入文件要求**
 
-原始对话 Excel 至少需要包含：`轮次`、`query`、`answer`、`评测人`。系统会按 `轮次 == 1` 切 session，再按 `chunk_size` 分块提取 USER.md。
+原始对话 Excel 至少需要包含：`轮次`、`query`、`answer`、`评测人`。系统会按 `轮次 == 1` 切 session，再按 `chunk_size` 分块提取 {document_name}。
 
 **结果保存位置**
 
@@ -398,14 +412,21 @@ if "ui_config" not in st.session_state:
 thread_registry = ensure_thread_registry()
 cfg = dict(st.session_state.ui_config)
 
-render_usage_guide()
-
 st.warning("实验功能：候选提示词可能沿着当前 Judge 的偏差自我强化。建议先小样本试跑，再决定是否扩大。")
 
 default_run_id = f"closed_loop_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 st.subheader("1. 基础设置")
 with st.container(border=True):
+    loop_task_type = st.selectbox(
+        "闭环任务",
+        [TaskType.USER_MD.value, TaskType.LONG_MEMORY.value],
+        format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
+        key="closed_loop_task_type",
+    )
+    document_name = "MEMORY.md" if loop_task_type == TaskType.LONG_MEMORY.value else "USER.md"
+    render_usage_guide(document_name)
+
     run_id_raw = st.text_input(
         "运行编号",
         value=st.session_state.get("closed_loop_last_run_id", default_run_id),
@@ -472,14 +493,18 @@ with st.container(border=True):
 st.subheader("2. 提示词设置")
 with st.container(border=True):
     extraction_prompt_files = list_extraction_prompt_files()
-    default_extraction_prompt = get_default_extraction_prompt_file("user_md_update")
+    default_extraction_prompt = get_default_extraction_prompt_file(loop_task_type)
     if default_extraction_prompt and default_extraction_prompt not in extraction_prompt_files:
         extraction_prompt_files = [default_extraction_prompt] + extraction_prompt_files
     extraction_options = [USE_CONFIG_PROMPT] + extraction_prompt_files
     extraction_source = st.selectbox(
         "初始提取提示词",
         extraction_options,
-        index=0,
+        index=(
+            extraction_options.index(default_extraction_prompt)
+            if default_extraction_prompt in extraction_options
+            else 0
+        ),
         help="第一轮使用这里的提示词；第二轮开始使用上一轮自动生成的新版本。",
     )
 
@@ -493,20 +518,24 @@ with st.container(border=True):
         )
 
     try:
-        extraction_prompt_text, extraction_prompt_version = resolve_extraction_prompt(extraction_source, local_prompt_path)
+        extraction_prompt_text, extraction_prompt_version, extraction_create_prompt_text = resolve_extraction_prompt(
+            extraction_source,
+            local_prompt_path,
+            loop_task_type,
+        )
     except Exception as exc:
-        extraction_prompt_text, extraction_prompt_version = "", ""
+        extraction_prompt_text, extraction_prompt_version, extraction_create_prompt_text = "", "", ""
         st.error(f"提取提示词读取失败：{exc}")
 
     judge_prompt_files = list_prompt_files()
-    default_judge_prompt = get_default_prompt_file("user_md_update")
+    default_judge_prompt = get_default_prompt_file(loop_task_type)
     if default_judge_prompt and default_judge_prompt not in judge_prompt_files:
         judge_prompt_files = [default_judge_prompt] + judge_prompt_files
     selected_judge_prompt = st.selectbox(
         "裁判提示词",
         judge_prompt_files,
         index=judge_prompt_files.index(default_judge_prompt) if default_judge_prompt in judge_prompt_files else 0,
-        help="用于给每轮 USER.md 提取结果打分。建议使用绝对评测稳定版。",
+        help=f"用于给每轮 {document_name} 提取结果打分。建议使用绝对评测稳定版。",
     )
     judge_prompt_text = load_prompt(selected_judge_prompt)
 
@@ -517,7 +546,14 @@ with st.container(border=True):
 
     with st.expander("查看提示词全文", expanded=False):
         st.caption("这里只读展示，修改提示词请去配置页保存版本，或使用本地 prompt 路径。")
-        st.text_area("初始提取提示词全文", value=extraction_prompt_text, height=260, disabled=True)
+        if loop_task_type == TaskType.LONG_MEMORY.value:
+            prompt_tabs = st.tabs(["更新模板", "新建模板"])
+            with prompt_tabs[0]:
+                st.text_area("初始更新模板全文", value=extraction_prompt_text, height=260, disabled=True)
+            with prompt_tabs[1]:
+                st.text_area("初始新建模板全文", value=extraction_create_prompt_text, height=260, disabled=True)
+        else:
+            st.text_area("初始提取提示词全文", value=extraction_prompt_text, height=260, disabled=True)
         st.text_area("裁判提示词全文", value=judge_prompt_text, height=220, disabled=True)
 
 mock = bool(cfg.get("mock", False))
@@ -608,7 +644,7 @@ with st.expander("高级运行参数", expanded=False):
             max_value=100,
             value=int(extraction_concurrency),
             step=1,
-            help="不同评测人之间可并发；同一评测人内部仍串行，避免 USER.md 继承关系错乱。",
+            help=f"不同评测人之间可并发；同一评测人内部仍串行，避免 {document_name} 继承关系错乱。",
         )
         extraction_send_enable_thinking = st.checkbox("提取发送enable_thinking字段", value=extraction_send_enable_thinking)
         extraction_enable_thinking = st.checkbox("提取enable_thinking=True", value=extraction_enable_thinking)
@@ -680,6 +716,7 @@ with st.container(border=True):
         loop_config = ClosedLoopConfig(
             run_id=run_id,
             input_excel_path=input_excel_path,
+            task_type=loop_task_type,
             sheet_name=resolve_sheet_name(sheet_name_raw),
             reviewer_filter=reviewer_filter,
             rounds=int(rounds),
@@ -689,6 +726,7 @@ with st.container(border=True):
             extraction_api_base=extraction_api_base or eval_api_base,
             extraction_api_token=extraction_api_token or eval_api_token or default_api_token,
             extraction_prompt_text=extraction_prompt_text,
+            extraction_create_prompt_text=extraction_create_prompt_text,
             extraction_prompt_version=extraction_prompt_version,
             extraction_max_tokens=int(extraction_max_tokens),
             extraction_request_interval=float(extraction_request_interval),

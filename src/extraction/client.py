@@ -173,13 +173,18 @@ class MockMemoryExtractionClient(MemoryExtractionClient):
     def chat_with_retry(self, messages: list[dict[str, str]]) -> tuple[bool, str, str, str]:
         self.counter += 1
         user_message = messages[-1]["content"] if messages else ""
+        system_message = messages[0]["content"] if messages else ""
+        is_long_memory = "MEMORY.md" in system_message or "*现有长期记忆*" in user_message
+        document_name = "MEMORY.md" if is_long_memory else "USER.md"
         existing = ""
         marker = "## [现有文件内容]"
         dialogue_marker = "## [最新对话内容]"
         if marker in user_message and dialogue_marker in user_message:
             existing = user_message.split(marker, 1)[1].split(dialogue_marker, 1)[0].strip()
-            existing = existing.replace("--- USER.md ---", "").strip()
+            existing = existing.replace(f"--- {document_name} ---", "").strip()
+        elif "*现有长期记忆*" in user_message and "*新增对话记录*" in user_message:
+            existing = user_message.split("*现有长期记忆*", 1)[1].split("*新增对话记录*", 1)[0].strip()
         lines = [line.strip() for line in existing.splitlines() if line.strip()]
         lines.append(f"- [MOCK] 已处理第 {self.counter} 个记忆提取 chunk")
-        content = "# Output\n--- USER.md ---\n" + "\n".join(lines)
+        content = f"# Output\n--- {document_name} ---\n" + "\n".join(lines)
         return True, content, "[MOCK] 未调用真实接口。", ""

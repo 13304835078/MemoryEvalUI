@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-ABSOLUTE_ADVISOR_SYSTEM_PROMPT = """你是一个 USER.md 绝对评测诊断助手。你的任务是根据单模型评测结果，诊断当前评测链路、Judge Prompt 和提取 Prompt 中可能需要澄清的部分。
+ABSOLUTE_ADVISOR_SYSTEM_PROMPT = """你是一个记忆提取绝对评测诊断助手。当前任务可能是 USER.md 用户画像或 MEMORY.md 长期记忆；必须根据输入证据中的 task_type、Judge Prompt 和提取 Prompt 判断当前任务。你的任务是根据单模型评测结果，诊断当前评测链路、Judge Prompt 和提取 Prompt 中可能需要澄清的部分。
 
 硬性约束：
 1. 只能基于用户提供的评测结果证据提出建议，不允许凭空猜测。

@@ -13,13 +13,20 @@ from src.extraction.memory_extractor import (
     MemoryExtractionRunner,
     MockMemoryExtractionClient,
     build_dialogue_history,
+    build_long_memory_prompt,
     build_user_prompt,
     extract_answer_from_response,
+    extract_long_memory,
     extract_user_md,
+    load_generation_prompt_templates,
     split_sessions,
 )
 from src.persistence import read_jsonl
-from src.ui.data_service import prepare_cases_from_run_output
+from src.schema import TaskType
+from src.ui.data_service import (
+    prepare_cases_from_run_output,
+    prepare_long_memory_cases_from_run_output,
+)
 from src.ui.memory_extraction_job_runner import MemoryExtractionJobConfig, estimate_total_chunks
 
 
@@ -59,6 +66,20 @@ class PromptAwareFakeExtractionClient:
         return False, "unexpected prompt", "", "unexpected prompt"
 
 
+class LongMemoryReviewerSwitchFakeClient:
+    def chat_with_retry(self, messages):
+        user_message = messages[-1]["content"]
+        if "Alice first" in user_message:
+            return True, "- 计划：Alice first", "", ""
+        if "Bob" in user_message:
+            assert "Alice first" not in user_message
+            return True, "- 计划：Bob", "", ""
+        if "Alice returns" in user_message:
+            assert "Alice first" not in user_message
+            return True, "- 计划：Alice returns", "", ""
+        return False, "unexpected prompt", "", "unexpected prompt"
+
+
 def test_extract_user_md_from_output_marker():
     text = """
 # Think
@@ -74,6 +95,31 @@ def test_extract_user_md_from_output_marker():
 
 def test_extract_user_md_rejects_reasoning_only():
     assert extract_user_md("# Reasoning\n用户说了一个临时请求") is None
+
+
+def test_extract_long_memory_and_build_update_prompt():
+    assert extract_long_memory(
+        "# Output\n--- MEMORY.md ---\n- 长期计划：用户正在准备考研"
+    ) == "- 长期计划：用户正在准备考研"
+    prompt = build_long_memory_prompt("- 长期计划：准备考研", "- user: 目标改为明年")
+    assert "*现有长期记忆*\n- 长期计划：准备考研" in prompt
+    assert "*新增对话记录*\n- user: 目标改为明年" in prompt
+
+
+def test_load_generation_prompt_templates_reads_create_and_update_yaml(tmp_path):
+    path = tmp_path / "memory.yaml"
+    path.write_text(
+        "memory_extraction:\n"
+        "  create_template: |\n"
+        "    create rules\n"
+        "  update_template: |\n"
+        "    update rules\n",
+        encoding="utf-8",
+    )
+
+    templates = load_generation_prompt_templates(path)
+
+    assert templates == {"create": "create rules", "update": "update rules"}
 
 
 def test_extract_answer_from_response_supports_reasoning():
@@ -161,6 +207,84 @@ def test_memory_extraction_runner_outputs_run_user_compatible_excel():
         assert convert_stats["generated_cases"] == 2
         assert cases[0].candidate_output == "- 喜欢粤菜\n- 常住上海"
         assert cases[1].old_memory == "- 喜欢粤菜\n- 常住上海"
+
+
+def test_long_memory_extraction_uses_create_then_update_and_outputs_cases():
+    df = pd.DataFrame({
+        "轮次": [1, 2],
+        "query": ["我准备考研", "目标改为明年"],
+        "answer": ["好的", "已更新"],
+        "评测人": ["张三", "张三"],
+    })
+    fake_client = FakeExtractionClient([
+        (True, "- 长期计划：用户正在准备考研", "r1", ""),
+        (True, "- 长期计划：用户计划明年考研", "r2", ""),
+    ])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        input_path = Path(tmp) / "input.xlsx"
+        output_path = Path(tmp) / "output.xlsx"
+        df.to_excel(input_path, index=False)
+
+        runner = MemoryExtractionRunner(
+            MemoryExtractionConfig(model="mock", request_interval=0),
+            prompt_text="update rules",
+            create_prompt_text="create rules",
+            update_prompt_text="update rules",
+            task_type=TaskType.LONG_MEMORY,
+            client=fake_client,
+        )
+        stats = runner.process_excel(input_path, output_path, chunk_size=1)
+
+        assert stats["task_type"] == TaskType.LONG_MEMORY.value
+        assert fake_client.messages[0][0]["content"] == "create rules"
+        assert fake_client.messages[1][0]["content"] == "update rules"
+        assert "*现有长期记忆*" not in fake_client.messages[0][1]["content"]
+        assert "- 长期计划：用户正在准备考研" in fake_client.messages[1][1]["content"]
+
+        out = pd.read_excel(output_path).fillna("")
+        assert out["当前使用的模板"].tolist() == ["create", "update"]
+        assert out.loc[0, "旧MEMORY.md"] == ""
+        assert out.loc[1, "旧MEMORY.md"] == "- 长期计划：用户正在准备考研"
+        assert out.loc[1, "MEMORY.md"] == "- 长期计划：用户计划明年考研"
+        assert out.loc[1, "模型原始返回"] == "- 长期计划：用户计划明年考研"
+
+        cases = prepare_long_memory_cases_from_run_output(
+            output_path,
+            model="mock",
+            prompt_version="memory_v1",
+            chunk_size=1,
+        )
+        assert [case.task_type for case in cases] == [TaskType.LONG_MEMORY, TaskType.LONG_MEMORY]
+        assert cases[1].old_memory == "- 长期计划：用户正在准备考研"
+        assert cases[1].candidate_output == "- 长期计划：用户计划明年考研"
+
+
+def test_long_memory_concurrency_resets_memory_for_each_reviewer_segment():
+    df = pd.DataFrame({
+        "轮次": [1, 1, 1],
+        "query": ["Alice first", "Bob", "Alice returns"],
+        "answer": ["ok", "ok", "ok"],
+        "评测人": ["alice", "bob", "alice"],
+    })
+
+    with tempfile.TemporaryDirectory() as tmp:
+        input_path = Path(tmp) / "input.xlsx"
+        output_path = Path(tmp) / "output.xlsx"
+        df.to_excel(input_path, index=False)
+
+        runner = MemoryExtractionRunner(
+            MemoryExtractionConfig(model="mock", request_interval=0, concurrency=3),
+            prompt_text="# MEMORY.md update",
+            create_prompt_text="# MEMORY.md create",
+            task_type=TaskType.LONG_MEMORY,
+            client=LongMemoryReviewerSwitchFakeClient(),
+        )
+        runner.process_excel(input_path, output_path, chunk_size=1)
+
+        out = pd.read_excel(output_path).fillna("")
+        assert out["当前使用的模板"].tolist() == ["create", "create", "create"]
+        assert out["旧MEMORY.md"].tolist() == ["", "", ""]
 
 
 def test_memory_extraction_job_estimates_chunks_from_excel_dataframe():
