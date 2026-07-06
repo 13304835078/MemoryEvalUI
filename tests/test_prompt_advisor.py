@@ -8,6 +8,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.schema import EvalConfig
 from src.ui.prompt_advisor import (
+    _is_similar_rule_key,
+    _normalize_rule_similarity_key,
     _split_complete_blocks,
     build_advisor_user_message,
     call_prompt_advisor,
@@ -574,6 +576,86 @@ def test_prompt_advisor_skips_append_that_duplicates_whole_prompt(monkeypatch):
     assert result["candidate_prompt_source"] == "no_valid_incremental_patch"
     skipped = result["extraction_prompt_patch_skipped_before_apply"]
     assert any("已有规则" in item.get("message", "") for item in skipped)
+
+
+def test_prompt_advisor_treats_same_decision_rule_as_duplicate():
+    first = "用户对当前对话中助手风格、口音、格式的临时调整要求，不记录为长期交互偏好。"
+    second = "用户对助手当前回答风格（如口音、语气、措辞）的临时调整要求，属于单次任务反馈，不记录为长期交互偏好。"
+
+    assert _is_similar_rule_key(
+        _normalize_rule_similarity_key(first),
+        _normalize_rule_similarity_key(second),
+    )
+
+
+def test_prompt_advisor_prunes_duplicate_inserted_lines_in_replace(monkeypatch):
+    old_section = (
+        "### 交互偏好\n\n"
+        "  可记录 user 对 assistant 后续回答方式的明确长期要求或偏好：\n\n"
+        "  - 临时要求某次任务使用特定格式，不记录为长期偏好。\n"
+    )
+    new_section = (
+        "### 交互偏好\n"
+        "- 用户对当前对话中助手风格、口音、格式的临时调整要求，不记录为长期交互偏好。\n\n"
+        "  可记录 user 对 assistant 后续回答方式的明确长期要求或偏好：\n\n"
+        "  - 临时要求某次任务使用特定格式，不记录为长期偏好。\n"
+        "  - 用户对助手当前回答风格（如口音、语气、措辞）的临时调整要求，属于单次任务反馈，不记录为长期交互偏好。\n"
+    )
+    stage1 = {
+        "can_suggest": True,
+        "evidence_summary": "交互偏好规则边界不清",
+        "diagnoses": [],
+        "patch_intents": [{
+            "intent_id": "I001",
+            "section_id": "S001",
+            "problem_type": "over_extraction",
+            "issue_summary": "临时风格调整是否记录边界不清",
+            "proposed_direction": "澄清临时调整不沉淀",
+            "confidence": "medium",
+            "evidence_refs": ["case_1"],
+        }],
+        "risks": [],
+        "validation_plan": [],
+    }
+    stage2 = {
+        "can_suggest": True,
+        "section_id": "S001",
+        "extraction_prompt_patch": {
+            "edits": [{
+                "op": "replace_within_section",
+                "target_id": "S001",
+                "old_text": old_section,
+                "new_text": new_section,
+                "reason": "澄清交互偏好边界",
+                "evidence_refs": ["case_1"],
+            }]
+        },
+        "section_notes": "replace 中有重复新增行",
+    }
+    responses = [
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage1, ensure_ascii=False)}}]}),
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
+    ]
+
+    def fake_post(_url, headers, data, timeout):
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
+
+    result, _raw = call_prompt_advisor(
+        EvalConfig(judge_max_retries=1, judge_request_interval=0),
+        evidence=[{"case_id": "case_1", "comment": "临时口音要求不应记录"}],
+        current_judge_prompt="judge",
+        extraction_prompt=old_section,
+        target="extraction_prompt",
+        min_evidence=1,
+    )
+
+    candidate = result["candidate_extraction_prompt"]
+    assert "用户对当前对话中助手风格" not in candidate
+    assert "用户对助手当前回答风格" in candidate
+    skipped = result["extraction_prompt_patch_skipped_before_apply"]
+    assert any("replace 新增行" in item.get("message", "") for item in skipped)
 
 
 def test_prompt_advisor_limits_cumulative_append_growth(monkeypatch):
