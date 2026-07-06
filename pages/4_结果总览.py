@@ -378,7 +378,7 @@ with st.expander("选择对照结果并生成稳定性报告", expanded=False):
 - **诊断变化**：diagnostics 的数量或内容不一致。
 - **规则引用变化**：rule_refs 指向的提取规则不一致。
 - **证据引用变化**：evidence_refs 指向的事实证据不一致。
-- **输出引用变化**：output_refs 指向的新 USER.md 片段不一致。
+- **输出引用变化**：output_refs 指向的候选输出片段不一致，例如新 USER.md 或新 MEMORY.md。
 - **评语变化**：comment 文本不一致；如果只有这一项变化，通常是低风险表达波动。
                         """.strip()
                     )

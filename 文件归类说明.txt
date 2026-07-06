@@ -1,83 +1,135 @@
 MemoryEvalUI 文件归类说明
 ==========================
 
-本压缩包根据你提供的文件树，把本轮上传的核心文件重新归类到项目目录。
+本文档说明当前源码协作版的主要目录和文件职责。打包产物、真实配置、上传数据、评测结果和日志不应提交到仓库。
 
 一、根目录
 ----------
+
 app.py                         Streamlit 首页入口
 run.py                         命令行一键交互入口
+run_streamlit.py               打包版启动 Streamlit 的辅助入口
 requirements.txt               Python 依赖
 MemoryEvalUI.spec              PyInstaller 打包配置
-MemoryEvalUI_使用说明.txt       使用说明文档
-.gitignore                     本次新增，避免提交本地配置、结果、缓存
+MemoryEvalUI_使用说明.txt       面向使用者的完整说明
+协作者快速说明.md              面向协作者的快速上手说明
+CONTRIBUTING.md                协作开发约定
+README.md                      项目概览
+接口说明.md                    内网接口说明，注意不要泄露到不该公开的位置
+.gitignore                     忽略本地配置、结果、缓存和打包产物
 
 二、pages/
 ---------
-pages/1_配置.py                API、Judge Prompt、Rubric 配置页
+
+pages/1_配置.py                API、模型参数、Prompt、Rubric 配置页
 pages/2_数据输入.py            数据上传、Case 生成与加载页
-pages/3_执行评测.py            执行 LLM Judge / Mock 评测页
-pages/4_结果总览.py            结果统计、筛选、导出页
-pages/5_Case详情.py            单条 Case 详情、diff、人工复核页
+pages/3_执行评测.py            普通绝对评测页
+pages/4_结果总览.py            结果统计、稳定性对比、导出页
+pages/5_样本详情.py            单条样本详情、diff、引用证据、人工复核页
+pages/6_人工审核结果评估.py    历史 GSB 双模型人工审核对比入口
+pages/7_提示词改进建议.py      基于评测证据生成候选提示词修改建议
+pages/8_裁判提示词AB对比.py    固定 case 和模型配置，对比两个 Judge Prompt
+pages/9_闭环实验.py            多轮提取、评测、提示词改进闭环实验
+pages/10_记忆提取.py           单独运行 USER.md 或 MEMORY.md 提取
 
 三、src/
 -------
-src/schema.py                  Case、DialogueTurn、EvalConfig、EvalResult 等核心数据结构
-src/eval/eval_runner.py         评测流程编排
-src/eval/judge_client.py        Mock/Real Judge 调用、JSON 解析、限流重试
-src/eval/metrics.py             汇总统计、错误标签、维度标签
-src/loaders/base_loader.py      Loader 基类、列名别名识别
-src/loaders/excel_loader.py     Excel 转 Case
-src/loaders/json_loader.py      JSON/JSONL 转 Case
-src/loaders/md_loader.py        Markdown case 目录转 Case
-src/loaders/__init__.py         loaders 包导出
-src/ui/config_store.py          UI 配置读写和 EvalConfig 构造
-src/ui/data_service.py          data 目录、case/result 文件管理
-src/ui/prompt_editor.py         Prompt/Rubric 文件读取与版本保存
-src/ui/components.py            UI 展示组件、diff、结果卡片
-src/ui/review_store.py          人工复核记录读写
-src/ui/__init__.py             ui 包初始化
+
+src/schema.py                  Case、DialogueTurn、EvalConfig、EvalResult、任务类型和评分维度
+src/runtime_paths.py           源码版/打包版运行路径解析
+src/build_info.py              构建信息读取和展示
+src/persistence.py             JSONL 等持久化辅助函数
+src/llm_api.py                 通用 LLM 请求 payload、鉴权头和响应解析
+
+src/eval/eval_runner.py        评测流程编排
+src/eval/judge_client.py       Mock/Real Judge 调用
+src/eval/judge_validation.py   Judge JSON 结构校验
+src/eval/metrics.py            结果汇总统计
+src/eval/stability.py          稳定性对比、差异样本和散度统计
+
+src/extraction/client.py       记忆提取 LLM 客户端
+src/extraction/memory_extractor.py
+                               USER.md / MEMORY.md 提取、session/chunk 切分、并发处理
+
+src/loaders/base_loader.py     Loader 基类、列名别名识别
+src/loaders/excel_loader.py    Excel 转标准 Case
+src/loaders/json_loader.py     JSON/JSONL 转标准 Case
+src/loaders/md_loader.py       Markdown case 目录转标准 Case
+
+src/loop/closed_loop.py        闭环实验核心编排
+src/loop/progress.py           闭环进度文本与状态展示辅助
+
+src/ui/config_store.py         UI 配置读写和 EvalConfig 构造
+src/ui/data_service.py         data 目录、case/result 文件管理和 Excel 转换
+src/ui/eval_job_runner.py      执行评测后台任务
+src/ui/memory_extraction_job_runner.py
+                               记忆提取后台任务
+src/ui/prompt_editor.py        Prompt/Rubric 文件读取与版本保存
+src/ui/prompt_advisor.py       提示词改进建议主逻辑
+src/ui/prompt_advisor_prompts.py
+                               提示词改进模型的系统提示词
+src/ui/prompt_patch.py         提取提示词 patch 应用与冲突控制
+src/ui/rule_ref_validation.py  规则引用校验，识别疑似幻觉规则编号
+src/ui/human_review_eval.py    人工 GSB 审核结果评估
+src/ui/components.py           UI 展示组件、diff、结果卡片
+src/ui/review_store.py         人工复核记录读写
+src/ui/state_io.py             后台任务状态安全读写
 
 四、scripts/
 -----------
-scripts/convert_to_cases.py                  通用 Excel/JSON/JSONL/MD 转标准 Case CLI
-scripts/prepare_eval_from_run_output.py      run_user.py 输出 Excel 转 USER.md 评测 Case CLI
-scripts/run_eval.py                          命令行执行评测
-scripts/analyze_results.py                   命令行分析结果
+
+scripts/convert_to_cases.py             通用 Excel/JSON/JSONL/MD 转标准 Case CLI
+scripts/prepare_eval_from_run_output.py run_user.py 输出 Excel 转 USER.md 评测 Case CLI
+scripts/run_eval.py                     命令行执行评测
+scripts/analyze_results.py              命令行分析结果
+scripts/smoke_pages.py                  Streamlit 页面冒烟测试
+scripts/build_release.ps1               测试、冒烟、PyInstaller 打包和压缩发布脚本
 
 五、prompts/ 与 rules/
 --------------------
-prompts/judge/judge_user_md_v1.md     USER.md Judge Prompt
-rules/rubric_user_md.md               USER.md 评测规则
-rules/rubric_day_memory.md            天级记忆规则占位
-rules/rubric_long_memory.md           长期记忆规则占位
-rules/rubric_summary.md               摘要规则占位
+
+prompts/judge/judge_user_md_v1.md
+prompts/judge/judge_user_md_absolute_stable_with_rules_v1.md
+prompts/judge/judge_user_md_human_aligned_v1.md
+prompts/judge/judge_user_md_human_aligned_stable_v1.md
+                               USER.md 裁判提示词
+prompts/judge/judge_long_memory_v1.md
+                               MEMORY.md 长期记忆裁判提示词
+prompts/generation/extract_user_md_rules_example_v1.md
+                               USER.md 提取规则示例
+prompts/generation/extract_long_memory_v1.yaml
+                               MEMORY.md 提取 create/update 模板
+
+rules/rubric_user_md.md        USER.md 评分规则
+rules/rubric_long_memory.md    MEMORY.md 长期记忆评分规则
+rules/rubric_day_memory.md     天级记忆规则占位
+rules/rubric_summary.md        摘要规则占位
 
 六、tests/
 ---------
-tests/test_schema.py           数据结构与 JSONL 往返测试
-tests/test_judge_client.py     Judge Client 解析和 Mock 测试
-tests/test_eval_runner.py      EvalRunner 流程测试
-tests/test_metrics.py          汇总统计测试
-tests/test_excel_loader.py     Excel Loader 测试
-tests/test_json_loader.py      JSON/JSONL Loader 测试
-tests/test_md_loader.py        Markdown Loader 测试
+
+tests/                         回归测试目录，覆盖 schema、loader、Judge、评测流程、
+                               结果统计、稳定性分析、提示词改进、后台任务、闭环、
+                               USER.md / MEMORY.md 提取和页面相关服务逻辑。
 
 七、config/ 与 data/
 ------------------
-config/local_config.example.json       脱敏示例配置，真实 local_config.json 未打包
-data/cases/                            标准 case 输出目录
-data/raw/uploads/                      UI 上传文件保存目录
-data/results/                          评测结果与人工复核目录
-logs/                                  日志目录
 
-八、本次做的轻量整理
-------------------
-1. 没有打包真实 config/local_config.json，避免泄露 API token。
-2. 新增 config/local_config.example.json 作为示例配置。
-3. 新增 .gitignore。
-4. 新增空的 src/__init__.py 与 src/eval/__init__.py，增强包导入稳定性。
-5. 修正两个测试文件中与当前代码结构不一致的小断言：
-   - tests/test_md_loader.py：MdLoader.load 返回 list[Case]，测试改为取 cases[0]。
-   - tests/test_schema.py：DialogueTurn.to_dict 会包含 metadata 字段，测试断言同步更新。
-6. 修正 pages/3_执行评测.py 中 Mock 模式下 interval 未定义的问题。
+config/local_config.example.json       脱敏示例配置
+config/local_config.json               本地真实配置，已被 Git 忽略
+
+data/raw/uploads/                      UI 上传文件保存目录
+data/cases/                            标准 case 输出目录
+data/results/                          评测结果与人工复核结果
+data/extraction/                       记忆提取输出和任务状态
+data/closed_loop/                      闭环实验中间产物和状态
+logs/                                  本地运行日志
+
+八、协作注意事项
+----------------
+
+1. 不提交真实配置、真实 Token、上传数据、评测结果、日志和打包产物。
+2. USER.md 和 MEMORY.md 已是当前主线任务；day_memory 与 summary 仍是预留任务。
+3. 修改提取、评测、闭环或提示词改进逻辑时，需要同步更新测试和说明文档。
+4. 新提示词另存新版本，不直接覆盖稳定版本。
+5. 打包前运行测试和页面冒烟测试，冒烟失败时不要继续发布。

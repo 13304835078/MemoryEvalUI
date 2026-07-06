@@ -63,7 +63,7 @@ def group_by(results: list[EvalResult], field: str) -> dict[str, list[EvalResult
     return dict(sorted(groups.items()))
 
 
-def print_summary(stats: dict, title: str = "USER.md 更新评测统计") -> None:
+def print_summary(stats: dict, title: str = "记忆更新评测统计") -> None:
     header = "=" * 60
 
     def _dim_label(key: str) -> str:

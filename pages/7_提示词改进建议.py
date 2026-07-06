@@ -228,7 +228,7 @@ def load_prompt_selectors(key_prefix: str, default_judge_prompt: str = "") -> tu
         extraction_options,
         index=extraction_options.index(default_extraction) if default_extraction in extraction_options else 0,
         key=f"{key_prefix}_extraction_prompt_file",
-        help="这里放生成 USER.md 时使用的原版提取提示词。建议模型会把它作为规则来源分析，不会当作用户事实来源。",
+        help="这里放生成 USER.md 或 MEMORY.md 时使用的原版提取提示词。建议模型会把它作为规则来源分析，不会当作用户事实来源。",
     )
     if selected_extraction == "不提供提取提示词":
         extraction_default_text = ""

@@ -4,31 +4,43 @@ Memory Eval UI 使用说明
 一、工具简介
 ------------
 
-Memory Eval UI 是一个本地运行的记忆评测工具，用于辅助评估模型生成的用户记忆内容质量。
+Memory Eval UI 是一个本地运行的记忆提取与评测工具，用于辅助评估模型生成的用户记忆内容质量。
 
-当前版本支持：
-1. USER.md 用户画像提取、绝对评测和闭环实验
-2. MEMORY.md 长期记忆提取、绝对评测和闭环实验
+当前主线支持：
 
-天级记忆和摘要评测暂未开放。
+1. USER.md 用户画像提取、绝对评测、提示词改进和闭环实验。
+2. MEMORY.md 长期记忆提取、绝对评测、提示词改进和闭环实验。
 
-工具支持两种评测模式：
-1. Mock 模式：不调用真实大模型，主要用于演示 UI 流程和测试功能是否正常。
-2. 真实 Judge 模式：调用配置的大模型接口，对 case 进行自动打分和备注。
+暂未作为主线开放：
 
-整体流程为：
+1. day_memory 天级记忆。
+2. summary 摘要任务。
 
-配置 API / Prompt
-    ↓
-导入或生成 Case
-    ↓
-执行评测
-    ↓
-查看结果总览
-    ↓
-查看单条 Case 详情
-    ↓
-人工复核与导出结果
+保留的历史入口：
+
+1. 人工审核结果评估：用于早期 GSB 双模型对比实验。当前主线已暂时放弃 GSB，但页面仍保留用于旧数据对照。
+
+工具支持两种运行模式：
+
+1. Mock 模式：不调用真实大模型，用于演示 UI 流程、检查数据转换和测试进度条。
+2. 真实模型模式：调用配置的大模型接口，进行记忆提取、Judge 评测或提示词改进。
+
+普通绝对评测主流程：
+
+配置 API 和 Prompt
+    -> 导入或生成 Case
+    -> 执行评测
+    -> 查看结果总览
+    -> 查看样本详情
+    -> 人工复核或导出结果
+
+闭环实验主流程：
+
+记忆提取
+    -> 生成 Case
+    -> 执行绝对评测
+    -> 生成候选提取提示词
+    -> 用候选提示词进入下一轮提取
 
 
 二、启动方式
@@ -47,118 +59,139 @@ MemoryEvalUI/
 
 启动方法：
 
-1. 双击 MemoryEvalUI.exe
-2. 程序会在本地启动 Streamlit 服务
-3. 正常情况下浏览器会自动打开页面
+1. 双击 MemoryEvalUI.exe。
+2. 程序会在本地启动 Streamlit 服务。
+3. 正常情况下浏览器会自动打开页面。
 4. 如果浏览器没有自动打开，可以手动访问：
 
 http://localhost:8501
 
 注意：
+
 - 程序是本地 Web UI，数据默认在本地处理。
 - 启动后出现黑色命令行窗口是正常现象，不要关闭。
-- 关闭命令行窗口会停止服务。
-- 如果 8501 端口被占用，可能需要关闭已有 Streamlit 进程或重新启动。
+- 关闭命令行窗口会停止服务，后台任务也会停止。
+- 如果 8501 端口被占用，可能需要关闭已有 Streamlit 进程后重新启动。
 
 
 三、页面说明
 ------------
 
-左侧导航栏包含 5 个主要页面：
+左侧导航栏包含以下页面：
 
 1. 配置
+   设置 API、模型参数、并发、重试、限流等待、裁判提示词和提取提示词。
+
 2. 数据输入
+   加载已有 case，上传 USER.md 提取结果，上传 MEMORY.md 提取结果，或上传通用 Excel/JSONL/Markdown。
+
 3. 执行评测
+   对已加载 case 运行普通绝对评测。支持 USER.md 和 MEMORY.md。
+
 4. 结果总览
-5. Case 详情
+   查看平均分、维度分、错误标签、失败样本、历史结果对比和稳定性对比。
+
+5. 样本详情
+   查看单条样本的对话、旧/新 USER.md 或 MEMORY.md、得分、comment、error_tags、rule_refs、evidence_refs、output_refs 和原始响应。
+
+6. 人工审核结果评估
+   历史 GSB 双模型对比入口。当前主线不建议继续依赖 GSB。
+
+7. 提示词改进建议
+   基于评测证据生成候选裁判提示词或候选提取提示词。无人工结果时，建议只作为候选，不直接覆盖正式版本。
+
+8. 裁判提示词 AB 对比
+   固定同一批 case、同一个被评测模型和同一个裁判模型配置，只比较两个 Judge Prompt。
+
+9. 闭环实验
+   自动多轮串联提取、评测、提示词改进和再提取。支持 USER.md 和 MEMORY.md。
+
+10. 记忆提取
+    单独运行 USER.md 或 MEMORY.md 提取，不进入闭环。支持后台进度、终止请求、结果下载和 chunk 详情查看。
 
 
 四、配置页使用说明
 ------------------
 
-配置页用于设置 Judge 模型接口、Prompt 和评测规则。
+配置页用于设置模型接口、核心推理参数、Prompt 和评测规则。
 
-1. API 配置
+1. API 和模型配置
 
-主要字段：
+核心字段：
 
 API Base URL：
-    填写大模型接口地址。
-    例如：
-    http://xxx.xxx.xxx.xxx:8080/service/xxx/llm/v1/chat/completions
+    填写大模型 chat/completions 接口地址。
 
-Judge 模型名：
-    填写实际接口支持的模型名。
-    不建议随便填写。
-    例如内部接口可能使用：
-    AGENT-GLM5-PERF
+模型名：
+    填写实际接口支持的模型名称，例如 AGENT-GLM5-PERF。
 
 API Token：
-    填写接口鉴权 Token。
-    如果接口要求 Bearer Token，请填写完整格式：
+    填写接口鉴权 Token。Bearer 接口需要填写完整格式：
     Bearer xxxxx
 
 max_tokens：
-    Judge 模型最大输出 token 数。
-    默认 2000，一般够用。
-    如果评测输出被截断，可以适当调大。
+    最大输出 token 数。Judge 输出被截断时需要调大。
 
 timeout 秒：
-    单次请求超时时间。
-    默认 120 秒。
+    单次请求超时时间。默认 120 秒。
 
 max_retries：
-    单条 case 调用失败后的最大重试次数。
-    遇到限流时建议设置为 5。
+    单条请求失败后的最大重试次数。遇到限流时建议 3 到 5。
 
-请求间隔秒数 request_interval：
-    每条 case 之间等待多少秒。
-    如果接口限制为 0.10 QPS，建议设置为 10.5 到 12 秒。
+request_interval：
+    请求启动间隔。接口限制为 0.10 QPS 时建议 10.5 到 12 秒。
 
-限流重试等待秒数 qps_backoff：
-    遇到 QPS limit exceeded 后等待多久再重试。
-    建议设置为 12 秒。
+qps_backoff：
+    遇到 QPS limit exceeded 后等待多久再重试。建议 12 秒或更高。
+
+并发数：
+    控制同时处理的请求数量。并发越高越容易触发限流。
+    如果接口是 0.10 QPS，建议并发 1 到 2，并保留足够 request_interval。
+
+temperature：
+    评测和提示词改进建议通常推荐 0，减少随机性。
+
+top_p：
+    通常保持 1.0。温度为 0 时，不建议为了稳定性随意调低 top_p。
+
+top_k：
+    如果接口没有明确要求，建议不设置。
+
+enable_thinking：
+    如果需要关闭 thinking，通常需要同时确认两件事：
+    - 是否发送 enable_thinking 字段。
+    - 发送时字段值是 true 还是 false。
+    如果不想让接口收到该字段，关闭“发送 enable_thinking 字段”。
 
 Mock 模式：
-    勾选后不调用真实接口。
-    用于演示流程或调试 UI。
-    如果要真实调用大模型 Judge，请取消勾选。
+    勾选后不调用真实接口，用于演示流程或调试 UI。
 
-2. 测试连接
+2. Prompt 配置
 
-填写 API Base URL、Judge 模型名和 API Token 后，可以点击“测试连接”。
+Prompt 分为两类：
 
-测试连接成功表示：
-- 接口可访问
-- 鉴权通过
-- 模型能返回合法 JSON
-- 返回结果符合 JudgeResult 格式
+裁判提示词：
+    存放在 prompts/judge/。
+    用于 Judge 打分。
 
-如果测试连接失败，常见原因包括：
-- Token 错误或过期
-- API Base URL 填错
-- 模型名不被接口支持
-- 当前网络无法访问接口
-- 接口返回 authentication fail
-- 接口限流
+提取提示词：
+    存放在 prompts/generation/。
+    用于记忆提取，也可作为 Judge 的规则来源。
 
-注意：
-“能返回 JSON”不等于测试成功。必须返回符合评测格式的 JSON 才算成功。
+USER.md 推荐：
+    裁判提示词使用 judge_user_md_absolute_stable_with_rules_v1.md。
+    提取提示词可以先使用 extract_user_md_rules_example_v1.md，再粘贴真实线上版本另存。
 
-3. Prompt 配置
+MEMORY.md 推荐：
+    裁判提示词使用 judge_long_memory_v1.md。
+    提取提示词使用 extract_long_memory_v1.yaml。
+    YAML 中包含 create/update 两类模板。
 
-配置页右侧可以选择和编辑 Judge Prompt。
+重要原则：
 
-常用操作：
-- 选择当前任务类型，例如 user_md_update
-- 选择 prompts/judge/ 下的评测 prompt 文件
-- 查看和编辑 prompt 内容
-- 保存为新的 prompt 版本
-
-建议：
-- 不要直接覆盖已有稳定版本
-- 修改 prompt 后保存为新文件，例如 judge_user_md_v2.md
-- 后续比较不同 prompt 效果时，可以通过结果中的 judge_prompt_version 区分
+- 提取提示词在评测中只是“规则来源”，不是用户事实来源。
+- Judge 判断事实时仍只能依据旧记忆、对话、reasoning 和新记忆。
+- 新提示词请另存为新版本，不要直接覆盖稳定版本。
 
 
 五、数据输入页使用说明
@@ -166,44 +199,46 @@ Mock 模式：
 
 数据输入页用于加载或生成标准评测 Case。
 
-支持几种输入方式：
-
 1. 选择已有 cases.jsonl
 
-如果 data/cases/ 目录下已经有标准 case 文件，可以直接选择并加载。
+如果 data/cases/ 目录下已有标准 case 文件，可以直接选择并加载。
 
-适合场景：
-- 已经转换过数据
-- 只是重新评测
-- 只是查看已有 case
+2. 上传 USER.md 提取结果 Excel
 
-2. 上传 run_user.py 输出 Excel
+适用场景：
 
-这是当前 USER.md 评测最推荐的输入方式。
-
-适用 Excel 格式：
-- 每行有 query 和 answer
-- 每个 chunk 的末行有 user.md 或 result
-- user.md 表示该 chunk 后生成的新 USER.md
-- 上一个 chunk 的 user.md 会作为下一个 chunk 的 old_memory
+- 已经有 run_user.py 或类似程序输出的 USER.md 提取结果。
+- 每行包含 query、answer、评测人、轮次等信息。
+- 每个 chunk 的最后一行包含 user.md、result 或类似候选输出列。
 
 转换逻辑：
-- old_memory = 上一个 chunk 的 user.md
-- dialogue = 当前 chunk 内所有 query + answer
-- candidate_output = 当前 chunk 的 user.md
-- 每个 chunk 生成一个评测 case
 
-需要填写：
-- 被评测模型名，例如 GLM5、DeepSeek、Qwen
-- 生成 Prompt 版本，例如 user_md_v1、user_10.2
+- 先按评测人和 session/chunk 规则切分。
+- 当前 chunk 的输出作为 candidate_output。
+- 上一个 chunk 的输出作为下一个 chunk 的 old_memory。
+- 评测人切换时 old_memory 清空。
+- 如果到该抽取的位置但没有抽取结果，会进入漏抽 case 标记，避免错误生成正常 case。
 
-这两个字段会写入 case 和评测结果，后续结果总览页可以按模型和 prompt 版本筛选、对比。
+3. 上传 MEMORY.md 提取结果 Excel
 
-3. 上传通用 Excel / JSON / JSONL
+适用场景：
+
+- 已经有长期记忆提取程序输出。
+- 结果列名为 MEMORY.md 或生成的MEMORY.md正文。
+
+转换逻辑：
+
+- task_type 为 long_memory。
+- candidate_output 来自 MEMORY.md 结果列。
+- old_memory 来自上一条 MEMORY.md 或显式旧MEMORY.md列。
+- 评测人切换时旧 MEMORY.md 清空。
+
+4. 上传通用 Excel / JSON / JSONL
 
 适合已有标准字段的数据。
 
-常见字段包括：
+常见字段：
+
 - case_id
 - session_id
 - old_memory
@@ -212,408 +247,452 @@ Mock 模式：
 - reference_output
 - model_name
 - prompt_version
+- task_type
 
-通用 Excel 会尝试自动识别中英文列名，但如果列名过于特殊，可能需要先手动整理。
-
-4. 读取 Markdown case 目录
+5. 读取 Markdown case 目录
 
 适合手工构造少量测试样例。
 
-目录中需要包含：
+USER.md 样例目录通常包含：
 
-old_user.md
-dialogue.md
-new_user.md
-
-dialogue.md 格式示例：
-
-- user: 我最近在学 Rust
-- assistant: Rust 是个很好的选择
-- user: 我更喜欢简洁一点的回答
-- assistant: 明白
-
-读取后会生成标准 case 文件。
+- old_user.md
+- dialogue.md
+- new_user.md
 
 
-六、执行评测页使用说明
+六、记忆提取页使用说明
 ----------------------
 
-执行评测页用于真正运行 Judge 评测。
+记忆提取页用于单独运行提取，不进入闭环。
+
+支持任务：
+
+1. USER.md 用户画像提取。
+2. MEMORY.md 长期记忆提取。
+
+USER.md 提取：
+
+- 使用单个提取提示词。
+- 同一评测人内部按 session/chunk 顺序继承旧 USER.md。
+- 评测人切换时旧 USER.md 清空。
+
+MEMORY.md 提取：
+
+- 使用 create/update 两类模板。
+- 当前旧 MEMORY.md 为空时使用 create 模板。
+- 当前旧 MEMORY.md 非空时使用 update 模板。
+- 如果模型输出为空，系统会尽量保留上一版 MEMORY.md，避免误清空长期记忆。
+- 评测人切换时旧 MEMORY.md 清空。
+
+后台进度：
+
+- 开始任务后可以切换页面，任务会在后台继续运行。
+- 回到页面后可以通过自动刷新或手动刷新查看进度。
+- 请求终止后，已发出的 API 请求会先返回，之后不再继续后续任务。
+
+结果输出：
+
+- 提取结果 Excel 会保存到 data/extraction/。
+- 可选择自动生成对应 case 文件，供“执行评测”使用。
+- 页面只预览核心列，详细内容可在详情展开项中查看。
+
+
+七、执行评测页使用说明
+----------------------
+
+执行评测页用于运行普通绝对评测。
 
 基本步骤：
 
-1. 确认已经加载 Case
-2. 选择任务类型，例如 user_md_update
-3. 选择是否使用 Mock 模式
-4. 选择 Judge Prompt 文件
-5. 设置评测条数限制
-6. 点击“开始评测”
+1. 确认已加载 Case。
+2. 选择任务类型：USER.md 或 MEMORY.md。
+3. 选择 Mock 或真实 Judge。
+4. 选择裁判提示词。
+5. 选择提取提示词作为规则来源。
+6. 设置评测条数、并发、请求间隔和重试。
+7. 点击开始评测。
 
-1. Mock 模式
+输出结果包含：
 
-Mock 模式不会调用真实大模型。
-适合：
-- 检查 UI 是否正常
-- 检查 case 是否能加载
-- 演示完整流程
-- 避免消耗接口资源
-
-Mock 模式下的分数不代表真实评测结果。
-
-2. 真实 Judge 模式
-
-取消 Mock 模式后，会调用配置页设置的大模型接口。
-
-建议首次测试：
-- limit 设置为 1 或 3
-- request_interval 设置为 10.5 到 12 秒
-- qps_backoff 设置为 12 秒
-- max_retries 设置为 5
-
-确认少量 case 能正常打分后，再跑全量。
-
-3. 关于限流
-
-如果接口返回：
-
-QPS limit exceeded, limit:0.10
-
-说明接口限制为 0.10 QPS，大约 10 秒最多 1 次请求。
-
-此时建议配置：
-- request_interval = 12
-- qps_backoff = 12
-- max_retries = 5
-
-如果 57 条 case 全量评测，预计至少需要 10 到 12 分钟。
-
-4. 注意事项
-
-评测运行过程中不要切换到其他页面。
-当前版本切换页面后，进度条状态可能消失，但评测状态不便继续展示。
-建议等待当前评测完成后再切换页面。
-
-5. 评测结果保存位置
-
-评测完成后会生成结果文件：
-
-data/results/eval_results_YYYYMMDD_HHMMSS.jsonl
-
-每一行是一条 EvalResult，包含：
-- case_id
 - score_total
 - scores
 - comment
 - error_tags
 - fatal_error
-- model_name
-- prompt_version
-- judge_model
-- judge_prompt_version
+- diagnostics
+- rule_refs
+- evidence_refs
+- output_refs
 - raw_response
-- timestamp
+
+关于引用字段：
+
+- rule_refs：引用提取提示词中的规则标题、编号或短句。
+- evidence_refs：引用旧记忆、用户对话或 reasoning 中的事实证据。
+- output_refs：引用候选 USER.md 或 MEMORY.md 中对应的输出片段。
+
+注意：
+
+- comment 是短摘要，不一定承载完整结构化证据。
+- diagnostics 用于展示主要扣分点和引用来源。
+- 如果 Judge 创造了提取提示词中不存在的规则编号，页面会提示疑似幻觉规则引用。
+
+限流建议：
+
+如果接口返回：
+
+QPS limit exceeded, limit:0.10
+
+说明接口约 10 秒最多 1 次请求。建议：
+
+- 并发数：1 到 2
+- request_interval：10.5 到 12
+- qps_backoff：12 或更高
+- max_retries：3 到 5
 
 
-七、结果总览页使用说明
+八、结果总览页使用说明
 ----------------------
 
 结果总览页用于查看整体统计结果。
 
 可以展示：
+
 - Case 数量
 - 平均总分
-- fatal_error 数量
-- fatal_error 比例
+- fatal_error 数量和比例
 - 各维度平均分
 - 错误标签分布
-- 按被评测模型分组统计
-- 按生成 Prompt 分组统计
-- 明细表格
+- 按模型、Prompt、任务类型分组统计
+- 失败样本和低分样本
+- 规则引用校验结果
+- 稳定性对比
+- 历史结果对比
 
-1. 加载结果文件
+结果文件：
 
-可以在侧边栏选择 data/results/ 下的 result jsonl 文件。
+- 原始评测结果优先使用 data/results/ 下的 JSONL。
+- 页面也可导入导出的 CSV 或 Excel，但 CSV/Excel 可能缺少完整原始字段。
 
-如果希望在结果表格里看到 old_memory、candidate_output 预览，需要同时加载对应的 case 文件。
+稳定性对比：
 
-2. 筛选功能
+- 可以选择另一次历史结果作为对照。
+- 总分相同不代表错误完全一致。
+- 页面会展示维度差异、错误标签差异、comment 差异、样本级不稳定明细和分布散度。
+- 对“得分相同但 comment 或错误标签不同”的样本，会单独标出，便于判断评测是否稳定。
 
-支持按以下条件筛选：
-- 被评测模型 model_name
-- 生成 Prompt 版本 prompt_version
-- fatal_error
-- 最低分数
+导出：
 
-3. 导出结果
-
-支持导出：
-- CSV
-- Excel
-
-导出结果适合后续人工分析、汇报或发送给其他人查看。
+- 支持 CSV 和 Excel。
+- Excel 更适合发给协作者查看。
 
 
-八、Case 详情页使用说明
------------------------
+九、样本详情页使用说明
+----------------------
 
-Case 详情页用于查看单条评测样本的详细内容。
+样本详情页用于查看单条评测样本。
 
-展示内容包括：
-- old_memory
-- candidate_output
-- old_memory 与 candidate_output 的 diff
-- 对话记录 dialogue
-- 各维度得分
-- 总分
-- Judge 评语 comment
-- 错误标签 error_tags
-- Judge 原始响应 raw_response
+主要内容：
 
-如果加载了 case 文件，页面会展示完整输入。
-如果只加载 result 文件，可能只能看到评测结果，看不到原始对话和 USER.md。
+- case_id、task_type、model_name、prompt_version。
+- old_memory。
+- candidate_output。
+- old 与 candidate 的 diff。
+- 对话记录，默认不会一次性全部展开，避免页面过长。
+- 总分和各维度得分。
+- comment。
+- error_tags。
+- rule_refs。
+- evidence_refs。
+- output_refs。
+- diagnostics。
+- raw_response。
+- 人工复核记录。
 
-1. 单条 Case 选择
+说明：
 
-可以通过下拉框选择某条结果。
-如果同一个 case_id 有多个模型或 prompt 版本，会显示 model_name 和 prompt_version 以便区分。
-
-2. 人工复核
-
-可以填写：
-- 人工评分 human_score
-- 人工错误标签 human_error_tags
-- 人工备注 human_comment
-- 复核状态 review_status
-
-复核结果会保存到：
-
-data/results/human_reviews.jsonl
-
-适合记录：
-- Judge 是否误判
-- 需要讨论的 case
-- 后续 prompt 优化依据
-- 模型对比中的典型错误样例
+- USER.md 页面文案会显示旧/新 USER.md。
+- MEMORY.md 页面文案会显示旧/新 MEMORY.md。
+- 如果只加载 result 文件，没有加载对应 case 文件，可能看不到完整对话和旧记忆。
 
 
-九、常见问题
-------------
+十、提示词改进建议页使用说明
+----------------------------
 
-1. 双击 exe 后黑色窗口一闪而过
+提示词改进建议页用于根据评测证据生成候选 Prompt 修改建议。
 
-可能原因：
-- 打包文件不完整
-- 没有解压整个文件夹
-- 缺少 _internal 目录
-- app.py、pages、src 等资源缺失
+支持两类证据来源：
+
+1. 普通绝对评测结果。
+2. 历史人工审核 GSB 结果。
+
+当前主线建议使用普通绝对评测结果。
+
+可优化对象：
+
+- 只优化提取提示词。
+- 只优化裁判提示词。
+- 同时给出两类建议。
+
+提取提示词优化机制：
+
+- 不是简单重写整份 Prompt。
+- 系统会先切分提取提示词章节。
+- 第一阶段让模型诊断应该改哪些章节和方向。
+- 第二阶段只对相关章节生成受约束 patch。
+- 合并前会做重复规则过滤、追加长度限制和冲突检查。
+- 候选提示词另存为新版本，不覆盖原文件。
+
+建议使用方式：
+
+- 证据条数先设少量，例如 3 到 10。
+- 优先选择“只优化提取提示词”。
+- 先看 diff 和 skipped/conflicts，再决定是否采用。
+- 不要因为单个 case 生成过细、过拟合的规则。
+- 候选提示词需要人工复核后再进入下一轮正式提取。
+
+常见失败原因：
+
+- 模型输出不是合法 JSON。
+- max_tokens 太小导致输出被截断。
+- 输入证据和 Prompt 太长，接口空闲超时。
+- 接口限流或连接超时。
+
+
+十一、裁判提示词 AB 对比页使用说明
+----------------------------------
+
+该页面用于比较两个裁判提示词，而不是比较两个被评测模型。
+
+固定不变：
+
+- 同一批 case。
+- 同一个被评测模型输出。
+- 同一个裁判模型。
+- 同一套温度、top_p、并发、请求间隔、提取规则。
+
+唯一变化：
+
+- 裁判提示词 A。
+- 裁判提示词 B。
+
+适合用途：
+
+- 判断新裁判提示词是否更稳定。
+- 判断新裁判提示词是否减少 JSON 解析失败。
+- 判断两个裁判提示词在同一批样本上的扣分点差异。
+
+
+十二、闭环实验页使用说明
+------------------------
+
+闭环实验用于自动多轮尝试提示词改进。
+
+每一轮包括：
+
+1. 使用当前提取提示词运行记忆提取。
+2. 将提取结果转换为 case。
+3. 使用 Judge 运行绝对评测。
+4. 基于评测证据生成候选提取提示词。
+5. 下一轮使用上一轮候选提取提示词继续提取。
+
+支持任务：
+
+- USER.md。
+- MEMORY.md。
+
+MEMORY.md 闭环说明：
+
+- 第一轮使用 YAML 中的 create/update 模板。
+- 后续候选提示词会作为下一轮提取规则使用。
+- 当前实现中，候选提示词会同时用于 create/update 场景，便于保持闭环简单可控。
 
 建议：
-- 不要单独复制 exe
-- 发给他人时压缩整个 MemoryEvalUI 文件夹
-- 从命令行运行 exe 查看具体报错
 
-2. 页面能打开，但提示 No module named src
+- 先用 Mock 模式或少量 case 跑通。
+- 闭环轮次先设 1 到 2。
+- 每轮最多评测 case 先设 10 到 30。
+- 候选提示词只作为实验产物，不自动替换正式提示词。
 
-说明打包时没有把 src 目录复制进去。
-需要确认 dist/MemoryEvalUI/_internal/src 是否存在。
+进度：
 
-3. 测试连接失败：authentication fail
-
-可能原因：
-- Token 错误
-- Token 过期
-- Token 没有带 Bearer
-- API Base URL 填错
-- 当前网络无法访问该服务
-
-建议填写完整 Token，例如：
-
-Bearer movie-sk-XXX
-
-4. 测试连接成功，但执行评测全是 0 分
-
-需要查看 result 文件中的 raw_response。
-
-如果 raw_response 是：
-- authentication fail：鉴权失败
-- QPS limit exceeded：接口限流
-- 非 JSON 文本：Judge 没有按格式输出
-- 输出被截断：max_tokens 可能太小
-
-5. QPS limit exceeded
-
-说明请求太快。
-建议：
-- request_interval 设置为 12
-- qps_backoff 设置为 12
-- max_retries 设置为 5
-
-6. 只有少数 case 成功，大部分失败
-
-如果失败 raw_response 是 QPS limit exceeded，说明是限流。
-不是模型不会评测，而是请求过快。
-
-7. 结果总览里被评测模型只有 unknown
-
-说明生成 case 时没有填写 model_name 和 prompt_version。
-
-解决方式：
-- 在数据输入页上传 run_user.py 输出 Excel 时填写“被评测模型名”和“生成 Prompt 版本”
-- 或重新生成 case 文件
-
-8. 维度均分为空
-
-可能原因：
-- 没有成功评测结果
-- 所有结果都是 fatal_error
-- Judge 返回格式不符合要求
-- result 文件中 scores 字段为空
-
-9. 切换页面后进度条消失
-
-这是当前版本的已知限制。
-建议评测过程中不要切换页面。
-等评测完成后再查看其他页面。
-
-10. 导出的 CSV 打开乱码
-
-建议使用 Excel 打开 UTF-8 BOM 格式的 CSV。
-如果仍乱码，可以优先导出 Excel。
+- 页面会展示当前轮次、当前步骤、提取进度、评测进度和提示词改进状态。
+- 切换页面后后台任务仍会继续。
+- 程序进程退出后，后台线程不会自动恢复，但已生成的中间文件会保留。
 
 
-十、推荐演示流程
-----------------
+十三、人工审核结果评估页说明
+----------------------------
 
-给他人演示时，建议按以下流程：
+该页面是历史 GSB 双模型对比入口。
 
-1. 双击 MemoryEvalUI.exe
-2. 进入“配置”页
-3. 先开启 Mock 模式
-4. 进入“数据输入”页
-5. 选择已有 cases.jsonl，或上传 run_user.py 输出 Excel
-6. 进入“执行评测”页
-7. limit 设置为 3
-8. 点击开始评测
-9. 进入“结果总览”页查看统计
-10. 进入“Case 详情”页查看单条 case、diff 和评语
-11. 如果需要真实 Judge，再回到配置页填写 API 信息并关闭 Mock 模式
+输入 Excel 通常包含：
+
+- 轮次
+- query
+- answer
+- 评测人
+- user.md-glm5-think
+- user.md-ds-10.1.2
+- GSB
+- 问题类型
+- 备注
+
+页面逻辑：
+
+1. 同一行拆成模型 1 和模型 2 两个 case。
+2. 分别调用 Judge 对两个模型结果评分。
+3. 用固定分差规则自动判定 G/S/B。
+4. 与人工 GSB 对比，展示一致率和混淆矩阵。
+
+当前主线已转向单模型绝对评测和闭环实验，因此该入口主要用于历史结果复查。
 
 
-十一、真实 Judge 推荐配置
--------------------------
+十四、真实接口推荐配置
+----------------------
 
-如果接口限制为 0.10 QPS，推荐配置：
+如果接口限制为 0.10 QPS，推荐：
 
 Mock 模式：
     关闭
 
-Judge 模型名：
-    使用接口实际支持的模型名，例如 AGENT-GLM5-PERF
+temperature：
+    0
 
-API Base URL：
-    填写完整 chat/completions 地址
+top_p：
+    1.0
 
-API Token：
-    填写完整 Bearer Token
+top_k：
+    不设置，除非接口明确要求
+
+enable_thinking：
+    评测稳定性优先时建议关闭；如果接口需要字段，发送 false；如果接口不需要字段，则不要发送该字段。
 
 max_tokens：
-    2000 或更高
+    评测通常 2000 到 8000。
+    提示词改进建议可能需要更高，但输入过长时更容易超时。
 
 timeout：
-    120
+    120 或更高
 
 max_retries：
-    5
+    3 到 5
 
 request_interval：
-    12
+    10.5 到 12
 
 qps_backoff：
-    12
+    12 或更高
 
-首次测试：
-    limit = 1 或 3
-
-全量评测：
-    确认小批量成功后再运行
+并发：
+    0.10 QPS 接口建议 1 到 2。
+    如果服务端实际限流更宽，可以逐步提高。
 
 
-十二、数据安全说明
+十五、数据安全说明
 ------------------
 
 当前工具设计为本地运行：
-- 上传文件默认保存在本地 data/raw/uploads
-- case 文件保存在 data/cases
-- 评测结果保存在 data/results
-- 人工复核保存在 data/results/human_reviews.jsonl
-- API 配置保存在 config/local_config.json
+
+- 上传文件默认保存在 data/raw/uploads。
+- case 文件保存在 data/cases。
+- 评测结果保存在 data/results。
+- 记忆提取结果保存在 data/extraction。
+- 闭环实验中间产物保存在 data/closed_loop。
+- 人工复核保存在 data/results/human_reviews.jsonl。
+- API 配置保存在 config/local_config.json。
 
 注意：
-- 不要把真实 API Token 提交到代码仓库
-- 不要把包含敏感信息的 data/raw、data/cases、data/results 随意外发
-- 发给他人演示时，建议使用脱敏数据或 mock 数据
-- 打包分发前检查 config/local_config.json 中是否包含真实 Token
+
+- 不要把真实 API Token 提交到代码仓库。
+- 不要把包含敏感信息的 data/raw、data/cases、data/results、data/extraction、data/closed_loop 随意外发。
+- 发给他人演示时，建议使用脱敏数据或 Mock 数据。
+- 打包分发前检查 config/local_config.json 中是否包含真实 Token。
 
 
-十三、目录说明
+十六、常见问题
 --------------
 
-常用目录：
+1. 双击 exe 后黑色窗口一闪而过
 
-data/raw/
-    原始上传文件
+可能原因：
 
-data/raw/uploads/
-    UI 上传后的临时保存文件
+- 打包文件不完整。
+- 没有解压整个文件夹。
+- 缺少 _internal 目录。
+- 资源文件缺失。
 
-data/cases/
-    标准评测 case，jsonl 格式
+建议从命令行运行 exe 查看具体报错。
 
-data/results/
-    评测结果、人工复核结果
+2. 测试连接失败：authentication fail
 
-prompts/judge/
-    Judge Prompt 文件
+可能原因：
 
-rules/
-    Rubric 评测规则文件
+- Token 错误。
+- Token 过期。
+- Token 没有带 Bearer。
+- API Base URL 填错。
+- 当前网络无法访问服务。
 
-config/
-    本地配置文件
+3. 测试连接成功，但执行评测大量失败
 
-logs/
-    运行日志目录，如有
+查看 raw_response。
+
+常见原因：
+
+- QPS limit exceeded：接口限流。
+- 非 JSON 文本：Judge 没有按格式输出。
+- JSON 被截断：max_tokens 太小。
+- Connection Idle Timeout：输入过长、模型响应太慢或服务端连接超时。
+
+4. 结果总览没有结果文件
+
+确认文件放在当前运行目录对应的 data/results 下。
+打包版通常是 MemoryEvalUI.exe 同级或 _internal 对应的 data/results，而不是源码目录下的 data/results。
+原始 JSONL 最完整；CSV/Excel 是导出格式，字段可能不完整。
+
+5. 结果总分一样但细节不一样
+
+总分相同不代表评测完全稳定。
+请使用结果总览的历史结果对比和不稳定样本明细，查看维度分、error_tags、comment、diagnostics 是否一致。
+
+6. 提示词改进建议没有结果
+
+常见原因：
+
+- 证据不足。
+- 模型输出不是合法 JSON。
+- 输入过长导致接口空闲超时。
+- max_tokens 太小。
+- 接口限流。
+
+建议减少证据条数，优先只优化提取提示词，并查看原始错误。
+
+7. MEMORY.md 提取为空
+
+如果本轮没有可记录长期事项，空输出可能是合理的。
+如果旧 MEMORY.md 非空但新输出为空，系统会尽量保留上一版，避免误清空。
+仍需结合提取 prompt 和样本详情判断是否漏抽。
+
+8. 切换页面后进度条是否会归零
+
+当前执行评测、记忆提取和闭环实验都会写后台状态。
+切换页面后任务继续运行，回到页面后可重新读取状态。
+如果程序进程关闭，后台线程停止，任务不能自动继续。
 
 
-十四、当前版本已知限制
-----------------------
-
-1. 后台任务进度会持久化到状态文件，切换页面后可继续查看。
-2. 真实 Judge 评测速度受接口 QPS 限制影响。
-3. 当前支持 USER.md 和 MEMORY.md；天级记忆与摘要任务尚未实现。
-4. 如果 Judge 输出不是严格 JSON，会被标记为 fatal_error。
-5. 当前没有多用户权限管理，不适合作为多人在线平台直接部署。
-6. 后台任务使用本地线程运行；程序进程退出后任务不能自动恢复，只能依据中间文件重新启动。
-
-
-十五、问题排查建议
+十七、推荐演示流程
 ------------------
 
-如果出现异常，建议按顺序检查：
+给他人演示时，建议：
 
-1. 是否能正常启动 UI
-2. 是否能加载 case 文件
-3. Mock 模式能否跑通
-4. API 测试连接是否成功
-5. limit=1 的真实 Judge 是否成功
-6. result 文件中的 raw_response 是什么
-7. 是否出现 authentication fail
-8. 是否出现 QPS limit exceeded
-9. Judge 是否返回合法 JSON
-10. 是否加载了正确的 result 文件和 case 文件
-
-如果需要定位问题，优先查看：
-
-data/results/eval_results_xxx.jsonl
-
-其中 raw_response 字段通常能说明具体失败原因。
+1. 双击 MemoryEvalUI.exe。
+2. 进入“配置”页，开启 Mock 模式。
+3. 进入“数据输入”页，加载已有 case 或上传小样本 Excel。
+4. 进入“执行评测”页，limit 设置为 3。
+5. 点击开始评测。
+6. 进入“结果总览”页查看统计。
+7. 进入“样本详情”页查看单条 case、diff 和评语。
+8. 进入“记忆提取”页演示 USER.md 或 MEMORY.md 单独提取。
+9. 进入“闭环实验”页，用 Mock 模式跑 1 轮。
+10. 需要真实调用时，再回到配置页填写 API 信息并关闭 Mock 模式。
