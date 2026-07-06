@@ -1,8 +1,8 @@
 import pandas as pd
 
 from src.eval.metrics import flatten_results
-from src.schema import EvalResult
-from src.ui.data_service import dataframe_to_excel_bytes, list_files, load_results_bytes
+from src.schema import Case, EvalResult, TaskType
+from src.ui.data_service import dataframe_to_excel_bytes, find_case_for_result, list_files, load_results_bytes
 
 
 def test_list_files_matches_suffix_case_insensitively(tmp_path):
@@ -55,3 +55,34 @@ def test_exported_csv_and_excel_can_be_loaded_back_as_results():
         assert restored.rule_refs == original.rule_refs
         assert restored.evidence_refs == original.evidence_refs
         assert restored.output_refs == original.output_refs
+
+
+def test_find_case_for_result_requires_matching_task_type():
+    user_case = Case(
+        case_id="same_id",
+        task_type=TaskType.USER_MD,
+        session_id="s1",
+        old_memory="旧用户画像",
+        candidate_output="候选用户画像",
+        model_name="model",
+        prompt_version="prompt",
+    )
+    memory_case = Case(
+        case_id="same_id",
+        task_type=TaskType.LONG_MEMORY,
+        session_id="s1",
+        old_memory="旧长期记忆",
+        candidate_output="候选长期记忆",
+        model_name="model",
+        prompt_version="prompt",
+    )
+    result = EvalResult(
+        case_id="same_id",
+        task_type=TaskType.LONG_MEMORY.value,
+        score_total=4.5,
+        model_name="model",
+        prompt_version="prompt",
+    )
+
+    assert find_case_for_result([user_case, memory_case], result) is memory_case
+    assert find_case_for_result([user_case], result) is None

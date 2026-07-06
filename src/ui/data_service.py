@@ -338,16 +338,22 @@ def results_to_dataframe(results: list[EvalResult]) -> pd.DataFrame:
     return pd.DataFrame(flatten_results(results))
 
 
-def case_match_key(case: Case) -> tuple[str, str, str]:
+def _task_type_value(value: Any) -> str:
+    return value.value if isinstance(value, TaskType) else str(value or "")
+
+
+def case_match_key(case: Case) -> tuple[str, str, str, str]:
     return (
+        _task_type_value(case.task_type),
         case.case_id,
         case.model_name or "unknown",
         case.prompt_version or "unknown",
     )
 
 
-def result_match_key(result: EvalResult) -> tuple[str, str, str]:
+def result_match_key(result: EvalResult) -> tuple[str, str, str, str]:
     return (
+        _task_type_value(result.task_type),
         result.case_id,
         result.model_name or "unknown",
         result.prompt_version or "unknown",
@@ -355,14 +361,15 @@ def result_match_key(result: EvalResult) -> tuple[str, str, str]:
 
 
 def find_case_for_result(cases: list[Case], result: EvalResult) -> Case | None:
-    """优先按 case_id+model_name+prompt_version 匹配；失败后按 case_id 匹配。"""
+    """优先按 task_type+case_id+model_name+prompt_version 匹配；失败后只在同任务内按 case_id 匹配。"""
     exact = {case_match_key(c): c for c in cases}
     hit = exact.get(result_match_key(result))
     if hit:
         return hit
 
+    result_task_type = _task_type_value(result.task_type)
     for c in cases:
-        if c.case_id == result.case_id:
+        if _task_type_value(c.task_type) == result_task_type and c.case_id == result.case_id:
             return c
 
     return None

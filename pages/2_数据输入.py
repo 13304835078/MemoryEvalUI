@@ -70,16 +70,33 @@ st.session_state.task_type = st.selectbox(
     format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
 )
 
-mode = st.radio(
-    "输入方式",
-    [
+if st.session_state.task_type == TaskType.LONG_MEMORY.value:
+    mode_options = [
         "选择已有样本文件",
-        "运行 USER.md 记忆提取",
-        "上传 run_user.py 输出 Excel",
         "上传长期记忆提取结果 Excel",
         "上传通用 Excel / JSON / JSONL",
         "读取 Markdown 样本目录",
-    ],
+    ]
+    mode_help = "长期记忆任务只展示 MEMORY.md 相关输入方式；如需重新提取，请到「记忆提取」页选择长期记忆 MEMORY.md。"
+else:
+    mode_options = [
+        "选择已有样本文件",
+        "运行 USER.md 记忆提取",
+        "上传 run_user.py 输出 Excel",
+        "上传通用 Excel / JSON / JSONL",
+        "读取 Markdown 样本目录",
+    ]
+    mode_help = "用户画像任务只展示 USER.md 相关输入方式。"
+
+previous_mode = st.session_state.get("data_input_mode")
+if previous_mode not in mode_options:
+    st.session_state.data_input_mode = mode_options[0]
+
+mode = st.radio(
+    "输入方式",
+    mode_options,
+    key="data_input_mode",
+    help=mode_help,
 )
 
 st.divider()
@@ -567,7 +584,12 @@ elif mode == "上传通用 Excel / JSON / JSONL":
             st.error(f"加载失败：{e}")
 
 elif mode == "读取 Markdown 样本目录":
-    st.info("目录需包含 old_user.md / dialogue.md / new_user.md。")
+    document_name = "MEMORY.md" if st.session_state.task_type == TaskType.LONG_MEMORY.value else "USER.md"
+    st.info(
+        f"读取 Markdown 样本目录会生成 {document_name} 评测样本。"
+        "目录需包含 old_user.md / dialogue.md / new_user.md。"
+        "长期记忆任务也复用这三个文件名，内容请放 MEMORY.md。"
+    )
     dir_path = st.text_input("Markdown 样本目录路径")
 
     if dir_path and st.button("读取 Markdown 样本", use_container_width=True):

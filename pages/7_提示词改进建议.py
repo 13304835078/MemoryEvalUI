@@ -10,6 +10,7 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.schema import EVALUATABLE_TASK_TYPES, TASK_TYPE_LABELS, TaskType
 from src.ui.config_store import build_eval_config, load_config
 from src.ui.data_service import list_result_files, load_results, load_results_bytes, save_uploaded_file
 from src.ui.prompt_advisor import (
@@ -43,7 +44,23 @@ if "gsb_advisor_result" not in st.session_state:
     st.session_state.gsb_advisor_result = None
 
 
-def render_advisor_result(result: dict | None, raw: str, key_prefix: str) -> None:
+def _prompt_task_slug(task_type: str) -> str:
+    return "long_memory" if task_type == TaskType.LONG_MEMORY.value else "user_md"
+
+
+def infer_single_task_type(results: list) -> str:
+    allowed = {task.value for task in EVALUATABLE_TASK_TYPES}
+    task_types = {
+        str(getattr(result, "task_type", "") or "")
+        for result in results
+        if str(getattr(result, "task_type", "") or "") in allowed
+    }
+    if len(task_types) == 1:
+        return next(iter(task_types))
+    return TaskType.USER_MD.value
+
+
+def render_advisor_result(result: dict | None, raw: str, key_prefix: str, task_type: str = TaskType.USER_MD.value) -> None:
     if not result:
         return
 
@@ -96,11 +113,11 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str) -> Non
         )
         version_name = st.text_input(
             "保存为新的裁判提示词文件名",
-            value=f"judge_user_md_advised_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+            value=f"judge_{_prompt_task_slug(task_type)}_advised_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
             key=f"{key_prefix}_judge_save_name",
         )
         if st.button("保存候选裁判提示词为新版本", use_container_width=True, key=f"{key_prefix}_save_judge"):
-            saved = save_prompt_version("user_md_update", candidate_judge_prompt, version_name)
+            saved = save_prompt_version(task_type, candidate_judge_prompt, version_name)
             st.success(f"已保存：prompts/judge/{saved}。注意：尚未自动启用，请到对应页面手动选择。")
 
     st.markdown("**提取提示词建议**")
@@ -188,12 +205,12 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str) -> Non
         )
         extraction_version_name = st.text_input(
             "保存为新的提取提示词文件名",
-            value=f"extract_user_md_advised_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+            value=f"extract_{_prompt_task_slug(task_type)}_advised_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
             key=f"{key_prefix}_extract_save_name",
         )
         if st.button("保存候选提取提示词为新版本", use_container_width=True, key=f"{key_prefix}_save_extract"):
             saved = save_prompt_version(
-                "user_md_update",
+                task_type,
                 candidate_extraction_prompt,
                 extraction_version_name,
                 prompt_kind="extraction",
@@ -204,9 +221,13 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str) -> Non
         st.code(raw or "", language="json")
 
 
-def load_prompt_selectors(key_prefix: str, default_judge_prompt: str = "") -> tuple[str, str]:
+def load_prompt_selectors(
+    key_prefix: str,
+    default_judge_prompt: str = "",
+    task_type: str = TaskType.USER_MD.value,
+) -> tuple[str, str]:
     prompt_files = list_prompt_files()
-    default_prompt = default_judge_prompt or get_default_prompt_file("user_md_update")
+    default_prompt = default_judge_prompt or get_default_prompt_file(task_type)
     selected_prompt = st.selectbox(
         "裁判提示词文件",
         prompt_files,
@@ -217,11 +238,17 @@ def load_prompt_selectors(key_prefix: str, default_judge_prompt: str = "") -> tu
         "当前裁判提示词内容",
         value=load_prompt(selected_prompt),
         height=300,
-        key=f"{key_prefix}_judge_prompt_text",
+        key=f"{key_prefix}_judge_prompt_text::{selected_prompt}",
     )
 
     extraction_files = list_extraction_prompt_files()
-    default_extraction = st.session_state.get("selected_extraction_prompt_file", "") or get_default_extraction_prompt_file("user_md_update")
+    configured_task = st.session_state.get("selected_prompt_task_type")
+    configured_extraction = st.session_state.get("selected_extraction_prompt_file", "")
+    default_extraction = (
+        configured_extraction
+        if configured_task == task_type and configured_extraction
+        else get_default_extraction_prompt_file(task_type)
+    )
     extraction_options = ["不提供提取提示词"] + extraction_files
     selected_extraction = st.selectbox(
         "提取提示词文件",
@@ -233,7 +260,8 @@ def load_prompt_selectors(key_prefix: str, default_judge_prompt: str = "") -> tu
     if selected_extraction == "不提供提取提示词":
         extraction_default_text = ""
     elif (
-        selected_extraction == st.session_state.get("selected_extraction_prompt_file")
+        configured_task == task_type
+        and selected_extraction == st.session_state.get("selected_extraction_prompt_file")
         and st.session_state.get("extraction_prompt_text")
     ):
         extraction_default_text = st.session_state.get("extraction_prompt_text", "")
@@ -243,7 +271,7 @@ def load_prompt_selectors(key_prefix: str, default_judge_prompt: str = "") -> tu
         "当前提取提示词内容",
         value=extraction_default_text,
         height=240,
-        key=f"{key_prefix}_extraction_prompt_text",
+        key=f"{key_prefix}_extraction_prompt_text::{selected_extraction}",
     )
     st.caption(
         f"裁判提示词版本：{infer_prompt_version(selected_prompt)}；"
@@ -344,8 +372,13 @@ with tab_absolute:
         include_all=bool(no_gate_extraction_loop),
     ) if absolute_results else []
     absolute_evidence = absolute_candidates[:int(max_items)]
+    absolute_task_type = infer_single_task_type(absolute_results) if absolute_results else TaskType.USER_MD.value
 
     if absolute_results:
+        result_task_types = sorted({str(getattr(item, "task_type", "") or "") for item in absolute_results})
+        if len(result_task_types) > 1:
+            st.warning(f"当前结果包含多个任务类型：{result_task_types}。提示词选择默认按 USER.md 处理，建议拆分后分别生成建议。")
+        st.caption(f"当前普通评测任务：{TASK_TYPE_LABELS.get(absolute_task_type, absolute_task_type)}")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("结果总数", len(absolute_results))
         c2.metric("符合条件", len(absolute_candidates))
@@ -372,7 +405,8 @@ with tab_absolute:
     st.subheader("当前提示词")
     absolute_judge_prompt, absolute_extraction_prompt = load_prompt_selectors(
         "absolute",
-        default_judge_prompt="judge_user_md_absolute_stable_with_rules_v1.md",
+        default_judge_prompt=get_default_prompt_file(absolute_task_type),
+        task_type=absolute_task_type,
     )
     abs_mock, abs_min_evidence, abs_target = render_generation_controls("absolute")
     if no_gate_extraction_loop:
@@ -466,6 +500,7 @@ with tab_absolute:
         st.session_state.get("absolute_advisor_result"),
         st.session_state.get("absolute_advisor_raw", "") or "",
         "absolute",
+        task_type=absolute_task_type,
     )
 
 with tab_gsb:
@@ -566,6 +601,7 @@ with tab_gsb:
     gsb_judge_prompt, gsb_extraction_prompt = load_prompt_selectors(
         "gsb",
         default_judge_prompt="judge_user_md_human_aligned_v1.md",
+        task_type=TaskType.USER_MD.value,
     )
     gsb_mock, gsb_min_evidence, gsb_target = render_generation_controls("gsb")
 
@@ -623,4 +659,5 @@ with tab_gsb:
         st.session_state.get("gsb_advisor_result"),
         st.session_state.get("gsb_advisor_raw", "") or "",
         "gsb",
+        task_type=TaskType.USER_MD.value,
     )

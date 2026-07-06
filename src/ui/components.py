@@ -189,7 +189,11 @@ def render_dialogue(case: Case) -> None:
 
 def render_case_input(case: Case) -> None:
     st.subheader("输入与候选输出")
-    is_long_memory = case.task_type == TaskType.LONG_MEMORY
+    try:
+        case_task_type = TaskType(case.task_type)
+    except ValueError:
+        case_task_type = case.task_type
+    is_long_memory = case_task_type == TaskType.LONG_MEMORY
     document_label = "长期记忆 MEMORY.md" if is_long_memory else "用户画像 USER.md"
 
     col_old, col_new = st.columns(2)
