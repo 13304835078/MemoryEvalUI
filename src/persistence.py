@@ -4,6 +4,9 @@ import json
 import os
 import threading
 import time
+from datetime import date, datetime
+from decimal import Decimal
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -60,7 +63,7 @@ def atomic_write_text(
 
 
 def atomic_write_jsonl(path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
-    payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    payload = "".join(_json_dumps(row) + "\n" for row in rows)
     atomic_write_text(path, payload)
 
 
@@ -75,7 +78,7 @@ def append_jsonl_rows(path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
     with lock:
         with open(target, "a", encoding="utf-8", newline="") as handle:
             for row in rows:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                handle.write(_json_dumps(row) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
 
@@ -100,3 +103,31 @@ def read_jsonl(path: str | Path, *, tolerate_trailing_partial: bool = True) -> l
             raise ValueError(f"JSONL 第 {index + 1} 行必须是 object")
         rows.append(value)
     return rows
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default)
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if hasattr(value, "item") and callable(value.item):
+        try:
+            item_value = value.item()
+            if item_value is not value:
+                return item_value
+        except Exception:
+            pass
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
