@@ -16,6 +16,7 @@ from src.ui.prompt_advisor import (
     collect_absolute_eval_evidence,
     collect_review_evidence,
 )
+from src.ui.prompt_advisor_model_call import _advisor_attempt_profile
 from src.schema import EvalResult
 
 
@@ -32,6 +33,25 @@ def test_collect_review_evidence_requires_human_fields():
     assert len(evidence) == 1
     assert evidence[0]["case_id"] == "c2"
     assert evidence[0]["human_comment"] == "漏记"
+
+
+def test_prompt_advisor_attempt_profile_compacts_retry_requests():
+    first = _advisor_attempt_profile(
+        attempt=1,
+        target="extraction_prompt",
+        evidence_count=20,
+        min_evidence=3,
+    )
+    retry = _advisor_attempt_profile(
+        attempt=3,
+        target="extraction_prompt",
+        evidence_count=20,
+        min_evidence=3,
+    )
+
+    assert retry["max_items"] < first["max_items"]
+    assert retry["text_limit"] < first["text_limit"]
+    assert retry["max_tokens_cap"] < first["max_tokens_cap"]
 
 
 def test_prompt_advisor_refuses_insufficient_evidence():

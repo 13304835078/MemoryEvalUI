@@ -8,6 +8,7 @@ from typing import Any
 
 from src.runtime_paths import DATA_DIR
 from src.schema import EvalConfig
+from src.persistence import atomic_write_text
 from src.ui.background_tasks import (
     list_task_job_ids,
     parse_time as _parse_time,
@@ -55,6 +56,14 @@ def state_path(job_id: str) -> Path:
 
 def stop_path(job_id: str) -> Path:
     return task_stop_path(PROMPT_ADVISOR_JOBS_DIR, job_id)
+
+
+def result_path(job_id: str) -> Path:
+    return job_dir(job_id) / "result.json"
+
+
+def raw_path(job_id: str) -> Path:
+    return job_dir(job_id) / "raw.txt"
 
 
 def read_prompt_advisor_job_state(job_id: str) -> dict[str, Any]:
@@ -127,6 +136,7 @@ def _safe_config(config: PromptAdvisorJobConfig) -> dict[str, Any]:
     eval_config = value.get("eval_config")
     if isinstance(eval_config, dict):
         eval_config.pop("judge_api_bearer_token", None)
+        eval_config["judge_max_attempts"] = int(eval_config.get("judge_max_retries") or 1)
     return value
 
 
@@ -156,6 +166,53 @@ def _write_state(
     if extra:
         state.update(extra)
     write_prompt_advisor_job_state(config.job_id, state)
+
+
+def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    patch_result = result.get("extraction_prompt_patch_result")
+    if not isinstance(patch_result, dict):
+        patch_result = {}
+    return {
+        "can_suggest": result.get("can_suggest"),
+        "error": result.get("error", ""),
+        "candidate_judge_prompt_chars": len(str(result.get("candidate_judge_prompt") or "")),
+        "candidate_extraction_prompt_chars": len(str(result.get("candidate_extraction_prompt") or "")),
+        "advisor_flow": result.get("advisor_flow", ""),
+        "applied_patch_edits": len(patch_result.get("applied_edits") or []),
+        "skipped_patch_edits": len(patch_result.get("skipped_edits") or []),
+        "risk_count": len(result.get("risks") or []),
+    }
+
+
+def _write_result_files(job_id: str, result: dict[str, Any] | None, raw: str | None) -> tuple[Path, Path]:
+    job_dir(job_id).mkdir(parents=True, exist_ok=True)
+    result_file = result_path(job_id)
+    raw_file = raw_path(job_id)
+    atomic_write_json(result_file, result or {})
+    atomic_write_text(raw_file, raw or "")
+    return result_file, raw_file
+
+
+def load_prompt_advisor_job_result(job_id: str, state: dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, str]:
+    state = state or read_prompt_advisor_job_state(job_id)
+    result_file = Path(str(state.get("result_path") or result_path(job_id)))
+    raw_file = Path(str(state.get("raw_path") or raw_path(job_id)))
+
+    result: dict[str, Any] | None = None
+    raw = ""
+    if result_file.exists():
+        loaded = read_json_state(result_file)
+        result = loaded if isinstance(loaded, dict) and loaded.get("status") != "corrupt" else None
+    elif isinstance(state.get("result"), dict):
+        result = state.get("result")
+
+    if raw_file.exists():
+        raw = raw_file.read_text(encoding="utf-8")
+    else:
+        raw = str(state.get("raw") or "")
+    return result, raw
 
 
 def run_prompt_advisor_job(config: PromptAdvisorJobConfig) -> None:
@@ -218,6 +275,7 @@ def run_prompt_advisor_job(config: PromptAdvisorJobConfig) -> None:
             progress_callback=on_progress,
         )
         status = "completed" if result and result.get("can_suggest") is not False else "completed"
+        saved_result_path, saved_raw_path = _write_result_files(config.job_id, result or {}, raw or "")
         state = read_prompt_advisor_job_state(config.job_id)
         _write_state(
             config,
@@ -228,8 +286,9 @@ def run_prompt_advisor_job(config: PromptAdvisorJobConfig) -> None:
             message="提示词建议生成完成。",
             started_at=started_at,
             extra={
-                "result": result or {},
-                "raw": raw or "",
+                "result_path": str(saved_result_path),
+                "raw_path": str(saved_raw_path),
+                "summary": _result_summary(result or {}),
                 "finished_at": utc_now(),
             },
         )

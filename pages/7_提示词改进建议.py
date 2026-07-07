@@ -13,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.schema import EVALUATABLE_TASK_TYPES, TASK_TYPE_LABELS, TaskType
 from src.ui.config_store import build_eval_config, load_config
+from src.ui.components import render_state_file_notice
 from src.ui.data_service import list_result_files, load_results, load_results_bytes
 from src.ui.prompt_advisor import (
     collect_absolute_eval_evidence,
@@ -20,6 +21,7 @@ from src.ui.prompt_advisor import (
 from src.ui.prompt_advisor_job_runner import (
     PromptAdvisorJobConfig,
     list_prompt_advisor_job_ids,
+    load_prompt_advisor_job_result,
     mark_prompt_advisor_job_interrupted,
     prompt_advisor_job_is_stale,
     read_prompt_advisor_job_state,
@@ -316,6 +318,7 @@ def render_prompt_advisor_job_state(job_id: str) -> None:
     if not state:
         st.info("暂无这个提示词建议任务的状态。")
         return
+    render_state_file_notice(state)
 
     status = str(state.get("status") or "")
     done = int(state.get("done", 0) or 0)
@@ -343,14 +346,16 @@ def render_prompt_advisor_job_state(job_id: str) -> None:
         st.warning("任务状态为已中断。通常是程序关闭或后台线程退出导致；可以重新生成建议。")
     elif status == "stopped":
         st.warning("任务已终止。")
+    elif status == "corrupt":
+        st.error(state.get("message") or "任务状态文件损坏。")
 
     if status in {"completed", "failed", "interrupted", "stopped"}:
-        result = state.get("result") if isinstance(state.get("result"), dict) else None
+        result, raw = load_prompt_advisor_job_result(job_id, state)
         if result:
             config = state.get("config") if isinstance(state.get("config"), dict) else {}
             render_advisor_result(
                 result,
-                str(state.get("raw") or ""),
+                raw,
                 f"advisor_job_{job_id}",
                 task_type=str(config.get("task_type") or TaskType.USER_MD.value),
             )

@@ -4,7 +4,11 @@ from src.schema import Case, DialogueTurn, EvalConfig, EvalResult, TaskType
 from src.ui import eval_job_runner, judge_ab_job_runner, prompt_advisor_job_runner
 from src.ui.eval_job_runner import EvalJobConfig, run_eval_job
 from src.ui.judge_ab_job_runner import JudgeAbJobConfig, load_judge_ab_results, run_judge_ab_job
-from src.ui.prompt_advisor_job_runner import PromptAdvisorJobConfig, run_prompt_advisor_job
+from src.ui.prompt_advisor_job_runner import (
+    PromptAdvisorJobConfig,
+    load_prompt_advisor_job_result,
+    run_prompt_advisor_job,
+)
 
 
 def _case(case_id: str) -> Case:
@@ -39,8 +43,31 @@ def test_prompt_advisor_background_job_completes_in_mock(tmp_path, monkeypatch):
     assert state["status"] == "completed"
     assert state["done"] == state["total"]
     assert state["total"] >= 2
-    assert state["result"]["can_suggest"] is True
+    assert "result" not in state
+    assert "raw" not in state
+    assert Path(state["result_path"]).exists()
+    assert Path(state["raw_path"]).exists()
+    result, raw = load_prompt_advisor_job_result("advisor-1", state)
+    assert result["can_suggest"] is True
+    assert raw
+    assert state["summary"]["can_suggest"] is True
     assert "judge_api_bearer_token" not in state["config"]["eval_config"]
+
+
+def test_prompt_advisor_result_loader_keeps_legacy_embedded_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(prompt_advisor_job_runner, "PROMPT_ADVISOR_JOBS_DIR", tmp_path)
+    path = tmp_path / "advisor-old" / "state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        '{"status":"completed","result":{"can_suggest":true},"raw":"legacy raw"}',
+        encoding="utf-8",
+    )
+
+    state = prompt_advisor_job_runner.read_prompt_advisor_job_state("advisor-old")
+    result, raw = load_prompt_advisor_job_result("advisor-old", state)
+
+    assert result == {"can_suggest": True}
+    assert raw == "legacy raw"
 
 
 def test_eval_background_job_can_stop_before_writing_failure_results(tmp_path, monkeypatch):
