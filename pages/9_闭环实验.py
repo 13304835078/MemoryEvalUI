@@ -19,9 +19,11 @@ from src.loop import (
     loop_is_running,
     loop_state_is_stale,
     mark_loop_interrupted,
+    read_loop_controls,
     read_loop_state,
     request_stop,
     run_closed_loop,
+    update_loop_controls,
 )
 from src.loop.progress import compute_closed_loop_progress
 from src.schema import TASK_TYPE_LABELS, TaskType
@@ -92,7 +94,13 @@ def render_file_table(paths: dict[str, str]) -> None:
 def render_candidate_prompt(round_item: dict, *, expanded: bool = False, key_prefix: str = "round") -> None:
     prompt_name = str(round_item.get("candidate_prompt_saved") or "")
     if not prompt_name:
-        st.info("本轮暂未生成候选提取提示词。")
+        reason = round_item.get("no_candidate_reason") if isinstance(round_item.get("no_candidate_reason"), dict) else {}
+        title = reason.get("title") or "本轮暂未生成候选提取提示词"
+        message = reason.get("message") or "本轮没有保存新的候选提取提示词。"
+        st.info(f"{title}：{message}")
+        if reason:
+            with st.expander("查看未生成原因", expanded=False):
+                st.json(reason)
         return
 
     prompt_text = read_text_file(prompt_name)
@@ -246,6 +254,11 @@ def render_state(run_id: str) -> None:
     status = state.get("status", "")
     stage = state.get("stage", "")
     rounds = state.get("rounds", [])
+    config = state.get("config") or {}
+    eval_config = config.get("eval_config") if isinstance(config.get("eval_config"), dict) else {}
+    controls = read_loop_controls(run_id) or state.get("controls") or {}
+    if controls:
+        state["controls"] = controls
 
     progress = compute_closed_loop_progress(state)
 
@@ -268,6 +281,65 @@ def render_state(run_id: str) -> None:
         st.info(f"当前阶段：{stage}")
 
     if status == "running":
+        with st.expander("运行中可调整参数", expanded=False):
+            st.caption(
+                "这些参数只影响后续调度：已发出的 API 请求不会被强制取消；目标轮数缩减后，当前轮会先跑完，再决定是否进入下一轮。"
+            )
+            max_rounds = max(1, int(config.get("rounds") or 1))
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                target_rounds = st.number_input(
+                    "目标总轮数",
+                    min_value=1,
+                    max_value=max_rounds,
+                    value=min(max_rounds, max(1, int(controls.get("target_rounds") or max_rounds))),
+                    step=1,
+                    key=f"{run_id}_ctl_target_rounds",
+                )
+                priority = st.number_input(
+                    "任务优先级（1低-10高）",
+                    min_value=1,
+                    max_value=10,
+                    value=min(10, max(1, int(controls.get("priority") or 5))),
+                    step=1,
+                    key=f"{run_id}_ctl_priority",
+                )
+            with c2:
+                extraction_concurrency = st.number_input(
+                    "后续提取并发",
+                    min_value=1,
+                    max_value=100,
+                    value=min(100, max(1, int(controls.get("extraction_concurrency") or config.get("extraction_concurrency") or 1))),
+                    step=1,
+                    key=f"{run_id}_ctl_extraction_concurrency",
+                )
+                judge_concurrency = st.number_input(
+                    "后续评测并发",
+                    min_value=1,
+                    max_value=100,
+                    value=min(100, max(1, int(controls.get("judge_concurrency") or eval_config.get("judge_concurrency") or 1))),
+                    step=1,
+                    key=f"{run_id}_ctl_judge_concurrency",
+                )
+            with c3:
+                judge_interval = st.number_input(
+                    "后续评测请求间隔",
+                    min_value=0.0,
+                    max_value=300.0,
+                    value=float(controls.get("judge_request_interval") if controls.get("judge_request_interval") is not None else eval_config.get("judge_request_interval") or 0.0),
+                    step=0.5,
+                    key=f"{run_id}_ctl_judge_interval",
+                )
+            if st.button("应用运行中参数", type="primary", use_container_width=True, key=f"{run_id}_apply_controls"):
+                update_loop_controls(run_id, {
+                    "target_rounds": int(target_rounds),
+                    "priority": int(priority),
+                    "extraction_concurrency": int(extraction_concurrency),
+                    "judge_concurrency": int(judge_concurrency),
+                    "judge_request_interval": float(judge_interval),
+                })
+                st.success("已保存运行中参数，后台任务会在后续调度点读取。")
+                st.rerun()
         st.caption("终止是协作式停止：当前 API 调用会先返回，然后在下一步边界停止。")
         if st.button("请求终止闭环", type="secondary", use_container_width=True):
             request_stop(run_id)
@@ -276,14 +348,12 @@ def render_state(run_id: str) -> None:
     elif status == "interrupted":
         st.warning("闭环任务可能已中断：通常是程序关闭或后台线程退出导致。已保存的中间产物仍可在下方查看。")
 
-    config = state.get("config") or {}
-    eval_config = config.get("eval_config") if isinstance(config.get("eval_config"), dict) else {}
-
     if rounds:
         rows = []
         for item in rounds:
             case_stats = item.get("case_stats") or {}
             eval_stats = item.get("eval_stats") or {}
+            no_candidate_reason = item.get("no_candidate_reason") if isinstance(item.get("no_candidate_reason"), dict) else {}
             rows.append({
                 "轮次": item.get("round"),
                 "状态": item.get("status", ""),
@@ -300,6 +370,7 @@ def render_state(run_id: str) -> None:
                 "最近消息": item.get("latest_message", ""),
                 "候选提示词": Path(item.get("candidate_prompt_saved", "")).name if item.get("candidate_prompt_saved") else "",
                 "候选来源": item.get("candidate_prompt_source", ""),
+                "未生成原因": no_candidate_reason.get("title", ""),
             })
         st.subheader("轮次摘要")
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -309,6 +380,12 @@ def render_state(run_id: str) -> None:
             st.subheader("最新候选提取提示词")
             render_candidate_prompt(completed_with_prompt[-1], expanded=True, key_prefix="latest")
             render_advisor_details(completed_with_prompt[-1])
+        else:
+            latest_advisor_rounds = [item for item in rounds if item.get("advisor_path") or item.get("no_candidate_reason")]
+            if latest_advisor_rounds:
+                st.subheader("最新提示词建议结论")
+                render_candidate_prompt(latest_advisor_rounds[-1], expanded=True, key_prefix="latest_no_candidate")
+                render_advisor_details(latest_advisor_rounds[-1])
 
         with st.expander("查看每轮中间结果和文件路径", expanded=False):
             st.caption("这里用于排查问题和回溯产物。正常观察进度只看上面的轮次摘要即可。")
@@ -353,8 +430,9 @@ def render_state(run_id: str) -> None:
                             "评测统计": item.get("eval_stats") or {},
                         })
 
-                    if item.get("candidate_prompt_saved"):
+                    if item.get("candidate_prompt_saved") or item.get("advisor_path") or item.get("no_candidate_reason"):
                         render_candidate_prompt(item, expanded=False, key_prefix="round_detail")
+                    if item.get("advisor_path"):
                         render_advisor_details(item)
 
                     preview = item.get("eval_preview") or []

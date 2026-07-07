@@ -6,7 +6,9 @@ from .closed_loop import (
     request_stop,
     run_closed_loop,
     read_loop_state,
+    read_loop_controls,
     loop_is_running,
+    update_loop_controls,
 )
 
 __all__ = [
@@ -17,5 +19,7 @@ __all__ = [
     "request_stop",
     "run_closed_loop",
     "read_loop_state",
+    "read_loop_controls",
     "loop_is_running",
+    "update_loop_controls",
 ]

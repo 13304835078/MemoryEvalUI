@@ -29,6 +29,15 @@ from src.ui.data_service import dataframe_to_excel_bytes
 from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
 from src.ui.prompt_editor import infer_prompt_version
 from src.ui.state_io import atomic_write_json
+from src.ui.task_controls import (
+    DEFAULT_PRIORITY,
+    control_float,
+    control_int,
+    control_priority,
+    init_task_controls,
+    merge_task_controls,
+    read_task_controls,
+)
 from src.persistence import atomic_write_bytes
 
 
@@ -76,8 +85,20 @@ def table_path(job_id: str) -> Path:
     return job_dir(job_id) / "judge_ab_result.xlsx"
 
 
+def controls_path(job_id: str) -> Path:
+    return job_dir(job_id) / "controls.json"
+
+
 def read_judge_ab_job_state(job_id: str) -> dict[str, Any]:
     return read_json_state(state_path(job_id))
+
+
+def read_judge_ab_job_controls(job_id: str) -> dict[str, Any]:
+    return read_task_controls(controls_path(job_id))
+
+
+def update_judge_ab_job_controls(job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    return merge_task_controls(controls_path(job_id), updates)
 
 
 def write_judge_ab_job_state(job_id: str, state: dict[str, Any]) -> None:
@@ -229,6 +250,7 @@ def _write_state(
         "started_at": started_at,
         "updated_at": utc_now(),
         "config": _safe_config(config),
+        "controls": read_judge_ab_job_controls(config.job_id),
         "results_a_path": str(results_a_path(config.job_id)),
         "results_b_path": str(results_b_path(config.job_id)),
         "table_path": str(table_path(config.job_id)),
@@ -260,20 +282,48 @@ def _evaluate_prompt(
         extraction_prompt_hash=config.extraction_prompt_hash,
     )
 
-    concurrency = min(100, max(1, int(config.eval_config.judge_concurrency or 1)))
-    concurrency = min(concurrency, max(1, len(cases)))
+    configured_concurrency = min(100, max(1, int(config.eval_config.judge_concurrency or 1)))
+    configured_concurrency = min(configured_concurrency, max(1, len(cases)))
     configured_interval = float(config.eval_config.judge_request_interval or 0.0) if not config.eval_config.mock else 0.0
-    effective_interval = configured_interval
-    if concurrency > 1 and not config.eval_config.mock:
-        effective_interval = max(effective_interval, float(config.eval_config.judge_qps_backoff or 0.0))
+    backoff_interval = float(config.eval_config.judge_qps_backoff or 0.0)
     rate_scope = api_rate_scope(config.eval_config.judge_api_base_url, config.eval_config.judge_api_bearer_token)
+
+    def current_controls() -> dict[str, Any]:
+        return read_judge_ab_job_controls(config.job_id)
+
+    def current_concurrency() -> int:
+        if not cases:
+            return 1
+        return min(len(cases), control_int(
+            current_controls(),
+            "judge_concurrency",
+            configured_concurrency,
+            min_value=1,
+            max_value=100,
+        ))
+
+    def current_interval() -> float:
+        value = control_float(
+            current_controls(),
+            "judge_request_interval",
+            configured_interval,
+            min_value=0.0,
+            max_value=300.0,
+        ) if not config.eval_config.mock else 0.0
+        if current_concurrency() > 1 and not config.eval_config.mock:
+            value = max(value, backoff_interval)
+        return value
+
+    def current_priority() -> int:
+        return control_priority(current_controls())
 
     def wait_for_rate_slot() -> None:
         wait_for_global_rate_slot(
             rate_scope,
-            effective_interval,
+            current_interval(),
             disabled=bool(config.eval_config.mock),
             should_stop=lambda: judge_ab_stop_requested(config.job_id),
+            priority=current_priority(),
         )
 
     if hasattr(runner.judge_client, "rate_limit_wait_callback"):
@@ -304,8 +354,8 @@ def _evaluate_prompt(
         return True
 
     if cases:
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            for _ in range(concurrency):
+        with ThreadPoolExecutor(max_workers=min(100, max(1, len(cases)))) as executor:
+            for _ in range(current_concurrency()):
                 if not submit_next(executor):
                     break
             while futures:
@@ -331,7 +381,9 @@ def _evaluate_prompt(
                         extra={
                             "current_label": label,
                             "configured_request_interval": configured_interval,
-                            "effective_request_interval": effective_interval,
+                            "effective_request_interval": current_interval(),
+                            "effective_concurrency": current_concurrency(),
+                            "priority": current_priority(),
                         },
                     )
                 if stopped or judge_ab_stop_requested(config.job_id):
@@ -343,14 +395,16 @@ def _evaluate_prompt(
                         break
                     continue
 
-                while len(futures) < concurrency and submit_next(executor):
+                while len(futures) < current_concurrency() and submit_next(executor):
                     pass
 
     return [results_by_index[i] for i in sorted(results_by_index)], {
         "prompt_file": prompt_file,
         "prompt_version": prompt_version,
         "configured_request_interval": configured_interval,
-        "effective_request_interval": effective_interval,
+        "effective_request_interval": current_interval(),
+        "effective_concurrency": current_concurrency(),
+        "priority": current_priority(),
         "stopped": stopped or judge_ab_stop_requested(config.job_id),
     }
 
@@ -360,6 +414,11 @@ def run_judge_ab_job(config: JudgeAbJobConfig, cases: list[Case]) -> None:
     if stop_path(config.job_id).exists():
         stop_path(config.job_id).unlink()
     job_dir(config.job_id).mkdir(parents=True, exist_ok=True)
+    init_task_controls(controls_path(config.job_id), {
+        "priority": DEFAULT_PRIORITY,
+        "judge_concurrency": min(100, max(1, int(config.eval_config.judge_concurrency or 1))),
+        "judge_request_interval": float(config.eval_config.judge_request_interval or 0.0),
+    })
     total = len(cases) * 2
     results_to_jsonl([], str(results_a_path(config.job_id)))
     results_to_jsonl([], str(results_b_path(config.job_id)))

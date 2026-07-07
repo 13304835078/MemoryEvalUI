@@ -36,6 +36,7 @@ class MemoryExtractionConfig:
     top_p: float | None = None
     top_k: int | None = None
     concurrency: int = 1
+    priority: int = 5
     mock: bool = False
 
     @classmethod

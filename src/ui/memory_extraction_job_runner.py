@@ -37,6 +37,14 @@ from src.ui.background_tasks import (
     utc_now,
 )
 from src.ui.state_io import atomic_write_json, state_file_lock
+from src.ui.task_controls import (
+    DEFAULT_PRIORITY,
+    control_int,
+    control_priority,
+    init_task_controls,
+    merge_task_controls,
+    read_task_controls,
+)
 
 
 MEMORY_EXTRACTION_JOBS_DIR = EXTRACTION_OUTPUT_DIR / "jobs"
@@ -73,8 +81,20 @@ def stop_path(job_id: str) -> Path:
     return task_stop_path(MEMORY_EXTRACTION_JOBS_DIR, job_id, sanitize=sanitize_filename)
 
 
+def controls_path(job_id: str) -> Path:
+    return job_dir(job_id) / "controls.json"
+
+
 def read_memory_extraction_job_state(job_id: str) -> dict[str, Any]:
     return read_json_state(state_path(job_id))
+
+
+def read_memory_extraction_job_controls(job_id: str) -> dict[str, Any]:
+    return read_task_controls(controls_path(job_id))
+
+
+def update_memory_extraction_job_controls(job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    return merge_task_controls(controls_path(job_id), updates)
 
 
 def write_memory_extraction_job_state(job_id: str, state: dict[str, Any]) -> None:
@@ -175,6 +195,7 @@ def _write_state(
         "started_at": started_at,
         "updated_at": utc_now(),
         "config": _safe_config(config),
+        "controls": read_memory_extraction_job_controls(config.job_id),
     }
     if extra:
         state.update(extra)
@@ -207,6 +228,25 @@ def run_memory_extraction_job(config: MemoryExtractionJobConfig) -> None:
     started_at = utc_now()
     if stop_path(config.job_id).exists():
         stop_path(config.job_id).unlink()
+    init_task_controls(controls_path(config.job_id), {
+        "priority": DEFAULT_PRIORITY,
+        "extraction_concurrency": min(100, max(1, int(config.extraction_config.concurrency or 1))),
+    })
+
+    def current_controls() -> dict[str, Any]:
+        return read_memory_extraction_job_controls(config.job_id)
+
+    def current_priority() -> int:
+        return control_priority(current_controls())
+
+    def current_concurrency() -> int:
+        return control_int(
+            current_controls(),
+            "extraction_concurrency",
+            min(100, max(1, int(config.extraction_config.concurrency or 1))),
+            min_value=1,
+            max_value=100,
+        )
 
     _write_state(
         config,
@@ -256,6 +296,8 @@ def run_memory_extraction_job(config: MemoryExtractionJobConfig) -> None:
             progress_callback=on_progress,
             should_stop=lambda: memory_extraction_stop_requested(config.job_id),
             emit_parallel_chunk_progress=True,
+            priority_provider=current_priority,
+            concurrency_provider=current_concurrency,
         )
 
         if stats.get("stopped"):

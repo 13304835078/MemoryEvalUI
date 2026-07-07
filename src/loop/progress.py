@@ -27,7 +27,7 @@ def parse_progress_fraction(value: Any) -> float | None:
 def round_progress_fraction(round_record: dict[str, Any]) -> float:
     if not round_record:
         return 0.0
-    if round_record.get("status") == "completed":
+    if round_record.get("status") in {"completed", "completed_no_change"}:
         return 1.0
     if round_record.get("candidate_prompt_saved"):
         return 0.98
@@ -57,6 +57,8 @@ def round_progress_fraction(round_record: dict[str, Any]) -> float:
 def describe_round_step(round_record: dict[str, Any]) -> str:
     if not round_record:
         return "等待开始"
+    if round_record.get("status") == "completed_no_change":
+        return "无需修改提示词"
     if round_record.get("status") == "completed":
         return "本轮完成"
     if round_record.get("candidate_prompt_saved"):
@@ -84,11 +86,13 @@ def describe_round_step(round_record: dict[str, Any]) -> str:
 
 def compute_closed_loop_progress(state: dict[str, Any]) -> dict[str, Any]:
     config = state.get("config") if isinstance(state.get("config"), dict) else {}
-    configured_rounds = int(config.get("rounds") or 0)
+    controls = state.get("controls") if isinstance(state.get("controls"), dict) else {}
+    configured_rounds = int(controls.get("target_rounds") or config.get("rounds") or 0)
     rounds = state.get("rounds") if isinstance(state.get("rounds"), list) else []
     total_rounds = max(configured_rounds, len(rounds), 1)
 
-    if state.get("status") == "completed":
+    if state.get("status") in {"completed", "completed_no_change"}:
+        current_step = "无需修改提示词，闭环结束" if state.get("status") == "completed_no_change" else "全部完成"
         return {
             "overall_fraction": 1.0,
             "current_round_fraction": 1.0,
@@ -96,7 +100,7 @@ def compute_closed_loop_progress(state: dict[str, Any]) -> dict[str, Any]:
             "total_rounds": total_rounds,
             "label": f"整体进度：100.0%（{total_rounds}/{total_rounds} 轮）",
             "current_label": "当前轮次：已完成",
-            "current_step": "全部完成",
+            "current_step": current_step,
             "latest_message": "",
         }
 

@@ -15,6 +15,15 @@ from src.ui.data_service import (
     load_results,
 )
 from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
+from src.ui.task_controls import (
+    DEFAULT_PRIORITY,
+    control_float,
+    control_int,
+    control_priority,
+    init_task_controls,
+    merge_task_controls,
+    read_task_controls,
+)
 from src.ui.background_tasks import (
     list_task_job_ids,
     parse_time as _parse_time,
@@ -69,6 +78,10 @@ def stop_path(job_id: str) -> Path:
     return task_stop_path(EVAL_JOBS_DIR, job_id)
 
 
+def controls_path(job_id: str) -> Path:
+    return job_dir(job_id) / "controls.json"
+
+
 def request_eval_stop(job_id: str) -> None:
     request_stop_file(stop_path(job_id))
 
@@ -79,6 +92,14 @@ def eval_job_stop_requested(job_id: str) -> bool:
 
 def read_eval_job_state(job_id: str) -> dict[str, Any]:
     return read_json_state(state_path(job_id))
+
+
+def read_eval_job_controls(job_id: str) -> dict[str, Any]:
+    return read_task_controls(controls_path(job_id))
+
+
+def update_eval_job_controls(job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    return merge_task_controls(controls_path(job_id), updates)
 
 
 def write_eval_job_state(job_id: str, state: dict[str, Any]) -> None:
@@ -170,6 +191,7 @@ def _write_progress(
         "message": message,
         "output_path": config.output_path,
         "config": _safe_config(config),
+        "controls": read_eval_job_controls(config.job_id),
     }
     if extra:
         state.update(extra)
@@ -180,6 +202,11 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
     started_at = utc_now()
     if stop_path(config.job_id).exists():
         stop_path(config.job_id).unlink()
+    init_task_controls(controls_path(config.job_id), {
+        "priority": DEFAULT_PRIORITY,
+        "judge_concurrency": min(100, max(1, int(config.eval_config.judge_concurrency or 1))),
+        "judge_request_interval": float(config.eval_config.judge_request_interval or 0.0),
+    })
     existing_results = list(existing_results or [])
     total = len(cases)
     skipped_count = 0
@@ -247,16 +274,42 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                 continue
             tasks.append((index, case))
 
-        concurrency = min(100, max(1, int(config.eval_config.judge_concurrency or 1)))
+        configured_concurrency = min(100, max(1, int(config.eval_config.judge_concurrency or 1)))
         configured_interval = float(config.eval_config.judge_request_interval or 0.0) if not config.eval_config.mock else 0.0
-        interval = configured_interval
         backoff_interval = float(config.eval_config.judge_qps_backoff or 0.0)
-        if concurrency > 1 and not config.eval_config.mock:
-            interval = max(interval, backoff_interval)
         rate_scope = api_rate_scope(
             config.eval_config.judge_api_base_url,
             config.eval_config.judge_api_bearer_token,
         )
+
+        def current_controls() -> dict[str, Any]:
+            return read_eval_job_controls(config.job_id)
+
+        def current_concurrency() -> int:
+            if not tasks:
+                return 1
+            return min(len(tasks), control_int(
+                current_controls(),
+                "judge_concurrency",
+                configured_concurrency,
+                min_value=1,
+                max_value=100,
+            ))
+
+        def current_interval() -> float:
+            value = control_float(
+                current_controls(),
+                "judge_request_interval",
+                configured_interval,
+                min_value=0.0,
+                max_value=300.0,
+            ) if not config.eval_config.mock else 0.0
+            if current_concurrency() > 1 and not config.eval_config.mock:
+                value = max(value, backoff_interval)
+            return value
+
+        def current_priority() -> int:
+            return control_priority(current_controls())
 
         def should_stop() -> bool:
             return eval_job_stop_requested(config.job_id)
@@ -264,9 +317,10 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
         def wait_for_rate_slot() -> None:
             wait_for_global_rate_slot(
                 rate_scope,
-                interval,
+                current_interval(),
                 disabled=bool(config.eval_config.mock),
                 should_stop=should_stop,
+                priority=current_priority(),
             )
             if should_stop():
                 raise EvalJobStopped()
@@ -290,11 +344,13 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                 skipped=skipped_count,
                 evaluated=evaluated_count,
                 fatal_count=sum(1 for item in results_by_key.values() if item.fatal_error),
-                message=f"开始评测：待评测 {len(tasks)} 条，跳过 {skipped_count} 条，并发数 {concurrency}",
+                message=f"开始评测：待评测 {len(tasks)} 条，跳过 {skipped_count} 条，并发数 {current_concurrency()}",
                 started_at=started_at,
                 extra={
-                    "effective_request_interval": interval,
+                    "effective_request_interval": current_interval(),
                     "configured_request_interval": configured_interval,
+                    "effective_concurrency": current_concurrency(),
+                    "priority": current_priority(),
                 },
             )
 
@@ -302,7 +358,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
             results_to_jsonl(list(results_by_key.values()), str(output_path))
 
         stopped = False
-        with ThreadPoolExecutor(max_workers=min(concurrency, max(1, len(tasks)))) as executor:
+        with ThreadPoolExecutor(max_workers=min(100, max(1, len(tasks)))) as executor:
             futures: dict[Any, tuple[int, Case]] = {}
             next_task_index = 0
 
@@ -314,7 +370,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                 futures[executor.submit(evaluate_task, case_index, case)] = (case_index, case)
                 next_task_index += 1
 
-            for _ in range(min(concurrency, len(tasks))):
+            for _ in range(min(current_concurrency(), len(tasks))):
                 submit_next()
 
             while futures:
@@ -353,6 +409,11 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                         fatal_count=fatal_count,
                         message=f"已保存：整体 {done}/{total}，新增 {evaluated_count}/{len(tasks)}，当前样本：{case.case_id}",
                         started_at=started_at,
+                        extra={
+                            "effective_request_interval": current_interval(),
+                            "effective_concurrency": current_concurrency(),
+                            "priority": current_priority(),
+                        },
                     )
 
                 if stopped or should_stop():
@@ -364,7 +425,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                         break
                     continue
 
-                while len(futures) < concurrency and next_task_index < len(tasks) and not should_stop():
+                while len(futures) < current_concurrency() and next_task_index < len(tasks) and not should_stop():
                     submit_next()
 
         if stopped or eval_job_stop_requested(config.job_id):

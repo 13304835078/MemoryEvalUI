@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from io import BytesIO
 from pathlib import Path
 from threading import Lock
@@ -423,6 +423,8 @@ class MemoryExtractionRunner:
         progress_callback: Callable[[int, int, str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         emit_parallel_chunk_progress: bool = False,
+        priority_provider: Callable[[], int] | None = None,
+        concurrency_provider: Callable[[], int] | None = None,
     ) -> dict[str, Any]:
         if chunk_size <= 0:
             raise ValueError("chunk_size 必须大于 0")
@@ -456,12 +458,23 @@ class MemoryExtractionRunner:
         request_interval = float(self.config.request_interval or 0)
         rate_scope = api_rate_scope(self.config.api_base, self.config.api_token)
 
+        def current_priority() -> int:
+            if priority_provider is not None:
+                return max(1, min(10, int(priority_provider() or 5)))
+            return max(1, min(10, int(getattr(self.config, "priority", 5) or 5)))
+
+        def current_concurrency(limit: int) -> int:
+            if concurrency_provider is not None:
+                return min(limit, 100, max(1, int(concurrency_provider() or concurrency)))
+            return min(limit, concurrency)
+
         def wait_for_rate_slot() -> None:
             wait_for_global_rate_slot(
                 rate_scope,
                 request_interval,
                 disabled=bool(self.config.mock),
                 should_stop=should_stop,
+                priority=current_priority(),
             )
 
         global_sessions = split_sessions(df)
@@ -504,7 +517,7 @@ class MemoryExtractionRunner:
 
             return on_parallel_progress
 
-        if concurrency <= 1:
+        if concurrency <= 1 and concurrency_provider is None:
             result = self._process_sessions(
                 global_sessions,
                 chunk_size,
@@ -539,30 +552,46 @@ class MemoryExtractionRunner:
                 )
                 merge_result(result)
             else:
-                with ThreadPoolExecutor(max_workers=min(concurrency, len(groups))) as executor:
-                    future_map = {
-                        executor.submit(
-                            self._process_sessions,
-                            split_sessions(group_df),
-                            chunk_size,
-                            total_chunks,
-                            wait_for_rate_slot,
-                            make_parallel_progress_callback(reviewer),
-                            should_stop,
-                            append_chunk_rows,
-                        ): reviewer
-                        for reviewer, group_df in groups
-                    }
-                    for future in as_completed(future_map):
-                        reviewer = future_map[future]
-                        result = future.result()
-                        merge_result(result)
-                        if progress_callback and not emit_parallel_chunk_progress:
-                            progress_callback(
-                                completed_chunks,
-                                total_chunks,
-                                f"已完成评测人 {reviewer}：{completed_chunks}/{total_chunks}",
-                            )
+                group_iter = iter(groups)
+                future_map = {}
+
+                def submit_next(executor: ThreadPoolExecutor) -> bool:
+                    if should_stop is not None and should_stop():
+                        return False
+                    try:
+                        reviewer, group_df = next(group_iter)
+                    except StopIteration:
+                        return False
+                    future_map[executor.submit(
+                        self._process_sessions,
+                        split_sessions(group_df),
+                        chunk_size,
+                        total_chunks,
+                        wait_for_rate_slot,
+                        make_parallel_progress_callback(reviewer),
+                        should_stop,
+                        append_chunk_rows,
+                    )] = reviewer
+                    return True
+
+                with ThreadPoolExecutor(max_workers=min(100, len(groups))) as executor:
+                    for _ in range(current_concurrency(len(groups))):
+                        if not submit_next(executor):
+                            break
+                    while future_map:
+                        done, _pending = wait(set(future_map), return_when=FIRST_COMPLETED)
+                        for future in done:
+                            reviewer = future_map.pop(future)
+                            result = future.result()
+                            merge_result(result)
+                            if progress_callback and not emit_parallel_chunk_progress:
+                                progress_callback(
+                                    completed_chunks,
+                                    total_chunks,
+                                    f"已完成评测人 {reviewer}：{completed_chunks}/{total_chunks}",
+                                )
+                        while len(future_map) < current_concurrency(len(groups)) and submit_next(executor):
+                            pass
 
         final_rows = sorted(final_rows, key=lambda row: int(row.get("__source_order", 0)))
         for row in final_rows:

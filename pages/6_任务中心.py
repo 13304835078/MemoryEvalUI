@@ -14,36 +14,46 @@ from src.loop.closed_loop import (
     CLOSED_LOOP_DIR,
     loop_state_is_stale,
     mark_loop_interrupted,
+    read_loop_controls,
     read_loop_state,
     request_stop as request_loop_stop,
+    update_loop_controls,
 )
 from src.ui.eval_job_runner import (
     eval_job_is_stale,
     list_eval_job_ids,
     mark_eval_job_interrupted,
+    read_eval_job_controls,
     read_eval_job_state,
     request_eval_stop,
+    update_eval_job_controls,
 )
 from src.ui.judge_ab_job_runner import (
     judge_ab_job_is_stale,
     list_judge_ab_job_ids,
     mark_judge_ab_job_interrupted,
+    read_judge_ab_job_controls,
     read_judge_ab_job_state,
     request_judge_ab_stop,
+    update_judge_ab_job_controls,
 )
 from src.ui.memory_extraction_job_runner import (
     list_memory_extraction_job_ids,
     mark_memory_extraction_job_interrupted,
     memory_extraction_job_is_stale,
+    read_memory_extraction_job_controls,
     read_memory_extraction_job_state,
     request_memory_extraction_stop,
+    update_memory_extraction_job_controls,
 )
 from src.ui.prompt_advisor_job_runner import (
     list_prompt_advisor_job_ids,
     mark_prompt_advisor_job_interrupted,
     prompt_advisor_job_is_stale,
+    read_prompt_advisor_job_controls,
     read_prompt_advisor_job_state,
     request_prompt_advisor_stop,
+    update_prompt_advisor_job_controls,
 )
 from src.ui.components import render_state_file_notice
 
@@ -96,6 +106,150 @@ def _request_stop(task_type: str, job_id: str) -> bool:
         request_judge_ab_stop(job_id)
         return True
     return False
+
+
+def _read_controls(task_type: str, job_id: str) -> dict[str, Any]:
+    if task_type == "执行评测":
+        return read_eval_job_controls(job_id)
+    if task_type == "记忆提取":
+        return read_memory_extraction_job_controls(job_id)
+    if task_type == "闭环实验":
+        return read_loop_controls(job_id)
+    if task_type == "提示词建议":
+        return read_prompt_advisor_job_controls(job_id)
+    if task_type == "A/B 对比":
+        return read_judge_ab_job_controls(job_id)
+    return {}
+
+
+def _update_controls(task_type: str, job_id: str, updates: dict[str, Any]) -> bool:
+    if task_type == "执行评测":
+        update_eval_job_controls(job_id, updates)
+        return True
+    if task_type == "记忆提取":
+        update_memory_extraction_job_controls(job_id, updates)
+        return True
+    if task_type == "闭环实验":
+        update_loop_controls(job_id, updates)
+        return True
+    if task_type == "提示词建议":
+        update_prompt_advisor_job_controls(job_id, updates)
+        return True
+    if task_type == "A/B 对比":
+        update_judge_ab_job_controls(job_id, updates)
+        return True
+    return False
+
+
+def _as_int(value: Any, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        current = int(value)
+    except (TypeError, ValueError):
+        current = int(default)
+    return min(max_value, max(min_value, current))
+
+
+def _as_float(value: Any, default: float, *, min_value: float, max_value: float) -> float:
+    try:
+        current = float(value)
+    except (TypeError, ValueError):
+        current = float(default)
+    return min(max_value, max(min_value, current))
+
+
+def _render_runtime_controls(task_type: str, job_id: str, state: dict[str, Any]) -> None:
+    if state.get("status") != "running":
+        return
+
+    controls = _read_controls(task_type, job_id)
+    config = state.get("config") if isinstance(state.get("config"), dict) else {}
+    eval_config = config.get("eval_config") if isinstance(config.get("eval_config"), dict) else {}
+    extraction_config = config.get("extraction_config") if isinstance(config.get("extraction_config"), dict) else {}
+
+    with st.expander("运行中可调整参数", expanded=False):
+        st.caption(
+            "只允许调整后续调度参数：已发出的 API 请求不会被强制取消；模型、prompt、输入文件等会影响结果解释的参数不允许运行中修改。"
+        )
+        with st.form(f"runtime_controls_{task_type}_{job_id}"):
+            updates: dict[str, Any] = {}
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                priority = st.number_input(
+                    "任务优先级（1低-10高）",
+                    min_value=1,
+                    max_value=10,
+                    value=_as_int(controls.get("priority"), 5, min_value=1, max_value=10),
+                    step=1,
+                )
+                updates["priority"] = int(priority)
+
+            if task_type == "闭环实验":
+                max_rounds = max(1, int(config.get("rounds") or 1))
+                with c1:
+                    updates["target_rounds"] = int(st.number_input(
+                        "目标总轮数",
+                        min_value=1,
+                        max_value=max_rounds,
+                        value=_as_int(controls.get("target_rounds"), max_rounds, min_value=1, max_value=max_rounds),
+                        step=1,
+                    ))
+                with c2:
+                    updates["extraction_concurrency"] = int(st.number_input(
+                        "后续提取并发",
+                        min_value=1,
+                        max_value=100,
+                        value=_as_int(controls.get("extraction_concurrency"), config.get("extraction_concurrency") or 1, min_value=1, max_value=100),
+                        step=1,
+                    ))
+                    updates["judge_concurrency"] = int(st.number_input(
+                        "后续评测并发",
+                        min_value=1,
+                        max_value=100,
+                        value=_as_int(controls.get("judge_concurrency"), eval_config.get("judge_concurrency") or 1, min_value=1, max_value=100),
+                        step=1,
+                    ))
+                with c3:
+                    updates["judge_request_interval"] = float(st.number_input(
+                        "后续评测请求间隔",
+                        min_value=0.0,
+                        max_value=300.0,
+                        value=_as_float(controls.get("judge_request_interval"), eval_config.get("judge_request_interval") or 0.0, min_value=0.0, max_value=300.0),
+                        step=0.5,
+                    ))
+            elif task_type in {"执行评测", "A/B 对比"}:
+                with c2:
+                    updates["judge_concurrency"] = int(st.number_input(
+                        "后续评测并发",
+                        min_value=1,
+                        max_value=100,
+                        value=_as_int(controls.get("judge_concurrency"), eval_config.get("judge_concurrency") or 1, min_value=1, max_value=100),
+                        step=1,
+                    ))
+                with c3:
+                    updates["judge_request_interval"] = float(st.number_input(
+                        "后续评测请求间隔",
+                        min_value=0.0,
+                        max_value=300.0,
+                        value=_as_float(controls.get("judge_request_interval"), eval_config.get("judge_request_interval") or 0.0, min_value=0.0, max_value=300.0),
+                        step=0.5,
+                    ))
+            elif task_type == "记忆提取":
+                with c2:
+                    updates["extraction_concurrency"] = int(st.number_input(
+                        "后续提取并发",
+                        min_value=1,
+                        max_value=100,
+                        value=_as_int(controls.get("extraction_concurrency"), extraction_config.get("concurrency") or 1, min_value=1, max_value=100),
+                        step=1,
+                    ))
+            else:
+                c2.info("该任务当前只支持调整优先级。")
+
+            submitted = st.form_submit_button("保存运行中参数", type="primary", use_container_width=True)
+            if submitted:
+                if _update_controls(task_type, job_id, updates):
+                    st.success("已保存运行中参数，后台任务会在后续调度点读取。")
+                    st.rerun()
 
 
 def _job_rows() -> list[dict[str, Any]]:
@@ -183,6 +337,7 @@ if rows:
     selected_state = _read_state(selected_type, selected_id)
     render_state_file_notice(selected_state)
     st.json(selected_state)
+    _render_runtime_controls(selected_type, selected_id, selected_state)
     if selected_state.get("status") == "running":
         if st.button("请求终止该任务", type="secondary", use_container_width=True):
             if _request_stop(selected_type, selected_id):

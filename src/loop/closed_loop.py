@@ -23,10 +23,19 @@ from src.ui.data_service import (
     prepare_long_memory_cases_from_run_output,
     save_cases,
 )
-from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
+from src.ui.global_rate_limiter import api_rate_scope, set_current_task_priority, wait_for_global_rate_slot
 from src.ui.prompt_advisor import call_prompt_advisor, collect_absolute_eval_evidence
 from src.ui.prompt_editor import prompt_text_hash, save_prompt_version
 from src.ui.state_io import atomic_write_json, state_file_lock
+from src.ui.task_controls import (
+    DEFAULT_PRIORITY,
+    control_float,
+    control_int,
+    control_priority,
+    init_task_controls,
+    merge_task_controls,
+    read_task_controls,
+)
 
 
 PROJECT_ROOT = APP_HOME
@@ -95,6 +104,10 @@ def stop_path(run_id: str) -> Path:
     return run_dir(run_id) / "STOP"
 
 
+def controls_path(run_id: str) -> Path:
+    return run_dir(run_id) / "controls.json"
+
+
 def read_loop_state(run_id: str) -> dict[str, Any]:
     path = state_path(run_id)
     if not path.exists():
@@ -109,6 +122,14 @@ def write_loop_state(run_id: str, state: dict[str, Any]) -> None:
     path = state_path(run_id)
     state["heartbeat_at"] = utc_now()
     atomic_write_json(path, state)
+
+
+def read_loop_controls(run_id: str) -> dict[str, Any]:
+    return read_task_controls(controls_path(run_id))
+
+
+def update_loop_controls(run_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    return merge_task_controls(controls_path(run_id), updates)
 
 
 def request_stop(run_id: str) -> None:
@@ -183,6 +204,9 @@ def update_state(run_id: str, updater: Callable[[dict[str, Any]], None]) -> dict
     with state_file_lock(state_path(run_id)):
         state = read_loop_state(run_id)
         updater(state)
+        controls = read_loop_controls(run_id)
+        if controls:
+            state["controls"] = controls
         state["updated_at"] = utc_now()
         write_loop_state(run_id, state)
         return state
@@ -201,6 +225,7 @@ def _make_initial_state(config: ClosedLoopConfig) -> dict[str, Any]:
             safe_config["eval_config"].get("judge_max_retries") or 1
         )
     safe_config["extraction_max_attempts"] = int(safe_config.get("extraction_max_retries") or 0) + 1
+    controls = read_loop_controls(config.run_id)
     return {
         "run_id": config.run_id,
         "status": "running",
@@ -208,6 +233,7 @@ def _make_initial_state(config: ClosedLoopConfig) -> dict[str, Any]:
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "config": safe_config,
+        "controls": controls,
         "rounds": [],
         "events": [],
     }
@@ -225,6 +251,61 @@ def _advisor_eval_config(config: ClosedLoopConfig) -> EvalConfig:
 def _check_stop(run_id: str, message: str = "收到终止请求") -> None:
     if stop_requested(run_id):
         raise StopIteration(message)
+
+
+def _current_loop_controls(config: ClosedLoopConfig) -> dict[str, Any]:
+    return read_loop_controls(config.run_id)
+
+
+def _current_priority(config: ClosedLoopConfig) -> int:
+    return control_priority(_current_loop_controls(config))
+
+
+def _current_target_rounds(config: ClosedLoopConfig) -> int:
+    controls = _current_loop_controls(config)
+    return control_int(
+        controls,
+        "target_rounds",
+        int(config.rounds or 1),
+        min_value=1,
+        max_value=max(1, int(config.rounds or 1)),
+    )
+
+
+def _current_extraction_concurrency(config: ClosedLoopConfig) -> int:
+    return control_int(
+        _current_loop_controls(config),
+        "extraction_concurrency",
+        min(100, max(1, int(config.extraction_concurrency or 1))),
+        min_value=1,
+        max_value=100,
+    )
+
+
+def _current_judge_concurrency(config: ClosedLoopConfig, *, limit: int) -> int:
+    return min(limit, control_int(
+        _current_loop_controls(config),
+        "judge_concurrency",
+        min(100, max(1, int(getattr(config.eval_config, "judge_concurrency", 1) or 1))),
+        min_value=1,
+        max_value=100,
+    ))
+
+
+def _current_judge_interval(config: ClosedLoopConfig, *, concurrency: int) -> float:
+    configured = float(getattr(config.eval_config, "judge_request_interval", 0.0) or 0.0)
+    if config.eval_config.mock:
+        return 0.0
+    value = control_float(
+        _current_loop_controls(config),
+        "judge_request_interval",
+        configured,
+        min_value=0.0,
+        max_value=300.0,
+    )
+    if concurrency > 1:
+        value = max(value, float(getattr(config.eval_config, "judge_qps_backoff", 0.0) or 0.0))
+    return value
 
 
 def _round_record(state: dict[str, Any], round_index: int) -> dict[str, Any]:
@@ -246,6 +327,102 @@ def _save_candidate_prompt(
     )
     saved = save_prompt_version(task_type.value, candidate_prompt, version_name, prompt_kind="extraction")
     return saved, candidate_prompt
+
+
+def _classify_no_candidate_reason(
+    *,
+    results: list[EvalResult],
+    evidence: list[dict[str, Any]],
+    advisor_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    advisor_result = advisor_result or {}
+    total = len(results)
+    fatal_count = sum(1 for result in results if result.fatal_error)
+    valid_count = max(0, total - fatal_count)
+    fatal_rate = (fatal_count / total) if total else 0.0
+    issue_evidence_count = sum(
+        1
+        for item in evidence
+        if not item.get("fatal_error") and item.get("evidence_mode") == "issue_or_low_score"
+    )
+    weak_context_count = sum(1 for item in evidence if item.get("evidence_mode") == "weak_context_from_result")
+    risks = [str(item) for item in (advisor_result.get("risks") or []) if str(item).strip()]
+    source = str(advisor_result.get("candidate_prompt_source") or "")
+    error = str(advisor_result.get("error") or "")
+    can_suggest = advisor_result.get("can_suggest")
+
+    base = {
+        "total_results": total,
+        "valid_results": valid_count,
+        "fatal_results": fatal_count,
+        "fatal_rate": round(fatal_rate, 4),
+        "evidence_count": len(evidence),
+        "issue_evidence_count": issue_evidence_count,
+        "weak_context_count": weak_context_count,
+        "candidate_prompt_source": source,
+        "can_suggest": can_suggest,
+        "risks": risks[:8],
+        "error": error,
+    }
+
+    if total == 0:
+        return {
+            **base,
+            "category": "no_eval_results",
+            "status": "paused_no_evidence",
+            "stage": "无评测结果",
+            "title": "没有可用于提示词改进的评测结果",
+            "message": "本轮没有生成评测结果，不能判断是否需要修改提取提示词。",
+        }
+
+    if valid_count == 0 or (fatal_rate >= 0.5 and issue_evidence_count == 0):
+        return {
+            **base,
+            "category": "eval_chain_failed",
+            "status": "paused_eval_failed",
+            "stage": "评测链路失败",
+            "title": "评测链路失败，未生成候选提示词",
+            "message": "本轮有效 Judge 结果不足，主要证据是调用失败或 JSON 解析失败；这些不能作为修改提取提示词的依据。",
+        }
+
+    if issue_evidence_count == 0:
+        return {
+            **base,
+            "category": "no_change_needed",
+            "status": "completed_no_change",
+            "stage": "无需修改提示词",
+            "title": "本轮未发现需要自动修改提取提示词的稳定证据",
+            "message": "有效评测结果没有低分、错误标签或 diagnostics 形成的明确问题证据；为了避免过拟合，本轮不生成候选提示词。",
+        }
+
+    if error or can_suggest is False:
+        return {
+            **base,
+            "category": "advisor_failed",
+            "status": "paused_advisor_failed",
+            "stage": "提示词建议失败",
+            "title": "提示词建议模型失败，未生成候选提示词",
+            "message": "本轮存在有效问题证据，但提示词建议模型没有返回可解析、可应用的修改建议。",
+        }
+
+    if source == "no_valid_incremental_patch":
+        return {
+            **base,
+            "category": "no_safe_patch",
+            "status": "paused_no_safe_patch",
+            "stage": "无可安全应用的修改",
+            "title": "没有可安全应用的增量修改",
+            "message": "本轮存在有效问题证据，但候选 patch 未通过校验或会导致提示词膨胀；系统没有自动采用。",
+        }
+
+    return {
+        **base,
+        "category": "no_candidate_unknown",
+        "status": "paused_no_candidate",
+        "stage": "未生成候选提示词",
+        "title": "未生成候选提示词",
+        "message": "本轮没有得到候选提示词；请查看提示词建议原始结果判断是证据不足、无需修改，还是建议模型输出不合格。",
+    }
 
 
 def _evaluate_cases(
@@ -272,12 +449,6 @@ def _evaluate_cases(
     results_by_index: dict[int, EvalResult] = {}
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
-    request_interval = float(getattr(config.eval_config, "judge_request_interval", 0.0) or 0.0)
-    concurrency = min(100, max(1, int(getattr(config.eval_config, "judge_concurrency", 1) or 1)))
-    concurrency = min(concurrency, max(1, len(run_cases)))
-    backoff_interval = float(getattr(config.eval_config, "judge_qps_backoff", 0.0) or 0.0)
-    if concurrency > 1 and not config.eval_config.mock:
-        request_interval = max(request_interval, backoff_interval)
     if not run_cases:
         results_to_jsonl([], str(result_path))
         return []
@@ -287,7 +458,7 @@ def _evaluate_cases(
         state.update({"stage": f"第 {round_index} 轮：评测 0/{len(run_cases)}"}),
         _round_record(state, round_index).update({
             "eval_progress": f"0/{len(run_cases)}",
-            "eval_concurrency": concurrency,
+            "eval_concurrency": _current_judge_concurrency(config, limit=len(run_cases)),
         }),
     ))
 
@@ -297,11 +468,13 @@ def _evaluate_cases(
     )
 
     def wait_for_rate_slot() -> None:
+        concurrency = _current_judge_concurrency(config, limit=len(run_cases))
         wait_for_global_rate_slot(
             rate_scope,
-            request_interval,
+            _current_judge_interval(config, concurrency=concurrency),
             disabled=bool(config.eval_config.mock),
             should_stop=lambda: stop_requested(config.run_id),
+            priority=_current_priority(config),
         )
         _check_stop(config.run_id, "评测阶段收到终止请求")
 
@@ -328,8 +501,8 @@ def _evaluate_cases(
         return True
 
     try:
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            for _ in range(concurrency):
+        with ThreadPoolExecutor(max_workers=min(100, max(1, len(run_cases)))) as executor:
+            for _ in range(_current_judge_concurrency(config, limit=len(run_cases))):
                 if not submit_next(executor):
                     break
 
@@ -365,10 +538,13 @@ def _evaluate_cases(
                         state.update({"stage": f"第 {round_index} 轮：评测 {completed}/{len(run_cases)}"}),
                         _round_record(state, round_index).update({
                             "eval_progress": f"{completed}/{len(run_cases)}",
+                            "eval_concurrency": _current_judge_concurrency(config, limit=len(run_cases)),
                             "latest_message": f"已完成评测：{case.case_id}",
                         }),
                     ))
-                    submit_next(executor)
+                while len(futures) < _current_judge_concurrency(config, limit=len(run_cases)):
+                    if not submit_next(executor):
+                        break
     except StopIteration:
         for future in futures:
             future.cancel()
@@ -384,6 +560,13 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
     loop_dir.mkdir(parents=True, exist_ok=True)
     if stop_path(config.run_id).exists():
         stop_path(config.run_id).unlink()
+    init_task_controls(controls_path(config.run_id), {
+        "priority": DEFAULT_PRIORITY,
+        "target_rounds": int(config.rounds or 1),
+        "extraction_concurrency": min(100, max(1, int(config.extraction_concurrency or 1))),
+        "judge_concurrency": min(100, max(1, int(getattr(config.eval_config, "judge_concurrency", 1) or 1))),
+        "judge_request_interval": float(getattr(config.eval_config, "judge_request_interval", 0.0) or 0.0),
+    })
 
     state = _make_initial_state(config)
     append_event(state, "闭环实验启动")
@@ -399,7 +582,8 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
         if not current_prompt_text.strip():
             raise ValueError("初始提取提示词为空")
 
-        for round_index in range(1, int(config.rounds) + 1):
+        round_index = 1
+        while round_index <= _current_target_rounds(config):
             _check_stop(config.run_id)
             round_dir = loop_dir / f"round_{round_index:02d}"
             round_dir.mkdir(parents=True, exist_ok=True)
@@ -430,7 +614,8 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
             extraction_config.api_base = config.extraction_api_base or extraction_config.api_base
             extraction_config.api_token = config.extraction_api_token or extraction_config.api_token
             extraction_config.send_enable_thinking = config.extraction_send_enable_thinking
-            extraction_config.concurrency = min(100, max(1, int(config.extraction_concurrency or 1)))
+            extraction_config.concurrency = _current_extraction_concurrency(config)
+            extraction_config.priority = _current_priority(config)
             extraction_output = round_dir / f"memory_extract_round_{round_index:02d}.xlsx"
 
             def extraction_progress(done: int, total: int, message: str) -> None:
@@ -458,6 +643,8 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
                 progress_callback=extraction_progress,
                 should_stop=lambda: stop_requested(config.run_id),
                 emit_parallel_chunk_progress=True,
+                priority_provider=lambda: _current_priority(config),
+                concurrency_provider=lambda: _current_extraction_concurrency(config),
             )
             if extraction_stats.get("stopped"):
                 raise StopIteration("记忆提取阶段收到终止请求")
@@ -547,6 +734,7 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
                     "latest_message": f"正在生成提示词改进建议，输入证据 {len(evidence)} 条",
                 }),
             ))
+            set_current_task_priority(_current_priority(config))
             advisor_result, raw = call_prompt_advisor(
                 _advisor_eval_config(config),
                 evidence=evidence,
@@ -565,17 +753,28 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
             }, ensure_ascii=False, indent=2), encoding="utf-8")
 
             if not candidate_prompt:
-                final_status = "stopped_no_candidate"
+                no_candidate_reason = _classify_no_candidate_reason(
+                    results=results,
+                    evidence=evidence,
+                    advisor_result=advisor_result if isinstance(advisor_result, dict) else {},
+                )
+                final_status = str(no_candidate_reason.get("status") or "paused_no_candidate")
                 update_state(config.run_id, lambda state: (
                     _round_record(state, round_index).update({
-                    "advisor_path": str(advisor_path),
-                    "candidate_prompt_saved": "",
-                    "status": "stopped_no_candidate",
-                    "finished_at": utc_now(),
-                    "latest_message": "未生成候选提取提示词，闭环停止",
-                }),
-                append_event(state, f"第 {round_index} 轮未生成候选提取提示词，闭环停止", "warning"),
-            ))
+                        "advisor_path": str(advisor_path),
+                        "candidate_prompt_saved": "",
+                        "candidate_prompt_source": candidate_prompt_source,
+                        "no_candidate_reason": no_candidate_reason,
+                        "status": final_status,
+                        "finished_at": utc_now(),
+                        "latest_message": no_candidate_reason.get("message") or "未生成候选提取提示词。",
+                    }),
+                    append_event(
+                        state,
+                        f"第 {round_index} 轮{no_candidate_reason.get('title') or '未生成候选提取提示词'}",
+                        "info" if no_candidate_reason.get("category") == "no_change_needed" else "warning",
+                    ),
+                ))
                 break
 
             saved_prompt, saved_prompt_text = _save_candidate_prompt(
@@ -599,6 +798,8 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
                 append_event(state, f"第 {round_index} 轮候选提取提示词已保存：{saved_prompt}"),
             ))
 
+            round_index += 1
+
         if final_status == "completed":
             update_state(config.run_id, lambda state: (
                 state.update({"status": "completed", "stage": "完成", "finished_at": utc_now()}),
@@ -606,8 +807,24 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
             ))
         else:
             update_state(config.run_id, lambda state: (
-                state.update({"status": final_status, "stage": "未生成候选提示词", "finished_at": utc_now()}),
-                append_event(state, "闭环实验停止：未生成候选提取提示词", "warning"),
+                state.update({
+                    "status": final_status,
+                    "stage": (
+                        (_round_record(state, len(state.get("rounds") or [])).get("no_candidate_reason") or {}).get("stage")
+                        if state.get("rounds")
+                        else "未生成候选提示词"
+                    ),
+                    "finished_at": utc_now(),
+                }),
+                append_event(
+                    state,
+                    "闭环实验结束："
+                    + str(
+                        ((_round_record(state, len(state.get("rounds") or [])).get("no_candidate_reason") or {}).get("title"))
+                        or "未生成候选提取提示词"
+                    ),
+                    "info" if final_status == "completed_no_change" else "warning",
+                ),
             ))
 
     except StopIteration as exc:

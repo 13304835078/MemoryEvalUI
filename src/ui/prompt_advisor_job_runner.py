@@ -23,6 +23,14 @@ from src.ui.background_tasks import (
 )
 from src.ui.prompt_advisor import call_prompt_advisor
 from src.ui.state_io import atomic_write_json
+from src.ui.global_rate_limiter import set_current_task_priority
+from src.ui.task_controls import (
+    DEFAULT_PRIORITY,
+    control_priority,
+    init_task_controls,
+    merge_task_controls,
+    read_task_controls,
+)
 
 
 PROMPT_ADVISOR_JOBS_DIR = DATA_DIR / "prompt_advisor_jobs"
@@ -66,8 +74,20 @@ def raw_path(job_id: str) -> Path:
     return job_dir(job_id) / "raw.txt"
 
 
+def controls_path(job_id: str) -> Path:
+    return job_dir(job_id) / "controls.json"
+
+
 def read_prompt_advisor_job_state(job_id: str) -> dict[str, Any]:
     return read_json_state(state_path(job_id))
+
+
+def read_prompt_advisor_job_controls(job_id: str) -> dict[str, Any]:
+    return read_task_controls(controls_path(job_id))
+
+
+def update_prompt_advisor_job_controls(job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    return merge_task_controls(controls_path(job_id), updates)
 
 
 def write_prompt_advisor_job_state(job_id: str, state: dict[str, Any]) -> None:
@@ -162,6 +182,7 @@ def _write_state(
         "started_at": started_at,
         "updated_at": utc_now(),
         "config": _safe_config(config),
+        "controls": read_prompt_advisor_job_controls(config.job_id),
     }
     if extra:
         state.update(extra)
@@ -219,6 +240,7 @@ def run_prompt_advisor_job(config: PromptAdvisorJobConfig) -> None:
     started_at = utc_now()
     if stop_path(config.job_id).exists():
         stop_path(config.job_id).unlink()
+    init_task_controls(controls_path(config.job_id), {"priority": DEFAULT_PRIORITY})
 
     _write_state(
         config,
@@ -264,6 +286,7 @@ def run_prompt_advisor_job(config: PromptAdvisorJobConfig) -> None:
                 started_at=started_at,
             )
 
+        set_current_task_priority(control_priority(read_prompt_advisor_job_controls(config.job_id)))
         result, raw = call_prompt_advisor(
             config.eval_config,
             evidence=config.evidence,

@@ -81,7 +81,7 @@ def test_eval_background_job_can_stop_before_writing_failure_results(tmp_path, m
         def evaluate_one(self, case):
             raise AssertionError("STOP should be checked before evaluating the case")
 
-    def fake_wait_for_rate_slot(_scope, _interval, *, disabled=False, should_stop=None):
+    def fake_wait_for_rate_slot(_scope, _interval, *, disabled=False, should_stop=None, priority=None):
         eval_job_runner.request_eval_stop("eval-stop")
         return 0.0
 
