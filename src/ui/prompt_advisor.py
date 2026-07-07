@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import requests
@@ -13,12 +13,16 @@ import requests
 from src.eval.judge_client import RealJudgeClient
 from src.llm_api import retry_wait_seconds
 from src.schema import EvalConfig, EvalResult
+from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
 from src.ui.prompt_advisor_prompts import (
     ABSOLUTE_ADVISOR_SYSTEM_PROMPT,
     EXTRACTION_INTENT_SYSTEM_PROMPT,
     EXTRACTION_PATCH_SYSTEM_PROMPT,
 )
 from src.ui.prompt_patch import PromptSection, apply_prompt_patch, prompt_sections_for_model, split_prompt_sections
+
+
+AdvisorProgressCallback = Callable[[int, int, str, str], None]
 
 
 MAX_ADVISOR_PATCH_EDITS = 5
@@ -34,6 +38,18 @@ ADVISOR_STAGE2_MAX_TOKENS = 1000
 ADVISOR_SECTION_BLOCK_CHARS = 2400
 ADVISOR_SECTION_BLOCK_PREVIEW_CHARS = 180
 ADVISOR_MAX_EDITABLE_BLOCKS = 2
+
+
+def _emit_advisor_progress(
+    callback: AdvisorProgressCallback | None,
+    done: int,
+    total: int,
+    stage: str,
+    message: str,
+) -> None:
+    if callback is None:
+        return
+    callback(max(0, int(done)), max(1, int(total)), stage, message)
 
 
 def collect_review_evidence(df: pd.DataFrame, max_items: int = 30) -> list[dict[str, Any]]:
@@ -154,7 +170,8 @@ def build_advisor_user_message(
             "默认不要完整重写提取 prompt；请输出 extraction_prompt_patch，由系统应用 patch 得到候选全文。",
             "patch 只能引用 extraction_prompt_sections 中真实存在的 section_id。",
             "每个 edit 必须包含 evidence_refs，引用 evidence 中的 case_id/row_id。",
-            "优先使用 append_to_section 或 replace_within_section；不要删除核心章节。",
+            "优先使用 replace_within_section 合并到已有规则；冗余或冲突规则可用 delete_within_section 删除；append_to_section 只能作为最后手段。",
+            "append_to_section 必须匹配目标章节原格式；如果目标章节是列表，新增内容必须是同级列表项。",
             "候选提取 prompt 应保留原 prompt 的核心约束，只做可解释、可回滚的增量澄清。",
             "validation_plan 必须包含：另存新版本、重新提取、重新评测、稳定性对比、抽样人工复核、必要时回滚。",
         ]
@@ -182,11 +199,11 @@ def build_advisor_user_message(
             "mode": "incremental_patch",
             "edits": [
                 {
-                    "op": "append_to_section/insert_before_section/insert_after_section/replace_within_section",
+                    "op": "replace_within_section/delete_within_section/append_to_section",
                     "target_id": "必须来自 extraction_prompt_sections",
-                    "old_text": "仅 replace_within_section 需要，必须是 section preview 中能确认存在的原文",
+                    "old_text": "replace/delete 需要，必须是 section preview 或目标章节中能确认存在的原文",
                     "new_text": "仅 replace_within_section 需要",
-                    "text": "仅 append/insert 需要，直接写要追加或插入的提示词条款",
+                    "text": "仅 append 需要；必须是通用规则，且匹配目标章节格式",
                     "reason": "修改原因",
                     "evidence_refs": ["case_id 或 row_id"],
                 }
@@ -467,6 +484,8 @@ def _call_advisor_json(
 ) -> tuple[dict[str, Any] | None, str, str]:
     max_attempts = max(1, int(config.judge_max_retries or 1))
     last_error = ""
+    rate_scope = api_rate_scope(config.judge_api_base_url, config.judge_api_bearer_token)
+    request_interval = float(getattr(config, "judge_request_interval", 0.0) or 0.0)
     for attempt in range(1, max_attempts + 1):
         raw_text = ""
         attempt_message = _shrink_advisor_message_for_retry(user_message, attempt)
@@ -488,6 +507,7 @@ def _call_advisor_json(
             },
         }
         try:
+            wait_for_global_rate_slot(rate_scope, request_interval, disabled=bool(config.mock))
             response = requests.post(
                 url,
                 headers=headers,
@@ -921,11 +941,13 @@ def _build_section_patch_message(
         "request_contract": [
             "只能修改 target_section_blocks 对应的目标章节；邻近章节只用于避免冲突。",
             "replace_within_section 的 old_text 必须完整出现在 editable_blocks.full_text 中；不得根据截断预览改写原文。",
+            "delete_within_section 的 old_text 也必须完整出现在 editable_blocks.full_text 中；只能删除冗余、冲突或格式错误的规则，不能删除核心约束。",
             "block_outline 只用于判断是否重复，不能从预览中复制 old_text。",
             "如 has_oversized_uneditable_block=true，不得改写该块，只能在确有必要时向章节末尾追加一条通用规则。",
             "同一章节的相似规则必须合并，不能按 case 重复追加。",
             "只写通用规则，不要把证据中的具体实体、人名、作品名、地点写进 prompt。",
-            "优先澄清/合并已有规则；只有没有可承载规则时才追加 1 条短规则。",
+            "优先用 replace_within_section 澄清/合并已有规则；已有规则冗余或冲突时用 delete_within_section；只有没有可承载规则时才 append_to_section 追加 1 条短规则。",
+            "append_to_section 必须延续目标章节格式；如果目标章节正文是列表，text 必须以同级列表符号开头，例如 '- '。",
             "不要为了单个样本补丁式追加；如果只是已有规则换一种说法，输出空 edits。",
             f"每条 edit 文本不超过 {MAX_ADVISOR_EDIT_TEXT_CHARS} 字；本章节 patch 总文本不超过 {MAX_ADVISOR_TOTAL_PATCH_TEXT_CHARS} 字。",
             "如果现有章节已经覆盖该规则，输出空 edits 并说明原因。",
@@ -939,11 +961,11 @@ def _build_section_patch_message(
                 "mode": "incremental_patch",
                 "edits": [
                     {
-                        "op": "append_to_section/replace_within_section",
+                        "op": "replace_within_section/delete_within_section/append_to_section",
                         "target_id": group.get("section_id"),
-                        "old_text": "仅 replace_within_section 需要，必须从目标章节全文精确复制",
+                        "old_text": "replace/delete 需要，必须从目标章节全文精确复制",
                         "new_text": "仅 replace_within_section 需要",
-                        "text": "仅 append_to_section 需要；必须是通用规则，不要针对具体 case，不要冗余",
+                        "text": "仅 append_to_section 需要；必须是通用规则，不要针对具体 case，不要冗余，并匹配目标章节格式",
                         "reason": "修改原因",
                         "evidence_refs": ["case_id 或 row_id"],
                     }
@@ -1140,18 +1162,25 @@ def _normalize_patch_edit(raw: Any, index: int, *, valid_section_ids: set[str], 
     refs = [ref for ref in _normalize_string_values(item.get("evidence_refs") or item.get("case_refs")) if not allowed_refs or ref in allowed_refs]
     if not refs:
         return _invalid_patch_edit(index, "缺少有效 evidence_refs，已跳过。", raw)
+    if op in {"delete", "remove", "remove_within_section"}:
+        op = "delete_within_section"
     text = _clean(item.get("text") or item.get("insert_text"))
     old_text = _clean(item.get("old_text") or item.get("target_text"))
     new_text = _clean(item.get("new_text") or item.get("replacement_text"))
+    if op not in {"replace_within_section", "delete_within_section", "append_to_section"}:
+        return _invalid_patch_edit(index, f"不支持的操作 {op or '<empty>'}；只允许 replace/delete/append，已跳过。", raw)
     if op == "replace_within_section" and (not old_text or not new_text):
         return _invalid_patch_edit(index, "replace 缺少 old_text 或 new_text，已跳过。", raw)
     if op == "replace_within_section" and (len(old_text) > MAX_ADVISOR_REPLACE_TEXT_CHARS or len(new_text) > MAX_ADVISOR_REPLACE_TEXT_CHARS):
         return _invalid_patch_edit(index, f"replace 文本过长，超过 {MAX_ADVISOR_REPLACE_TEXT_CHARS} 字，已跳过。", raw)
     if op == "replace_within_section" and _looks_case_specific(new_text, refs):
         return _invalid_patch_edit(index, "new_text 看起来针对具体 case/样本，已跳过。", raw)
-    if op != "replace_within_section":
-        if op not in {"append_to_section", "insert_before_section", "insert_after_section"}:
-            op = "append_to_section"
+    if op == "delete_within_section":
+        if not old_text:
+            return _invalid_patch_edit(index, "delete 缺少 old_text，已跳过。", raw)
+        if len(old_text) > MAX_ADVISOR_REPLACE_TEXT_CHARS:
+            return _invalid_patch_edit(index, f"delete 文本过长，超过 {MAX_ADVISOR_REPLACE_TEXT_CHARS} 字，已跳过。", raw)
+    if op == "append_to_section":
         if not text:
             text = new_text
         if not text:
@@ -1184,6 +1213,7 @@ def _merge_section_patch_edits(
     valid_ids = set(section_map)
     append_groups: dict[tuple[str, str], dict[str, Any]] = {}
     replace_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    delete_groups: dict[tuple[str, str], dict[str, Any]] = {}
     conflicts: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
@@ -1219,6 +1249,22 @@ def _merge_section_patch_edits(
                 replace_groups[key] = edit
             continue
 
+        if edit["op"] == "delete_within_section":
+            section_text = section_map[edit["target_id"]].text
+            start = section_text.find(edit["old_text"])
+            if start < 0:
+                skipped.append({**edit, "message": "old_text 未在目标章节全文中命中，已跳过。"})
+                continue
+            key = (edit["target_id"], edit["old_text"])
+            existing = delete_groups.get(key)
+            if existing:
+                existing["evidence_refs"] = _dedupe_preserve_order((existing.get("evidence_refs") or []) + edit["evidence_refs"])
+                if edit.get("reason") and edit["reason"] not in existing.get("reason", ""):
+                    existing["reason"] = (existing.get("reason") + "；" + edit["reason"]).strip("；")
+            else:
+                delete_groups[key] = edit
+            continue
+
         normalized_text = _normalize_text_key(edit["text"])
         key = (edit["target_id"], edit["op"])
         existing = append_groups.get(key)
@@ -1236,6 +1282,8 @@ def _merge_section_patch_edits(
     edits: list[dict[str, Any]] = []
     for item in replace_groups.values():
         edits.append({k: v for k, v in item.items() if not k.startswith("_")})
+    for item in delete_groups.values():
+        edits.append({k: v for k, v in item.items() if not k.startswith("_")})
     for item in append_groups.values():
         edits.append({k: v for k, v in item.items() if not k.startswith("_")})
     edits.sort(key=lambda item: (item.get("target_id") or "", item.get("op") or "", item.get("edit_id") or ""))
@@ -1244,7 +1292,9 @@ def _merge_section_patch_edits(
     total_patch_chars = 0
     total_append_chars = 0
     for edit in edits:
-        if edit.get("op") != "replace_within_section":
+        op = edit.get("op")
+        new_units: list[dict[str, str]] = []
+        if op == "append_to_section":
             unique_text, new_units, duplicate_rows = _prune_duplicate_insert_text(str(edit.get("text") or ""), existing_rule_units)
             for duplicate in duplicate_rows:
                 skipped.append({
@@ -1255,7 +1305,7 @@ def _merge_section_patch_edits(
             if not unique_text:
                 continue
             edit = {**edit, "text": unique_text}
-        else:
+        elif op == "replace_within_section":
             unique_text, new_units, duplicate_rows = _prune_duplicate_replacement_text(
                 str(edit.get("old_text") or ""),
                 str(edit.get("new_text") or ""),
@@ -1271,9 +1321,20 @@ def _merge_section_patch_edits(
                 skipped.append({**edit, "message": "replace 去重后没有新增有效内容，已跳过。"})
                 continue
             edit = {**edit, "new_text": unique_text}
+        elif op == "delete_within_section":
+            pass
+        else:
+            skipped.append({**edit, "message": f"不支持的操作 {op}，已跳过。"})
+            continue
 
-        change_text = str(edit.get("text") or edit.get("new_text") or "")
-        if edit.get("op") != "replace_within_section" and total_append_chars + len(change_text) > MAX_ADVISOR_APPEND_TEXT_CHARS:
+        change_text = str(
+            edit.get("text")
+            if op == "append_to_section"
+            else edit.get("new_text")
+            if op == "replace_within_section"
+            else edit.get("old_text") or ""
+        )
+        if op == "append_to_section" and total_append_chars + len(change_text) > MAX_ADVISOR_APPEND_TEXT_CHARS:
             remaining_chars = MAX_ADVISOR_APPEND_TEXT_CHARS - total_append_chars
             kept_lines: list[str] = []
             kept_size = 0
@@ -1298,10 +1359,10 @@ def _merge_section_patch_edits(
             continue
         limited_edits.append(edit)
         total_patch_chars += change_size
-        if edit.get("op") != "replace_within_section":
+        if op == "append_to_section":
             total_append_chars += change_size
             existing_rule_units.extend(new_units)
-        else:
+        elif op == "replace_within_section":
             existing_rule_units.extend(new_units or _prompt_rule_units(str(edit.get("new_text") or "")))
     edits = limited_edits
     return {"edits": edits, "conflicts": conflicts, "skipped": skipped}
@@ -1413,6 +1474,7 @@ def _call_two_stage_extraction_advisor(
     url: str,
     headers: dict[str, str],
     client: RealJudgeClient,
+    progress_callback: AdvisorProgressCallback | None = None,
 ) -> tuple[dict[str, Any], str]:
     sections = split_prompt_sections(extraction_prompt)
     if not sections:
@@ -1429,6 +1491,7 @@ def _call_two_stage_extraction_advisor(
             "error": "提取提示词无法切分。",
         }, ""
 
+    _emit_advisor_progress(progress_callback, 0, 3, "准备章节定位", "正在切分提取提示词并准备证据。")
     allowed_refs = _allowed_evidence_refs(evidence)
     stage1_profile = _advisor_attempt_profile(
         attempt=1,
@@ -1490,6 +1553,14 @@ def _call_two_stage_extraction_advisor(
         unresolved_evidence[index:index + ADVISOR_STAGE1_BATCH_SIZE]
         for index in range(0, len(unresolved_evidence), ADVISOR_STAGE1_BATCH_SIZE)
     ]
+    stage_total = 1 + len(stage1_batches) + 1
+    _emit_advisor_progress(
+        progress_callback,
+        1,
+        stage_total,
+        "定位章节",
+        f"本地已定位 {len(prelocalized_refs)} 条证据，剩余 {len(unresolved_evidence)} 条证据需要分批定位。",
+    )
     for batch_index, batch in enumerate(stage1_batches, 1):
         if batch_index > 1:
             interval = float(getattr(config, "judge_request_interval", 0.0) or 0.0)
@@ -1538,6 +1609,13 @@ def _call_two_stage_extraction_advisor(
                 "evidence_refs": [_evidence_ref_id(item) for item in batch],
                 "error": batch_error or "第1阶段输出不可解析。",
             })
+        _emit_advisor_progress(
+            progress_callback,
+            1 + batch_index,
+            stage_total,
+            "定位章节",
+            f"章节定位第 {batch_index}/{len(stage1_batches)} 批完成。",
+        )
 
     stage1_result = _merge_stage1_results(stage1_results)
     if not stage1_result:
@@ -1604,6 +1682,16 @@ def _call_two_stage_extraction_advisor(
 
     if not raw_edits:
         groups = plan.get("groups") or []
+        stage2_total = min(len(groups), MAX_ADVISOR_PATCH_EDITS)
+        completed_before_stage2 = 1 + len(stage1_batches)
+        stage_total = completed_before_stage2 + stage2_total + 1
+        _emit_advisor_progress(
+            progress_callback,
+            completed_before_stage2,
+            stage_total,
+            "生成章节修改",
+            f"已合并为 {len(groups)} 个目标章节，准备生成段落级修改。",
+        )
         for group_index, group in enumerate(groups[:MAX_ADVISOR_PATCH_EDITS], 1):
             interval = float(getattr(config, "judge_request_interval", 0.0) or 0.0)
             if interval > 0:
@@ -1675,6 +1763,16 @@ def _call_two_stage_extraction_advisor(
                 "accepted_edit_count": accepted,
                 "section_notes": section_result.get("section_notes") or "",
             })
+            _emit_advisor_progress(
+                progress_callback,
+                completed_before_stage2 + group_index,
+                stage_total,
+                "生成章节修改",
+                f"段落级修改第 {group_index}/{stage2_total} 个章节完成。",
+            )
+    else:
+        completed_before_stage2 = 1 + len(stage1_batches)
+        stage_total = completed_before_stage2 + 1
 
     merged = _merge_section_patch_edits(raw_edits, sections=sections, allowed_refs=allowed_refs)
     base_result["extraction_prompt_patch_intents"] = intents
@@ -1710,7 +1808,9 @@ def _call_two_stage_extraction_advisor(
     if merged.get("conflicts"):
         base_result["risks"].append("检测到同一章节内冲突修改，冲突项未自动应用。")
 
+    _emit_advisor_progress(progress_callback, max(stage_total - 1, 0), stage_total, "应用候选修改", "正在校验并应用候选提示词修改。")
     finalized = _finalize_advisor_result(base_result, extraction_prompt=extraction_prompt, target=target)
+    _emit_advisor_progress(progress_callback, stage_total, stage_total, "完成", "提示词建议生成完成。")
     return finalized, json.dumps(raw_payload, ensure_ascii=False, indent=2)
 
 
@@ -1722,8 +1822,10 @@ def call_prompt_advisor(
     target: str = "judge_prompt",
     advisor_mode: str = "absolute_eval",
     min_evidence: int = 3,
+    progress_callback: AdvisorProgressCallback | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     if advisor_mode != "absolute_eval":
+        _emit_advisor_progress(progress_callback, 1, 1, "不支持", "当前提示词建议模式不支持。")
         return {
             "can_suggest": False,
             "evidence_summary": f"不支持的提示词建议模式：{advisor_mode}",
@@ -1738,6 +1840,7 @@ def call_prompt_advisor(
         }, ""
 
     if len(evidence) < min_evidence:
+        _emit_advisor_progress(progress_callback, 1, 1, "证据不足", "证据条数不足，未生成候选提示词。")
         summary = f"评测结果证据少于 {min_evidence} 条，拒绝生成候选 prompt，避免根据个例过拟合。"
         plan = [f"至少收集 {min_evidence} 条低分、带错误标签、带 diagnostics 或 fatal 的普通评测结果。"]
         return {
@@ -1754,6 +1857,7 @@ def call_prompt_advisor(
         }, ""
 
     if config.mock:
+        _emit_advisor_progress(progress_callback, 0, 2, "模拟模式", "正在生成模拟提示词建议。")
         extraction_patch: dict[str, Any] = {"mode": "incremental_patch", "edits": []}
         if target in {"extraction_prompt", "both"} and extraction_prompt.strip():
             sections = prompt_sections_for_model(extraction_prompt, max_sections=1, preview_chars=120)
@@ -1765,7 +1869,7 @@ def call_prompt_advisor(
                         {
                             "op": "append_to_section",
                             "target_id": sections[0]["section_id"],
-                            "text": "<!-- MOCK: 这里示例展示增量 patch 机制，真实运行时不会插入这段。 -->",
+                            "text": "- [MOCK] 这里示例展示增量修改机制，真实运行时不会插入这段。",
                             "reason": "模拟模式用于验证 patch 展示和保存流程。",
                             "evidence_refs": [str(first_evidence.get("case_id") or first_evidence.get("row_id") or "mock_case")],
                         }
@@ -1785,6 +1889,7 @@ def call_prompt_advisor(
             "evidence_usage": _evidence_usage(len(evidence), len(evidence)),
         }
         mock_result = _finalize_advisor_result(mock_result, extraction_prompt=extraction_prompt, target=target)
+        _emit_advisor_progress(progress_callback, 2, 2, "完成", "模拟提示词建议生成完成。")
         return mock_result, json.dumps(mock_result, ensure_ascii=False)
 
     url = RealJudgeClient._normalize_chat_completions_url(config.judge_api_base_url)
@@ -1803,6 +1908,7 @@ def call_prompt_advisor(
             url=url,
             headers=headers,
             client=client,
+            progress_callback=progress_callback,
         )
 
     last_error = ""
@@ -1811,6 +1917,13 @@ def call_prompt_advisor(
 
     max_attempts = max(1, int(config.judge_max_retries or 1))
     for attempt in range(1, max_attempts + 1):
+        _emit_advisor_progress(
+            progress_callback,
+            attempt - 1,
+            max_attempts,
+            "调用模型",
+            f"正在调用提示词建议模型，第 {attempt}/{max_attempts} 次尝试。",
+        )
         raw_text = ""
         profile = _advisor_attempt_profile(
             attempt=attempt,
@@ -1871,6 +1984,11 @@ def call_prompt_advisor(
             "error": "",
         }
         try:
+            wait_for_global_rate_slot(
+                api_rate_scope(config.judge_api_base_url, config.judge_api_bearer_token),
+                float(getattr(config, "judge_request_interval", 0.0) or 0.0),
+                disabled=bool(config.mock),
+            )
             response = requests.post(
                 url,
                 headers=headers,
@@ -1902,6 +2020,7 @@ def call_prompt_advisor(
                             attempt_metrics[0]["evidence_count"],
                             attempts=attempt_metrics,
                         )
+                        _emit_advisor_progress(progress_callback, max_attempts, max_attempts, "完成", "提示词建议生成完成。")
                         return parsed, content or raw_text
                     last_error = f"提示词建议输出不是可解析 JSON: {content[:1000]}"
 
@@ -1917,6 +2036,7 @@ def call_prompt_advisor(
         if attempt < max_attempts:
             time.sleep(_advisor_retry_wait_seconds(config, last_error, attempt))
 
+    _emit_advisor_progress(progress_callback, max_attempts, max_attempts, "失败", "提示词建议生成失败。")
     return {
         "can_suggest": False,
         "evidence_summary": "提示词改进建议生成失败，未拿到可解析的模型输出。",

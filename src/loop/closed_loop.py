@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
-import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
@@ -24,6 +22,7 @@ from src.ui.data_service import (
     prepare_long_memory_cases_from_run_output,
     save_cases,
 )
+from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
 from src.ui.prompt_advisor import call_prompt_advisor, collect_absolute_eval_evidence
 from src.ui.prompt_editor import prompt_text_hash, save_prompt_version
 from src.ui.state_io import atomic_write_json, state_file_lock
@@ -287,22 +286,19 @@ def _evaluate_cases(
         }),
     ))
 
-    rate_lock = threading.Lock()
-    next_request_at = {"value": time.monotonic()}
+    rate_scope = api_rate_scope(
+        config.eval_config.judge_api_base_url,
+        config.eval_config.judge_api_bearer_token,
+    )
 
     def wait_for_rate_slot() -> None:
-        if request_interval <= 0 or config.eval_config.mock:
-            return
-        with rate_lock:
-            now = time.monotonic()
-            wait_seconds = max(0.0, next_request_at["value"] - now)
-            next_request_at["value"] = max(now, next_request_at["value"]) + request_interval
-
-        while wait_seconds > 0:
-            _check_stop(config.run_id, "评测阶段收到终止请求")
-            sleep_seconds = min(1.0, wait_seconds)
-            time.sleep(sleep_seconds)
-            wait_seconds -= sleep_seconds
+        wait_for_global_rate_slot(
+            rate_scope,
+            request_interval,
+            disabled=bool(config.eval_config.mock),
+            should_stop=lambda: stop_requested(config.run_id),
+        )
+        _check_stop(config.run_id, "评测阶段收到终止请求")
 
     if hasattr(runner.judge_client, "rate_limit_wait_callback"):
         runner.judge_client.rate_limit_wait_callback = wait_for_rate_slot

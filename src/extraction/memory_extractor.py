@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import re
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
@@ -20,6 +19,7 @@ from src.extraction.client import (
 from src.persistence import append_jsonl_rows, atomic_write_jsonl
 from src.runtime_paths import APP_HOME, DATA_DIR
 from src.schema import TaskType
+from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
 
 PROJECT_ROOT = APP_HOME
 EXTRACTION_OUTPUT_DIR = DATA_DIR / "extractions"
@@ -453,23 +453,15 @@ class MemoryExtractionRunner:
 
         concurrency = min(100, max(1, int(getattr(self.config, "concurrency", 1) or 1)))
         request_interval = float(self.config.request_interval or 0)
-        rate_lock = Lock()
-        next_request_at = {"value": time.monotonic()}
+        rate_scope = api_rate_scope(self.config.api_base, self.config.api_token)
 
         def wait_for_rate_slot() -> None:
-            if request_interval <= 0:
-                return
-            with rate_lock:
-                now = time.monotonic()
-                wait_seconds = max(0.0, next_request_at["value"] - now)
-                next_request_at["value"] = max(now, next_request_at["value"]) + request_interval
-
-            while wait_seconds > 0:
-                if should_stop is not None and should_stop():
-                    return
-                sleep_seconds = min(1.0, wait_seconds)
-                time.sleep(sleep_seconds)
-                wait_seconds -= sleep_seconds
+            wait_for_global_rate_slot(
+                rate_scope,
+                request_interval,
+                disabled=bool(self.config.mock),
+                should_stop=should_stop,
+            )
 
         global_sessions = split_sessions(df)
         for session_index, session_rows in enumerate(global_sessions, start=1):

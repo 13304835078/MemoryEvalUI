@@ -110,6 +110,11 @@ if (-not (Test-Path $Exe)) {
 $ReleaseRoot = Join-Path $Root "dist\MemoryEvalUI"
 $WritableDirs = @(
     "data\cases"
+    "data\closed_loop"
+    "data\eval_jobs"
+    "data\extraction\jobs"
+    "data\judge_ab_jobs"
+    "data\prompt_advisor_jobs"
     "data\raw\uploads"
     "data\results"
     "config"

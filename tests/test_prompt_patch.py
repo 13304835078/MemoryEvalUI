@@ -162,3 +162,45 @@ def test_append_patch_skips_when_only_duplicate_heading_remains():
     assert len(result["skipped_edits"]) == 1
     assert result["candidate_prompt"] == prompt
     assert "章节标题" in result["skipped_edits"][0]["message"]
+
+
+def test_append_patch_requires_list_marker_in_list_section():
+    prompt = "## B1 用户画像\n- 姓名、昵称\n- 性别\n"
+    patch = {
+        "edits": [
+            {
+                "op": "append_to_section",
+                "target_id": "S001",
+                "text": "严禁记录泛化的娱乐偏好。",
+                "reason": "模型返回了非列表段落",
+                "evidence_refs": ["case_1"],
+            }
+        ]
+    }
+
+    result = apply_prompt_patch(prompt, patch)
+
+    assert result["applied_edits"] == []
+    assert result["candidate_prompt"] == prompt
+    assert "列表结构" in result["skipped_edits"][0]["message"]
+
+
+def test_apply_prompt_patch_deletes_exact_text_with_evidence_refs():
+    prompt = "## 规则\n- 保留规则。\n- 冗余规则。\n"
+    patch = {
+        "edits": [
+            {
+                "op": "delete_within_section",
+                "target_id": "S001",
+                "old_text": "- 冗余规则。\n",
+                "reason": "删除重复规则",
+                "evidence_refs": ["case_1"],
+            }
+        ]
+    }
+
+    result = apply_prompt_patch(prompt, patch)
+
+    assert len(result["applied_edits"]) == 1
+    assert "- 保留规则。" in result["candidate_prompt"]
+    assert "冗余规则" not in result["candidate_prompt"]

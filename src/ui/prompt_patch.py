@@ -17,6 +17,7 @@ ALLOWED_OPS = {
     "insert_after_section",
     "append_to_section",
     "replace_within_section",
+    "delete_within_section",
 }
 
 
@@ -249,11 +250,11 @@ def _validate_edit_basics(edit: dict[str, Any], section_map: dict[str, PromptSec
         return False, f"目标 section 不存在：{edit['target_id']}"
     if not edit["evidence_refs"]:
         return False, "缺少 evidence_refs；为避免无依据改 prompt，未自动应用。"
-    if edit["op"] == "replace_within_section" and not edit["old_text"]:
-        return False, "replace_within_section 缺少 old_text。"
+    if edit["op"] in {"replace_within_section", "delete_within_section"} and not edit["old_text"]:
+        return False, f"{edit['op']} 缺少 old_text。"
     if edit["op"] == "replace_within_section" and not edit["new_text"]:
         return False, "replace_within_section 缺少 new_text。"
-    if edit["op"] != "replace_within_section" and not edit["text"]:
+    if edit["op"] not in {"replace_within_section", "delete_within_section"} and not edit["text"]:
         return False, "插入类操作缺少 text。"
     return True, ""
 
@@ -272,6 +273,22 @@ def _build_operation(original: str, section: PromptSection, edit: dict[str, Any]
             "end": end,
             "replacement": edit["new_text"],
             "change_chars": len(edit["old_text"]) + len(edit["new_text"]),
+        }
+
+    if op == "delete_within_section":
+        relative = section.text.find(edit["old_text"])
+        if relative < 0:
+            return {"ok": False, "message": "old_text 未在目标 section 中精确命中。"}
+        start = section.start + relative
+        end = start + len(edit["old_text"])
+        return {
+            "ok": True,
+            "start": start,
+            "end": end,
+            "replacement": "",
+            "change_chars": len(edit["old_text"]),
+            "message": "已删除目标原文",
+            "applied_text": edit["old_text"],
         }
 
     if op == "insert_before_section":
@@ -309,6 +326,9 @@ def _build_operation(original: str, section: PromptSection, edit: dict[str, Any]
         sanitized = _sanitize_insert_text(edit["text"], strip_headings=True, section=section)
         if not sanitized["text"]:
             return {"ok": False, "message": sanitized["message"] or "追加文本规范化后为空。"}
+        ok, message = _validate_append_format_for_section(sanitized["text"], section)
+        if not ok:
+            return {"ok": False, "message": message}
         applied_text = _align_append_text_to_section(sanitized["text"], section)
         replacement = _format_insert_text(applied_text, before_text=original[:insert_at], after_text=original[insert_at:])
         return {
@@ -322,6 +342,36 @@ def _build_operation(original: str, section: PromptSection, edit: dict[str, Any]
         }
 
     return {"ok": False, "message": f"不支持的操作：{op}"}
+
+
+def _validate_append_format_for_section(text: str, section: PromptSection) -> tuple[bool, str]:
+    if not _section_uses_list_items(section):
+        return True, ""
+    nonblank_lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not nonblank_lines:
+        return False, "追加文本为空。"
+    invalid_lines = [line for line in nonblank_lines if not LIST_ITEM_RE.match(line)]
+    if invalid_lines:
+        return False, (
+            "目标章节是列表结构；append_to_section 必须追加同级列表项"
+            "（例如以 '- ' 开头），或改用 replace_within_section 合并到已有规则。"
+        )
+    return True, ""
+
+
+def _section_uses_list_items(section: PromptSection) -> bool:
+    body_lines = []
+    list_count = 0
+    for raw_line in str(section.text or "").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or HEADING_LINE_RE.match(stripped):
+            continue
+        body_lines.append(stripped)
+        if LIST_ITEM_RE.match(raw_line):
+            list_count += 1
+    if not body_lines:
+        return False
+    return list_count > 0 and list_count >= max(1, len(body_lines) // 2)
 
 
 def _section_content_end(section: PromptSection) -> int:

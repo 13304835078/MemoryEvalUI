@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import sys
 import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from statistics import mean
 
 import pandas as pd
 import streamlit as st
@@ -14,10 +11,22 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.eval.eval_runner import EvalRunner
-from src.schema import Case, EvalResult, TaskType
+from src.schema import TaskType
 from src.ui.config_store import build_eval_config, load_config
-from src.ui.data_service import dataframe_to_excel_bytes, list_case_files, load_cases
+from src.ui.data_service import list_case_files, load_cases
+from src.ui.judge_ab_job_runner import (
+    JudgeAbJobConfig,
+    avg_dimension_scores,
+    judge_ab_job_is_stale,
+    list_judge_ab_job_ids,
+    load_judge_ab_results,
+    mark_judge_ab_job_interrupted,
+    read_judge_ab_job_state,
+    request_judge_ab_stop,
+    result_table,
+    run_judge_ab_job,
+    summarize_results,
+)
 from src.ui.prompt_editor import (
     get_default_extraction_prompt_file,
     get_default_prompt_file,
@@ -37,142 +46,151 @@ st.caption("单模型绝对评测对比：同一批 case、同一个裁判模型
 
 if "ui_config" not in st.session_state:
     st.session_state.ui_config = load_config()
-if "judge_ab_single_result" not in st.session_state:
-    st.session_state.judge_ab_single_result = None
 
 
 def get_task_choices() -> list[str]:
     return [item.value for item in TaskType if item.value != "raw_dialogue"]
 
 
-def make_rate_limiter(config, concurrency: int):
-    configured_interval = float(config.judge_request_interval or 0.0) if not config.mock else 0.0
-    interval = configured_interval
-    if concurrency > 1 and not config.mock:
-        interval = max(interval, float(config.judge_qps_backoff or 0.0))
-    lock = threading.Lock()
-    next_call_at = {"value": time.monotonic()}
-
-    def wait() -> None:
-        if interval <= 0:
-            return
-        with lock:
-            now = time.monotonic()
-            wait_seconds = max(0.0, next_call_at["value"] - now)
-            next_call_at["value"] = max(now, next_call_at["value"]) + interval
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
-
-    return wait, configured_interval, interval
+def ensure_judge_ab_threads() -> dict[str, threading.Thread]:
+    if "judge_ab_threads" not in st.session_state:
+        st.session_state.judge_ab_threads = {}
+    return st.session_state.judge_ab_threads
 
 
-def evaluate_prompt(
-    label: str,
-    prompt_file: str,
-    cases: list[Case],
-    task_type: str,
-    config,
-    extraction_prompt_text: str,
-    extraction_prompt_version: str,
-    extraction_prompt_hash: str,
-    max_workers: int,
-) -> tuple[list[EvalResult], dict]:
-    prompt_version = infer_prompt_version(prompt_file)
-    runner = EvalRunner(
-        config=config,
-        task_type=TaskType(task_type),
-        prompt_file=prompt_file,
-        judge_prompt_version=prompt_version,
-        extraction_prompt_text=extraction_prompt_text,
-        extraction_prompt_version=extraction_prompt_version,
-        extraction_prompt_hash=extraction_prompt_hash,
-    )
-    wait_for_rate_limit, configured_interval, effective_interval = make_rate_limiter(config, max_workers)
-    if hasattr(runner.judge_client, "rate_limit_wait_callback"):
-        runner.judge_client.rate_limit_wait_callback = wait_for_rate_limit
-    rows_by_index: dict[int, EvalResult] = {}
-    progress = st.progress(
-        0.0,
-        text=f"提示词 {label}: 0/{len(cases)}，实际请求启动间隔 {effective_interval:.1f}s",
-    )
+def render_judge_ab_result(job_id: str, state: dict) -> None:
+    results_a, results_b = load_judge_ab_results(job_id)
+    if not results_a or not results_b:
+        return
 
-    def evaluate_one(index: int, case: Case) -> tuple[int, EvalResult]:
-        wait_for_rate_limit()
-        return index, runner.evaluate_one(case)
+    st.divider()
+    st.subheader("4. 对比结果")
+    summary_a = state.get("summary_a") or summarize_results(results_a)
+    summary_b = state.get("summary_b") or summarize_results(results_b)
 
-    if cases:
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(cases))) as executor:
-            future_map = {executor.submit(evaluate_one, idx, case): idx for idx, case in enumerate(cases)}
-            completed = 0
-            for future in as_completed(future_map):
-                idx, result = future.result()
-                rows_by_index[idx] = result
-                completed += 1
-                progress.progress(
-                    completed / len(cases),
-                    text=f"提示词 {label}: {completed}/{len(cases)}，实际请求启动间隔 {effective_interval:.1f}s",
-                )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("A 平均分", f"{float(summary_a.get('avg_score') or 0):.4f}")
+    c2.metric("B 平均分", f"{float(summary_b.get('avg_score') or 0):.4f}")
+    c3.metric("B-A 平均分差", f"{float(summary_b.get('avg_score') or 0) - float(summary_a.get('avg_score') or 0):.4f}")
+    c4.metric("样本数", int(summary_a.get("total") or 0))
 
-    stats = {
-        "prompt_file": prompt_file,
-        "prompt_version": prompt_version,
-        "configured_request_interval": configured_interval,
-        "effective_request_interval": effective_interval,
-    }
-    return [rows_by_index[i] for i in sorted(rows_by_index)], stats
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("A fatal", int(summary_a.get("fatal_count") or 0))
+    c2.metric("B fatal", int(summary_b.get("fatal_count") or 0))
+    c3.metric("A 有标签样本", int(summary_a.get("tagged_count") or 0))
+    c4.metric("B 有标签样本", int(summary_b.get("tagged_count") or 0))
 
-
-def summarize_results(results: list[EvalResult]) -> dict:
-    if not results:
-        return {
-            "total": 0,
-            "avg_score": 0.0,
-            "fatal_count": 0,
-            "tagged_count": 0,
-            "diagnostics_count": 0,
-        }
-    return {
-        "total": len(results),
-        "avg_score": round(mean(float(item.score_total or 0) for item in results), 4),
-        "fatal_count": sum(1 for item in results if item.fatal_error),
-        "tagged_count": sum(1 for item in results if item.error_tags),
-        "diagnostics_count": sum(len(item.diagnostics or []) for item in results),
-    }
-
-
-def avg_dimension_scores(results: list[EvalResult]) -> dict[str, float]:
-    dims = sorted({dim for result in results for dim in (result.scores or {})})
-    rows: dict[str, float] = {}
-    for dim in dims:
-        values = [float((result.scores or {}).get(dim, 0.0) or 0.0) for result in results]
-        rows[dim] = round(mean(values), 4) if values else 0.0
-    return rows
-
-
-def result_table(results_a: list[EvalResult], results_b: list[EvalResult]) -> pd.DataFrame:
-    rows = []
-    for a, b in zip(results_a, results_b):
-        rows.append({
-            "case_id": a.case_id,
-            "model_name": a.model_name,
-            "candidate_prompt_version": a.prompt_version,
-            "score_A": a.score_total,
-            "score_B": b.score_total,
-            "score_delta_B_minus_A": round(float(b.score_total or 0) - float(a.score_total or 0), 4),
-            "fatal_A": a.fatal_error,
-            "fatal_B": b.fatal_error,
-            "error_tags_A": ", ".join(a.error_tags or []),
-            "error_tags_B": ", ".join(b.error_tags or []),
-            "diagnostics_A": len(a.diagnostics or []),
-            "diagnostics_B": len(b.diagnostics or []),
-            "comment_A": a.comment,
-            "comment_B": b.comment,
-            "rule_refs_A": "; ".join(a.rule_refs or []),
-            "rule_refs_B": "; ".join(b.rule_refs or []),
-            "evidence_refs_A": "; ".join(a.evidence_refs or []),
-            "evidence_refs_B": "; ".join(b.evidence_refs or []),
+    dim_a = avg_dimension_scores(results_a)
+    dim_b = avg_dimension_scores(results_b)
+    dim_rows = []
+    for dim in sorted(set(dim_a) | set(dim_b)):
+        dim_rows.append({
+            "dimension": dim,
+            "avg_A": dim_a.get(dim, 0.0),
+            "avg_B": dim_b.get(dim, 0.0),
+            "delta_B_minus_A": round(dim_b.get(dim, 0.0) - dim_a.get(dim, 0.0), 4),
         })
-    return pd.DataFrame(rows)
+    if dim_rows:
+        st.markdown("**维度平均分对比**")
+        st.dataframe(pd.DataFrame(dim_rows), use_container_width=True, hide_index=True)
+
+    preview_rows = state.get("table_preview") or []
+    table = pd.DataFrame(preview_rows) if preview_rows else result_table(results_a, results_b)
+    st.markdown("**样本明细**")
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    table_file = str(state.get("table_path") or "")
+    if table_file and Path(table_file).exists():
+        st.download_button(
+            "下载 A/B 对比结果",
+            data=Path(table_file).read_bytes(),
+            file_name=Path(table_file).name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"{job_id}_download_ab",
+        )
+
+    with st.expander("运行元信息", expanded=False):
+        st.json({
+            "job_id": job_id,
+            "created_at": state.get("started_at", ""),
+            "prompt_A": state.get("stats_a", {}),
+            "prompt_B": state.get("stats_b", {}),
+            "config": state.get("config", {}),
+        })
+
+
+def render_judge_ab_job_state(job_id: str) -> None:
+    state = read_judge_ab_job_state(job_id)
+    if judge_ab_job_is_stale(state):
+        state = mark_judge_ab_job_interrupted(job_id)
+    if not state:
+        st.info("暂无这个 A/B 对比任务的状态。")
+        return
+
+    status = str(state.get("status") or "")
+    done = int(state.get("done", 0) or 0)
+    total = int(state.get("total", 0) or 0)
+    progress = done / total if total else 0.0
+
+    st.subheader("后台 A/B 对比进度")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("状态", status or "-")
+    c2.metric("阶段", state.get("stage", "-"))
+    c3.metric("进度", f"{done}/{total}" if total else "准备中")
+    c4.metric("更新时间", str(state.get("updated_at", ""))[:19])
+    st.progress(progress)
+    st.write(state.get("message", ""))
+    if state.get("effective_request_interval") is not None:
+        st.caption(
+            f"实际请求启动间隔：{float(state.get('effective_request_interval') or 0):.1f}s"
+            f"（配置请求间隔：{float(state.get('configured_request_interval') or 0):.1f}s）"
+        )
+    if status == "running":
+        st.info("任务仍在后台运行。切换页面后再回来，进度会从状态文件恢复。")
+        if st.button("请求终止 A/B 对比", type="secondary", use_container_width=True, key=f"{job_id}_stop"):
+            request_judge_ab_stop(job_id)
+            st.warning("已写入终止请求。已发出的 API 调用会先返回，后续样本会停止提交。")
+            st.rerun()
+    elif status == "interrupted":
+        st.warning("任务状态为已中断。通常是程序关闭或后台线程退出导致；可以重新启动任务。")
+    elif status == "stopped":
+        st.warning("任务已终止。")
+
+    if status in {"completed", "stopped", "interrupted", "failed"}:
+        render_judge_ab_result(job_id, state)
+    if state.get("traceback"):
+        with st.expander("错误堆栈", expanded=True):
+            st.code(state.get("traceback", ""), language="text")
+
+
+@st.fragment(run_every="10s")
+def render_judge_ab_job_state_auto(job_id: str) -> None:
+    render_judge_ab_job_state(job_id)
+
+
+def render_judge_ab_job_panel() -> str:
+    job_ids = list_judge_ab_job_ids()
+    if not job_ids:
+        return ""
+    last_job_id = st.session_state.get("judge_ab_job_id", "") or job_ids[0]
+    index = job_ids.index(last_job_id) if last_job_id in job_ids else 0
+    selected_job_id = st.selectbox("查看后台 A/B 对比任务", job_ids, index=index)
+    st.session_state.judge_ab_job_id = selected_job_id
+    state = read_judge_ab_job_state(selected_job_id)
+    if state.get("status") == "running":
+        auto_refresh = st.checkbox(
+            "运行中每10秒自动刷新进度区",
+            value=False,
+            key=f"{selected_job_id}_ab_auto_refresh",
+            help="只刷新下面的进度区域，不刷新整个页面。",
+        )
+        if auto_refresh:
+            render_judge_ab_job_state_auto(selected_job_id)
+        else:
+            render_judge_ab_job_state(selected_job_id)
+    else:
+        render_judge_ab_job_state(selected_job_id)
+    return selected_job_id
 
 
 with st.expander("使用说明", expanded=True):
@@ -334,92 +352,30 @@ if st.button("开始 A/B 对比", type="primary", use_container_width=True, disa
         st.error("配置错误：\n" + "\n".join([f"- {item}" for item in errors]))
         st.stop()
 
-    max_workers = min(100, max(1, int(cfg.get("judge_concurrency", 1) or 1)))
-    with st.spinner("正在运行裁判提示词 A..."):
-        results_a, stats_a = evaluate_prompt(
-            "A",
-            prompt_a,
-            run_cases,
-            task_type,
-            config,
-            extraction_prompt_text,
-            extraction_prompt_version,
-            extraction_prompt_hash,
-            max_workers,
-        )
-    with st.spinner("正在运行裁判提示词 B..."):
-        results_b, stats_b = evaluate_prompt(
-            "B",
-            prompt_b,
-            run_cases,
-            task_type,
-            config,
-            extraction_prompt_text,
-            extraction_prompt_version,
-            extraction_prompt_hash,
-            max_workers,
-        )
-
-    st.session_state.judge_ab_single_result = {
-        "results_a": results_a,
-        "results_b": results_b,
-        "stats_a": stats_a,
-        "stats_b": stats_b,
-        "case_file": selected_case_path,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-    }
-
-
-result = st.session_state.judge_ab_single_result
-if result:
-    st.divider()
-    st.subheader("4. 对比结果")
-    results_a = result["results_a"]
-    results_b = result["results_b"]
-    summary_a = summarize_results(results_a)
-    summary_b = summarize_results(results_b)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("A 平均分", f"{summary_a['avg_score']:.4f}")
-    c2.metric("B 平均分", f"{summary_b['avg_score']:.4f}")
-    c3.metric("B-A 平均分差", f"{summary_b['avg_score'] - summary_a['avg_score']:.4f}")
-    c4.metric("样本数", summary_a["total"])
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("A fatal", summary_a["fatal_count"])
-    c2.metric("B fatal", summary_b["fatal_count"])
-    c3.metric("A 有标签样本", summary_a["tagged_count"])
-    c4.metric("B 有标签样本", summary_b["tagged_count"])
-
-    dim_a = avg_dimension_scores(results_a)
-    dim_b = avg_dimension_scores(results_b)
-    dim_rows = []
-    for dim in sorted(set(dim_a) | set(dim_b)):
-        dim_rows.append({
-            "dimension": dim,
-            "avg_A": dim_a.get(dim, 0.0),
-            "avg_B": dim_b.get(dim, 0.0),
-            "delta_B_minus_A": round(dim_b.get(dim, 0.0) - dim_a.get(dim, 0.0), 4),
-        })
-    if dim_rows:
-        st.markdown("**维度平均分对比**")
-        st.dataframe(pd.DataFrame(dim_rows), use_container_width=True, hide_index=True)
-
-    table = result_table(results_a, results_b)
-    st.markdown("**样本明细**")
-    st.dataframe(table, use_container_width=True, hide_index=True)
-    st.download_button(
-        "下载 A/B 对比结果",
-        data=dataframe_to_excel_bytes(table),
-        file_name=f"judge_prompt_ab_single_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+    job_id = f"judge_ab_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    job_config = JudgeAbJobConfig(
+        job_id=job_id,
+        task_type=task_type,
+        prompt_a=prompt_a,
+        prompt_b=prompt_b,
+        cases_file=selected_case_path,
+        extraction_prompt_text=extraction_prompt_text,
+        extraction_prompt_version=extraction_prompt_version,
+        extraction_prompt_hash=extraction_prompt_hash,
+        eval_config=config,
     )
+    thread = threading.Thread(
+        target=run_judge_ab_job,
+        args=(job_config, run_cases),
+        daemon=True,
+        name=f"judge-ab-{job_id}",
+    )
+    thread.start()
+    ensure_judge_ab_threads()[job_id] = thread
+    st.session_state.judge_ab_job_id = job_id
+    st.success(f"已启动后台 A/B 对比任务：{job_id}")
+    st.rerun()
 
-    with st.expander("运行元信息", expanded=False):
-        st.json({
-            "case_file": result.get("case_file", ""),
-            "created_at": result.get("created_at", ""),
-            "prompt_A": result.get("stats_a", {}),
-            "prompt_B": result.get("stats_b", {}),
-        })
+
+st.divider()
+render_judge_ab_job_panel()

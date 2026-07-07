@@ -181,6 +181,26 @@ def test_prompt_advisor_mock_with_enough_evidence_does_not_call_network():
     assert "[MOCK]" in raw
 
 
+def test_prompt_advisor_reports_progress_for_background_jobs():
+    events = []
+
+    result, _raw = call_prompt_advisor(
+        EvalConfig(mock=True),
+        evidence=[{"case_id": "1"}, {"case_id": "2"}, {"case_id": "3"}],
+        current_judge_prompt="judge prompt",
+        extraction_prompt="## 规则\nextract prompt",
+        target="extraction_prompt",
+        min_evidence=3,
+        progress_callback=lambda done, total, stage, message: events.append((done, total, stage, message)),
+    )
+
+    assert result["can_suggest"] is True
+    assert events
+    assert events[0][2] == "模拟模式"
+    assert events[-1][0] == events[-1][1]
+    assert events[-1][2] == "完成"
+
+
 def test_prompt_advisor_applies_incremental_patch_and_rejects_full_rewrite(monkeypatch):
     extraction_prompt = "## 规则\n- 单次评价默认不记录。\n"
     advisor_result = {
@@ -551,6 +571,119 @@ def test_prompt_advisor_skips_append_that_duplicates_whole_prompt(monkeypatch):
     assert result["candidate_prompt_source"] == "no_valid_incremental_patch"
     skipped = result["extraction_prompt_patch_skipped_before_apply"]
     assert any("已有规则" in item.get("message", "") for item in skipped)
+
+
+def test_prompt_advisor_skips_unknown_patch_op_instead_of_appending(monkeypatch):
+    extraction_prompt = "## A4 兴趣爱好\n- 单次评价默认不记录。\n"
+    stage1 = {
+        "can_suggest": True,
+        "evidence_summary": "同一规则边界不清",
+        "diagnoses": [],
+        "patch_intents": [{
+            "intent_id": "I001",
+            "section_id": "S001",
+            "problem_type": "missing_boundary",
+            "issue_summary": "边界不清",
+            "proposed_direction": "补充通用规则",
+            "confidence": "medium",
+            "evidence_refs": ["case_1"],
+        }],
+        "risks": [],
+        "validation_plan": [],
+    }
+    stage2 = {
+        "can_suggest": True,
+        "section_id": "S001",
+        "extraction_prompt_patch": {
+            "edits": [{
+                "op": "rewrite_section",
+                "target_id": "S001",
+                "text": "- 单次影视作品评价只有明确表达长期偏好或稳定审美时才沉淀。",
+                "reason": "未知操作不应被兜底成追加",
+                "evidence_refs": ["case_1"],
+            }]
+        },
+        "section_notes": "bad op",
+    }
+    responses = [
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage1, ensure_ascii=False)}}]}),
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
+    ]
+
+    def fake_post(_url, headers, data, timeout):
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
+
+    result, _raw = call_prompt_advisor(
+        EvalConfig(judge_max_retries=1, judge_request_interval=0),
+        evidence=[{"case_id": "case_1", "comment": "漏记"}],
+        current_judge_prompt="judge",
+        extraction_prompt=extraction_prompt,
+        target="extraction_prompt",
+        min_evidence=1,
+    )
+
+    assert result["candidate_prompt_source"] == "no_valid_incremental_patch"
+    skipped = result["extraction_prompt_patch_skipped_before_apply"]
+    assert any("不支持的操作" in item.get("message", "") for item in skipped)
+    assert "单次影视作品评价" not in result.get("candidate_extraction_prompt", "")
+
+
+def test_prompt_advisor_accepts_delete_within_section(monkeypatch):
+    extraction_prompt = "## 规则\n- 保留长期稳定规则。\n- 冗余规则。\n"
+    stage1 = {
+        "can_suggest": True,
+        "evidence_summary": "有重复规则",
+        "diagnoses": [],
+        "patch_intents": [{
+            "intent_id": "I001",
+            "section_id": "S001",
+            "problem_type": "format",
+            "issue_summary": "重复规则造成歧义",
+            "proposed_direction": "删除冗余规则",
+            "confidence": "medium",
+            "evidence_refs": ["case_1"],
+        }],
+        "risks": [],
+        "validation_plan": [],
+    }
+    stage2 = {
+        "can_suggest": True,
+        "section_id": "S001",
+        "extraction_prompt_patch": {
+            "edits": [{
+                "op": "delete_within_section",
+                "target_id": "S001",
+                "old_text": "- 冗余规则。\n",
+                "reason": "删除重复项",
+                "evidence_refs": ["case_1"],
+            }]
+        },
+        "section_notes": "delete",
+    }
+    responses = [
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage1, ensure_ascii=False)}}]}),
+        _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
+    ]
+
+    def fake_post(_url, headers, data, timeout):
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
+
+    result, _raw = call_prompt_advisor(
+        EvalConfig(judge_max_retries=1, judge_request_interval=0),
+        evidence=[{"case_id": "case_1", "comment": "重复"}],
+        current_judge_prompt="judge",
+        extraction_prompt=extraction_prompt,
+        target="extraction_prompt",
+        min_evidence=1,
+    )
+
+    assert result["candidate_prompt_source"] == "applied_incremental_patch"
+    assert "冗余规则" not in result["candidate_extraction_prompt"]
+    assert len(result["extraction_prompt_patch_result"]["applied_edits"]) == 1
 
 
 def test_prompt_advisor_treats_same_decision_rule_as_duplicate():

@@ -3,7 +3,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from src.loop import closed_loop
-from src.ui import eval_job_runner, memory_extraction_job_runner
+from src.ui import eval_job_runner, judge_ab_job_runner, memory_extraction_job_runner, prompt_advisor_job_runner
 
 
 def _stale_time() -> str:
@@ -104,6 +104,67 @@ def test_memory_extraction_job_is_running_marks_stale_job_interrupted(tmp_path, 
     assert updated["stage"] == "已中断"
     assert updated["done"] == 3
     assert updated["total"] == 8
+    assert updated["finished_at"]
+
+
+def test_prompt_advisor_job_is_running_marks_stale_job_interrupted(tmp_path, monkeypatch):
+    monkeypatch.setattr(prompt_advisor_job_runner, "PROMPT_ADVISOR_JOBS_DIR", tmp_path)
+    path = tmp_path / "advisor-1" / "state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "status": "running",
+            "heartbeat_at": _stale_time(),
+            "done": 0,
+            "total": 1,
+            "config": {
+                "eval_config": {
+                    "judge_timeout": 1,
+                    "judge_max_retries": 1,
+                    "judge_qps_backoff": 1,
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    assert prompt_advisor_job_runner.prompt_advisor_job_is_running("advisor-1") is False
+
+    updated = prompt_advisor_job_runner.read_prompt_advisor_job_state("advisor-1")
+    assert updated["status"] == "interrupted"
+    assert updated["stage"] == "已中断"
+    assert updated["finished_at"]
+
+
+def test_judge_ab_job_is_running_marks_stale_job_interrupted(tmp_path, monkeypatch):
+    monkeypatch.setattr(judge_ab_job_runner, "JUDGE_AB_JOBS_DIR", tmp_path)
+    path = tmp_path / "ab-1" / "state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "status": "running",
+            "heartbeat_at": _stale_time(),
+            "done": 1,
+            "total": 4,
+            "config": {
+                "eval_config": {
+                    "judge_timeout": 1,
+                    "judge_max_retries": 1,
+                    "judge_qps_backoff": 1,
+                    "judge_request_interval": 0,
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    assert judge_ab_job_runner.judge_ab_job_is_running("ab-1") is False
+
+    updated = judge_ab_job_runner.read_judge_ab_job_state("ab-1")
+    assert updated["status"] == "interrupted"
+    assert updated["stage"] == "已中断"
+    assert updated["done"] == 1
+    assert updated["total"] == 4
     assert updated["finished_at"]
 
 

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
-import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -18,6 +16,7 @@ from src.ui.data_service import (
     eval_result_resume_key,
     load_results,
 )
+from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
 from src.ui.state_io import atomic_write_json
 
 
@@ -248,18 +247,17 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
         backoff_interval = float(config.eval_config.judge_qps_backoff or 0.0)
         if concurrency > 1 and not config.eval_config.mock:
             interval = max(interval, backoff_interval)
-        rate_lock = threading.Lock()
-        next_request_at = {"value": time.monotonic()}
+        rate_scope = api_rate_scope(
+            config.eval_config.judge_api_base_url,
+            config.eval_config.judge_api_bearer_token,
+        )
 
         def wait_for_rate_slot() -> None:
-            if interval <= 0:
-                return
-            with rate_lock:
-                now = time.monotonic()
-                wait_seconds = max(0.0, next_request_at["value"] - now)
-                next_request_at["value"] = max(now, next_request_at["value"]) + interval
-            if wait_seconds > 0:
-                time.sleep(wait_seconds)
+            wait_for_global_rate_slot(
+                rate_scope,
+                interval,
+                disabled=bool(config.eval_config.mock),
+            )
 
         if hasattr(runner.judge_client, "rate_limit_wait_callback"):
             runner.judge_client.rate_limit_wait_callback = wait_for_rate_slot
