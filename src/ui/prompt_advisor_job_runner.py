@@ -3,12 +3,23 @@ from __future__ import annotations
 import json
 import traceback
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from src.runtime_paths import DATA_DIR
 from src.schema import EvalConfig
+from src.ui.background_tasks import (
+    list_task_job_ids,
+    parse_time as _parse_time,
+    read_json_state,
+    request_stop_file,
+    stop_file_exists,
+    task_job_dir,
+    task_state_path,
+    task_stop_path,
+    utc_datetime,
+    utc_now,
+)
 from src.ui.prompt_advisor import call_prompt_advisor
 from src.ui.state_io import atomic_write_json
 
@@ -34,39 +45,20 @@ class PromptAdvisorJobConfig:
     eval_config: EvalConfig = field(default_factory=EvalConfig)
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _parse_time(value: str) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
 def job_dir(job_id: str) -> Path:
-    return PROMPT_ADVISOR_JOBS_DIR / job_id
+    return task_job_dir(PROMPT_ADVISOR_JOBS_DIR, job_id)
 
 
 def state_path(job_id: str) -> Path:
-    return job_dir(job_id) / "state.json"
+    return task_state_path(PROMPT_ADVISOR_JOBS_DIR, job_id)
 
 
 def stop_path(job_id: str) -> Path:
-    return job_dir(job_id) / "STOP"
+    return task_stop_path(PROMPT_ADVISOR_JOBS_DIR, job_id)
 
 
 def read_prompt_advisor_job_state(job_id: str) -> dict[str, Any]:
-    path = state_path(job_id)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return read_json_state(state_path(job_id))
 
 
 def write_prompt_advisor_job_state(job_id: str, state: dict[str, Any]) -> None:
@@ -75,21 +67,15 @@ def write_prompt_advisor_job_state(job_id: str, state: dict[str, Any]) -> None:
 
 
 def list_prompt_advisor_job_ids() -> list[str]:
-    if not PROMPT_ADVISOR_JOBS_DIR.exists():
-        return []
-    paths = [path for path in PROMPT_ADVISOR_JOBS_DIR.iterdir() if path.is_dir()]
-    paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    return [path.name for path in paths]
+    return list_task_job_ids(PROMPT_ADVISOR_JOBS_DIR)
 
 
 def request_prompt_advisor_stop(job_id: str) -> None:
-    path = stop_path(job_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(utc_now(), encoding="utf-8")
+    request_stop_file(stop_path(job_id))
 
 
 def prompt_advisor_stop_requested(job_id: str) -> bool:
-    return stop_path(job_id).exists()
+    return stop_file_exists(stop_path(job_id))
 
 
 def prompt_advisor_job_stale_after_seconds(state: dict[str, Any]) -> float:
@@ -108,8 +94,8 @@ def prompt_advisor_job_is_stale(state: dict[str, Any]) -> bool:
     if heartbeat is None:
         return False
     if heartbeat.tzinfo is None:
-        heartbeat = heartbeat.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - heartbeat).total_seconds() > prompt_advisor_job_stale_after_seconds(state)
+        heartbeat = heartbeat.replace(tzinfo=utc_datetime().tzinfo)
+    return (utc_datetime() - heartbeat).total_seconds() > prompt_advisor_job_stale_after_seconds(state)
 
 
 def mark_prompt_advisor_job_interrupted(job_id: str) -> dict[str, Any]:

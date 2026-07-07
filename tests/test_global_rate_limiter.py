@@ -31,3 +31,16 @@ def test_global_rate_limiter_does_not_queue_different_scope():
     wait_for_global_rate_slot(api_rate_scope("http://example/b", "token"), 0.05)
 
     assert time.monotonic() - start < 0.03
+
+
+def test_global_rate_limiter_stop_does_not_reserve_future_slot():
+    reset_global_rate_limits()
+    scope = api_rate_scope("http://example/api", "token")
+
+    wait_for_global_rate_slot(scope, 0.05)
+    wait_for_global_rate_slot(scope, 0.05, should_stop=lambda: True)
+    start = time.monotonic()
+    wait_for_global_rate_slot(scope, 0.05)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.08

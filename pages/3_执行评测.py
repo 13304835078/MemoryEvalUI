@@ -27,6 +27,7 @@ from src.ui.eval_job_runner import (
     load_job_results_from_state,
     mark_eval_job_interrupted,
     read_eval_job_state,
+    request_eval_stop,
     run_eval_job,
 )
 from src.ui.prompt_editor import (
@@ -102,8 +103,16 @@ def render_eval_job_state(job_id: str) -> None:
 
     if status == "running":
         st.info("任务仍在后台运行。切换页面后再回来，进度会从状态文件恢复。")
+        if st.button("请求终止评测任务", type="secondary", use_container_width=True, key=f"{job_id}_stop"):
+            request_eval_stop(job_id)
+            st.warning("已写入终止请求。已发出的单次 Judge 调用无法立即强制中断，会在下一个检查点停止，未开始的样本不会继续提交。")
+            st.rerun()
     elif status == "interrupted":
         st.warning("任务状态为已中断。通常是程序关闭或后台线程退出导致；可以重新开始评测，或选择已有结果文件断点续跑。")
+    elif status == "stopped":
+        st.warning("任务已按请求终止。已完成结果保留在结果文件中，可以断点续跑。")
+
+    if status in {"interrupted", "stopped"}:
         if st.button("载入该任务并从中断处继续", key=f"{job_id}_resume_interrupted", use_container_width=True):
             job_config = state.get("config") if isinstance(state.get("config"), dict) else {}
             extraction_file = find_extraction_prompt_file(
@@ -124,7 +133,7 @@ def render_eval_job_state(job_id: str) -> None:
             }
             st.rerun()
 
-    if status in {"completed", "failed", "interrupted"}:
+    if status in {"completed", "failed", "interrupted", "stopped"}:
         results = load_job_results_from_state(state)
         if results:
             st.session_state.results = results

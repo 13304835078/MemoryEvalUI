@@ -5,7 +5,6 @@ import math
 import re
 import traceback
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +23,18 @@ from src.ui.data_service import (
     prepare_cases_from_run_output,
     prepare_long_memory_cases_from_run_output,
     save_cases,
+)
+from src.ui.background_tasks import (
+    list_task_job_ids,
+    parse_time as _parse_time,
+    read_json_state,
+    request_stop_file,
+    stop_file_exists,
+    task_job_dir,
+    task_state_path,
+    task_stop_path,
+    utc_datetime,
+    utc_now,
 )
 from src.ui.state_io import atomic_write_json, state_file_lock
 
@@ -50,39 +61,20 @@ class MemoryExtractionJobConfig:
     extraction_config: MemoryExtractionConfig = field(default_factory=MemoryExtractionConfig)
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _parse_time(value: str) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
 def job_dir(job_id: str) -> Path:
-    return MEMORY_EXTRACTION_JOBS_DIR / sanitize_filename(job_id)
+    return task_job_dir(MEMORY_EXTRACTION_JOBS_DIR, job_id, sanitize=sanitize_filename)
 
 
 def state_path(job_id: str) -> Path:
-    return job_dir(job_id) / "state.json"
+    return task_state_path(MEMORY_EXTRACTION_JOBS_DIR, job_id, sanitize=sanitize_filename)
 
 
 def stop_path(job_id: str) -> Path:
-    return job_dir(job_id) / "STOP"
+    return task_stop_path(MEMORY_EXTRACTION_JOBS_DIR, job_id, sanitize=sanitize_filename)
 
 
 def read_memory_extraction_job_state(job_id: str) -> dict[str, Any]:
-    path = state_path(job_id)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return read_json_state(state_path(job_id))
 
 
 def write_memory_extraction_job_state(job_id: str, state: dict[str, Any]) -> None:
@@ -93,21 +85,15 @@ def write_memory_extraction_job_state(job_id: str, state: dict[str, Any]) -> Non
 
 
 def list_memory_extraction_job_ids() -> list[str]:
-    if not MEMORY_EXTRACTION_JOBS_DIR.exists():
-        return []
-    paths = [path for path in MEMORY_EXTRACTION_JOBS_DIR.iterdir() if path.is_dir()]
-    paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    return [path.name for path in paths]
+    return list_task_job_ids(MEMORY_EXTRACTION_JOBS_DIR)
 
 
 def request_memory_extraction_stop(job_id: str) -> None:
-    path = stop_path(job_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(utc_now(), encoding="utf-8")
+    request_stop_file(stop_path(job_id))
 
 
 def memory_extraction_stop_requested(job_id: str) -> bool:
-    return stop_path(job_id).exists()
+    return stop_file_exists(stop_path(job_id))
 
 
 def memory_extraction_job_is_running(job_id: str) -> bool:
@@ -135,8 +121,8 @@ def memory_extraction_job_is_stale(state: dict[str, Any]) -> bool:
     if heartbeat is None:
         return False
     if heartbeat.tzinfo is None:
-        heartbeat = heartbeat.replace(tzinfo=timezone.utc)
-    elapsed = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+        heartbeat = heartbeat.replace(tzinfo=utc_datetime().tzinfo)
+    elapsed = (utc_datetime() - heartbeat).total_seconds()
     return elapsed > memory_extraction_job_stale_after_seconds(state)
 
 

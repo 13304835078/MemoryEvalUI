@@ -25,7 +25,7 @@ def wait_for_global_rate_slot(
     disabled: bool = False,
     should_stop: Callable[[], bool] | None = None,
 ) -> float:
-    """Reserve the next request slot for a shared API scope.
+    """Wait until a request slot can be reserved for a shared API scope.
 
     This coordinates concurrent Streamlit background threads in the same process.
     It deliberately does not persist across process restarts.
@@ -34,20 +34,22 @@ def wait_for_global_rate_slot(
     if disabled or interval <= 0:
         return 0.0
 
-    with _LOCK:
-        now = time.monotonic()
-        next_at = _NEXT_REQUEST_AT.get(scope, now)
-        wait_seconds = max(0.0, next_at - now)
-        _NEXT_REQUEST_AT[scope] = max(now, next_at) + interval
-
-    remaining = wait_seconds
-    while remaining > 0:
+    total_waited = 0.0
+    while True:
         if should_stop is not None and should_stop():
-            break
-        sleep_seconds = min(1.0, remaining)
+            return total_waited
+
+        with _LOCK:
+            now = time.monotonic()
+            next_at = _NEXT_REQUEST_AT.get(scope, now)
+            wait_seconds = max(0.0, next_at - now)
+            if wait_seconds <= 0:
+                _NEXT_REQUEST_AT[scope] = now + interval
+                return total_waited
+
+        sleep_seconds = min(1.0, wait_seconds)
         time.sleep(sleep_seconds)
-        remaining -= sleep_seconds
-    return wait_seconds
+        total_waited += sleep_seconds
 
 
 def reset_global_rate_limits() -> None:

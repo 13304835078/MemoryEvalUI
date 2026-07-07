@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +15,18 @@ from src.ui.data_service import (
     load_results,
 )
 from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
+from src.ui.background_tasks import (
+    list_task_job_ids,
+    parse_time as _parse_time,
+    read_json_state,
+    request_stop_file,
+    stop_file_exists,
+    task_job_dir,
+    task_state_path,
+    task_stop_path,
+    utc_datetime,
+    utc_now,
+)
 from src.ui.state_io import atomic_write_json
 
 
@@ -25,6 +35,10 @@ RESUME_SKIP_ALL = "跳过所有已有结果"
 RESUME_SKIP_NON_FATAL = "只跳过非严重失败结果"
 RESUME_RERUN_ALL = "全部重跑"
 RESUME_STRATEGIES = [RESUME_SKIP_ALL, RESUME_SKIP_NON_FATAL, RESUME_RERUN_ALL]
+
+
+class EvalJobStopped(Exception):
+    pass
 
 
 @dataclass
@@ -43,35 +57,28 @@ class EvalJobConfig:
     eval_config: EvalConfig = field(default_factory=EvalConfig)
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _parse_time(value: str) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
 def job_dir(job_id: str) -> Path:
-    return EVAL_JOBS_DIR / job_id
+    return task_job_dir(EVAL_JOBS_DIR, job_id)
 
 
 def state_path(job_id: str) -> Path:
-    return job_dir(job_id) / "state.json"
+    return task_state_path(EVAL_JOBS_DIR, job_id)
+
+
+def stop_path(job_id: str) -> Path:
+    return task_stop_path(EVAL_JOBS_DIR, job_id)
+
+
+def request_eval_stop(job_id: str) -> None:
+    request_stop_file(stop_path(job_id))
+
+
+def eval_job_stop_requested(job_id: str) -> bool:
+    return stop_file_exists(stop_path(job_id))
 
 
 def read_eval_job_state(job_id: str) -> dict[str, Any]:
-    path = state_path(job_id)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return read_json_state(state_path(job_id))
 
 
 def write_eval_job_state(job_id: str, state: dict[str, Any]) -> None:
@@ -97,8 +104,8 @@ def eval_job_is_stale(state: dict[str, Any]) -> bool:
     if heartbeat is None:
         return False
     if heartbeat.tzinfo is None:
-        heartbeat = heartbeat.replace(tzinfo=timezone.utc)
-    elapsed = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+        heartbeat = heartbeat.replace(tzinfo=utc_datetime().tzinfo)
+    elapsed = (utc_datetime() - heartbeat).total_seconds()
     return elapsed > eval_job_stale_after_seconds(state)
 
 
@@ -123,11 +130,7 @@ def eval_job_is_running(job_id: str) -> bool:
 
 
 def list_eval_job_ids() -> list[str]:
-    if not EVAL_JOBS_DIR.exists():
-        return []
-    paths = [path for path in EVAL_JOBS_DIR.iterdir() if path.is_dir()]
-    paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    return [path.name for path in paths]
+    return list_task_job_ids(EVAL_JOBS_DIR)
 
 
 def _safe_config(config: EvalJobConfig) -> dict[str, Any]:
@@ -174,6 +177,8 @@ def _write_progress(
 
 def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: list[EvalResult] | None = None) -> None:
     started_at = utc_now()
+    if stop_path(config.job_id).exists():
+        stop_path(config.job_id).unlink()
     existing_results = list(existing_results or [])
     total = len(cases)
     skipped_count = 0
@@ -252,18 +257,28 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
             config.eval_config.judge_api_bearer_token,
         )
 
+        def should_stop() -> bool:
+            return eval_job_stop_requested(config.job_id)
+
         def wait_for_rate_slot() -> None:
             wait_for_global_rate_slot(
                 rate_scope,
                 interval,
                 disabled=bool(config.eval_config.mock),
+                should_stop=should_stop,
             )
+            if should_stop():
+                raise EvalJobStopped()
 
         if hasattr(runner.judge_client, "rate_limit_wait_callback"):
             runner.judge_client.rate_limit_wait_callback = wait_for_rate_slot
 
         def evaluate_task(case_index: int, case: Case) -> tuple[int, Case, EvalResult]:
+            if should_stop():
+                raise EvalJobStopped()
             wait_for_rate_slot()
+            if should_stop():
+                raise EvalJobStopped()
             return case_index, case, runner.evaluate_one(case)
 
         if tasks:
@@ -285,43 +300,89 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
         if not output_path.exists():
             results_to_jsonl(list(results_by_key.values()), str(output_path))
 
+        stopped = False
         with ThreadPoolExecutor(max_workers=min(concurrency, max(1, len(tasks)))) as executor:
-            futures = {
-                executor.submit(evaluate_task, case_index, case): (case_index, case)
-                for case_index, case in tasks
-            }
-            for future in as_completed(futures):
-                _, case = futures[future]
-                try:
-                    _, _, result = future.result()
-                except Exception as exc:
-                    result = EvalResult.from_parse_failure(
-                        case_id=case.case_id,
-                        task_type=config.task_type,
-                        raw=f"{type(exc).__name__}: {exc}",
-                        model_name=case.model_name,
-                        prompt_version=case.prompt_version,
-                        judge_model=judge_model_key,
-                        judge_prompt_version=config.judge_prompt_version,
-                        extraction_prompt_version=config.extraction_prompt_version,
-                        extraction_prompt_hash=config.extraction_prompt_hash,
+            futures: dict[Any, tuple[int, Case]] = {}
+            next_task_index = 0
+
+            def submit_next() -> None:
+                nonlocal next_task_index
+                if next_task_index >= len(tasks) or should_stop():
+                    return
+                case_index, case = tasks[next_task_index]
+                futures[executor.submit(evaluate_task, case_index, case)] = (case_index, case)
+                next_task_index += 1
+
+            for _ in range(min(concurrency, len(tasks))):
+                submit_next()
+
+            while futures:
+                done_futures, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done_futures:
+                    _, case = futures.pop(future)
+                    try:
+                        _, _, result = future.result()
+                    except EvalJobStopped:
+                        stopped = True
+                        continue
+                    except Exception as exc:
+                        result = EvalResult.from_parse_failure(
+                            case_id=case.case_id,
+                            task_type=config.task_type,
+                            raw=f"{type(exc).__name__}: {exc}",
+                            model_name=case.model_name,
+                            prompt_version=case.prompt_version,
+                            judge_model=judge_model_key,
+                            judge_prompt_version=config.judge_prompt_version,
+                            extraction_prompt_version=config.extraction_prompt_version,
+                            extraction_prompt_hash=config.extraction_prompt_hash,
+                        )
+
+                    results_by_key[eval_result_resume_key(result)] = result
+                    append_result_to_jsonl(result, str(output_path))
+                    evaluated_count += 1
+                    done = skipped_count + evaluated_count
+                    fatal_count = sum(1 for item in results_by_key.values() if item.fatal_error)
+                    _write_progress(
+                        config,
+                        done=done,
+                        total=total,
+                        skipped=skipped_count,
+                        evaluated=evaluated_count,
+                        fatal_count=fatal_count,
+                        message=f"已保存：整体 {done}/{total}，新增 {evaluated_count}/{len(tasks)}，当前样本：{case.case_id}",
+                        started_at=started_at,
                     )
 
-                results_by_key[eval_result_resume_key(result)] = result
-                append_result_to_jsonl(result, str(output_path))
-                evaluated_count += 1
-                done = skipped_count + evaluated_count
-                fatal_count = sum(1 for item in results_by_key.values() if item.fatal_error)
-                _write_progress(
-                    config,
-                    done=done,
-                    total=total,
-                    skipped=skipped_count,
-                    evaluated=evaluated_count,
-                    fatal_count=fatal_count,
-                    message=f"已保存：整体 {done}/{total}，新增 {evaluated_count}/{len(tasks)}，当前样本：{case.case_id}",
-                    started_at=started_at,
-                )
+                if stopped or should_stop():
+                    stopped = True
+                    for future in list(futures):
+                        if future.cancel():
+                            futures.pop(future, None)
+                    if not futures:
+                        break
+                    continue
+
+                while len(futures) < concurrency and next_task_index < len(tasks) and not should_stop():
+                    submit_next()
+
+        if stopped or eval_job_stop_requested(config.job_id):
+            results = list(results_by_key.values())
+            results_to_jsonl(results, str(output_path))
+            done = skipped_count + evaluated_count
+            _write_progress(
+                config,
+                status="stopped",
+                done=done,
+                total=total,
+                skipped=skipped_count,
+                evaluated=evaluated_count,
+                fatal_count=sum(1 for item in results if item.fatal_error),
+                message=f"评测已终止：已完成 {done}/{total}，新增 {evaluated_count} 条，跳过 {skipped_count} 条；可用结果文件断点续跑。",
+                started_at=started_at,
+                extra={"finished_at": utc_now()},
+            )
+            return
 
         results = list(results_by_key.values())
         results_to_jsonl(results, str(output_path))

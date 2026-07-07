@@ -22,6 +22,7 @@ from src.ui.eval_job_runner import (
     list_eval_job_ids,
     mark_eval_job_interrupted,
     read_eval_job_state,
+    request_eval_stop,
 )
 from src.ui.judge_ab_job_runner import (
     judge_ab_job_is_stale,
@@ -78,6 +79,9 @@ def _read_state(task_type: str, job_id: str) -> dict[str, Any]:
 
 
 def _request_stop(task_type: str, job_id: str) -> bool:
+    if task_type == "执行评测":
+        request_eval_stop(job_id)
+        return True
     if task_type == "记忆提取":
         request_memory_extraction_stop(job_id)
         return True
@@ -178,9 +182,7 @@ if rows:
     selected_state = _read_state(selected_type, selected_id)
     st.json(selected_state)
     if selected_state.get("status") == "running":
-        if selected_type == "执行评测":
-            st.info("执行评测暂不支持强制终止；需要停止时请等待当前任务完成，或关闭应用进程后再断点续跑。")
-        elif st.button("请求终止该任务", type="secondary", use_container_width=True):
+        if st.button("请求终止该任务", type="secondary", use_container_width=True):
             if _request_stop(selected_type, selected_id):
                 st.warning("已写入终止请求。已发出的单次 API 调用无法立即强制中断，会在下一个检查点停止。")
                 st.rerun()
