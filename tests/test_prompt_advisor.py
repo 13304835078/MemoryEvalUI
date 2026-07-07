@@ -14,35 +14,9 @@ from src.ui.prompt_advisor import (
     build_advisor_user_message,
     call_prompt_advisor,
     collect_absolute_eval_evidence,
-    collect_gsb_evidence,
     collect_review_evidence,
 )
 from src.schema import EvalResult
-
-
-def test_collect_gsb_evidence_only_uses_mismatches():
-    df = pd.DataFrame({
-        "row_number": [2, 3],
-        "pair_id": ["p1", "p2"],
-        "人工GSB": ["G", "S"],
-        "自动GSB": ["B", "S"],
-        "是否一致": [False, True],
-        "问题类型": ["事实", "格式"],
-        "备注": ["人工认为模型1更准", ""],
-        "query": ["q1", "q2"],
-        "answer": ["a1", "a2"],
-        "m1_score": [4.5, 4.0],
-        "m2_score": [4.8, 4.0],
-        "m1_judge备注": ["ok1", "ok"],
-        "m2_judge备注": ["ok2", "ok"],
-    })
-
-    evidence = collect_gsb_evidence(df)
-
-    assert len(evidence) == 1
-    assert evidence[0]["pair_id"] == "p1"
-    assert evidence[0]["human_gsb"] == "G"
-    assert evidence[0]["auto_gsb"] == "B"
 
 
 def test_collect_review_evidence_requires_human_fields():
@@ -171,22 +145,23 @@ def test_build_advisor_user_message_uses_sections_without_full_extraction_prompt
     assert payload["output_schema"]["candidate_extraction_prompt"] == ""
 
 
-def test_prompt_advisor_refuses_absolute_and_gsb_modes_separately():
+def test_prompt_advisor_rejects_unsupported_mode():
     abs_result, _ = call_prompt_advisor(
         EvalConfig(mock=True),
         evidence=[{"case_id": "1"}],
         current_judge_prompt="prompt",
         advisor_mode="absolute_eval",
     )
-    gsb_result, _ = call_prompt_advisor(
+    unsupported_result, _ = call_prompt_advisor(
         EvalConfig(mock=True),
         evidence=[{"row_id": "1"}],
         current_judge_prompt="prompt",
-        advisor_mode="gsb_alignment",
+        advisor_mode="pairwise_alignment",
     )
 
     assert "评测结果证据少于 3 条" in abs_result["evidence_summary"]
-    assert "人工证据少于 3 条" in gsb_result["evidence_summary"]
+    assert unsupported_result["can_suggest"] is False
+    assert "不支持的提示词建议模式" in unsupported_result["evidence_summary"]
 
 
 def test_prompt_advisor_mock_with_enough_evidence_does_not_call_network():

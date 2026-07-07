@@ -12,13 +12,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.schema import EVALUATABLE_TASK_TYPES, TASK_TYPE_LABELS, TaskType
 from src.ui.config_store import build_eval_config, load_config
-from src.ui.data_service import list_result_files, load_results, load_results_bytes, save_uploaded_file
+from src.ui.data_service import list_result_files, load_results, load_results_bytes
 from src.ui.prompt_advisor import (
     call_prompt_advisor,
     collect_absolute_eval_evidence,
-    collect_gsb_evidence,
-    collect_review_evidence,
-    load_prompt_advisor_table,
 )
 from src.ui.prompt_patch import apply_prompt_patch
 from src.ui.prompt_editor import (
@@ -30,18 +27,15 @@ from src.ui.prompt_editor import (
     load_prompt,
     save_prompt_version,
 )
-from src.ui.review_store import DEFAULT_REVIEW_PATH, load_reviews, reviews_to_dataframe
 
 
 st.title("提示词改进建议")
-st.caption("普通绝对评测建议和人工 GSB 对齐建议已分离；只生成候选版本，不会自动覆盖当前提示词。")
+st.caption("基于普通绝对评测结果生成受约束的裁判提示词/提取提示词候选修改，不会自动覆盖当前提示词。")
 
 if "ui_config" not in st.session_state:
     st.session_state.ui_config = load_config()
 if "absolute_advisor_result" not in st.session_state:
     st.session_state.absolute_advisor_result = None
-if "gsb_advisor_result" not in st.session_state:
-    st.session_state.gsb_advisor_result = None
 
 
 def _prompt_task_slug(task_type: str) -> str:
@@ -303,12 +297,12 @@ def render_generation_controls(key_prefix: str) -> tuple[bool, int, str]:
     return mock, int(min_evidence), target_options[target_label]
 
 
-tab_absolute, tab_gsb = st.tabs(["单模型绝对评测建议", "GSB对齐建议"])
+tab_absolute = st.container()
 
 with tab_absolute:
     st.subheader("单模型绝对评测建议")
     st.info(
-        "这个入口只分析普通“执行评测”的单模型结果，不使用 GSB。"
+        "这个入口只分析普通“执行评测”的单模型绝对评测结果。"
         "它会基于低分、错误标签、diagnostics、规则/证据/输出引用来给评测建议。"
         "注意：没有人工复核时，这些建议是待人工确认的诊断，不应直接当成正确修复。"
     )
@@ -501,163 +495,4 @@ with tab_absolute:
         st.session_state.get("absolute_advisor_raw", "") or "",
         "absolute",
         task_type=absolute_task_type,
-    )
-
-with tab_gsb:
-    st.subheader("GSB 对齐建议")
-    st.warning(
-        "这个入口只用于人工审核/GSB 闭环。它会基于人工 GSB 与自动 GSB 不一致样本，"
-        "或样本详情页保存的人工复核记录生成建议。普通单模型评测请使用左侧标签页。"
-    )
-
-    source_mode = st.radio(
-        "选择证据来源",
-        [
-            "上传人工审核评估结果表",
-            "加载普通评测人工复核记录",
-            "加载已有结果文件（需要合并人工复核记录）",
-        ],
-        key="gsb_source_mode",
-    )
-
-    df = pd.DataFrame()
-    if source_mode == "上传人工审核评估结果表":
-        uploaded = st.file_uploader("上传人工审核评估结果（Excel/CSV/JSONL）", type=["xlsx", "xls", "csv", "jsonl"], key="gsb_upload")
-        local_path = st.text_input("或输入本地结果文件路径", value="", placeholder=r"C:\Users\...\human_review_eval.xlsx", key="gsb_local_path")
-        if uploaded is not None or local_path.strip():
-            try:
-                if uploaded is not None:
-                    path = save_uploaded_file(uploaded, suffix=Path(uploaded.name).suffix)
-                else:
-                    path = local_path.strip().strip('"')
-                df = load_prompt_advisor_table(path)
-                st.success(f"已加载 {len(df)} 行：{path}")
-            except Exception as e:
-                st.error(f"加载失败：{e}")
-    elif source_mode == "加载普通评测人工复核记录":
-        reviews = load_reviews(DEFAULT_REVIEW_PATH)
-        df = reviews_to_dataframe(reviews)
-        if df.empty:
-            st.info(f"暂无人工复核记录：{DEFAULT_REVIEW_PATH}")
-        else:
-            st.success(f"已加载 {len(df)} 条人工复核记录：{DEFAULT_REVIEW_PATH}")
-    else:
-        result_files = list_result_files()
-        if result_files:
-            labels = [Path(f).name for f in result_files]
-            selected = st.selectbox("选择结果文件", labels, key="gsb_result_reference")
-            st.info(f"结果文件仅用于记录来源：{selected}；实际证据来自 data/results/human_reviews.jsonl。")
-            reviews = load_reviews(DEFAULT_REVIEW_PATH)
-            df = reviews_to_dataframe(reviews)
-            if df.empty:
-                st.warning("没有人工复核记录，无法生成建议。")
-            else:
-                st.success(f"已加载 {len(df)} 条人工复核记录。")
-        else:
-            st.info("data/results 下暂无结果文件。")
-
-    evidence_kind = st.selectbox(
-        "证据类型",
-        ["自动识别", "人工 GSB 不一致", "普通评测人工复核"],
-        help="上传人工审核评估结果时通常选“人工 GSB 不一致”；样本详情页保存的人工复核记录选“普通评测人工复核”。",
-        key="gsb_evidence_kind",
-    )
-    max_items_gsb = st.number_input("最多使用证据条数", min_value=3, max_value=100, value=30, step=1, key="gsb_max_items")
-
-    gsb_evidence = []
-    gsb_evidence_count = 0
-    review_evidence_count = 0
-    if not df.empty:
-        gsb_evidence_count = len(collect_gsb_evidence(df, max_items=100000))
-        review_evidence_count = len(collect_review_evidence(df, max_items=100000))
-        if evidence_kind in {"自动识别", "人工 GSB 不一致"}:
-            gsb_evidence = collect_gsb_evidence(df, max_items=int(max_items_gsb))
-        if not gsb_evidence and evidence_kind in {"自动识别", "普通评测人工复核"}:
-            gsb_evidence = collect_review_evidence(df, max_items=int(max_items_gsb))
-
-    if not df.empty:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("已加载行数", len(df))
-        c2.metric("GSB不一致证据", gsb_evidence_count)
-        c3.metric("人工复核证据", review_evidence_count)
-
-    st.caption(f"当前会用于生成建议的 GSB/人工复核证据：{len(gsb_evidence)} 条")
-    if gsb_evidence:
-        evidence_columns = {
-            "case_id": "样本编号",
-            "row_id": "行编号",
-            "issue_type": "问题类型",
-            "human_gsb": "人工GSB",
-            "auto_gsb": "自动GSB",
-            "review_decision": "复核结论",
-            "review_note": "复核备注",
-            "query": "用户问题",
-            "answer": "助手回答",
-        }
-        st.dataframe(pd.DataFrame(gsb_evidence).head(30).rename(columns=evidence_columns), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.subheader("当前提示词")
-    gsb_judge_prompt, gsb_extraction_prompt = load_prompt_selectors(
-        "gsb",
-        default_judge_prompt="judge_user_md_human_aligned_v1.md",
-        task_type=TaskType.USER_MD.value,
-    )
-    gsb_mock, gsb_min_evidence, gsb_target = render_generation_controls("gsb")
-
-    if st.button("生成 GSB 对齐建议", type="primary", use_container_width=True, key="gsb_generate"):
-        if len(gsb_evidence) < gsb_min_evidence:
-            st.error(
-                f"人工证据少于 {gsb_min_evidence} 条，拒绝生成候选提示词。"
-                "这里需要人工 GSB 与自动 GSB 不一致样本，或样本详情页保存的人工复核记录。"
-            )
-            st.stop()
-
-        if gsb_mock:
-            result = {
-                "can_suggest": True,
-                "evidence_summary": f"Mock：已收集 {len(gsb_evidence)} 条 GSB/人工复核证据。",
-                "diagnoses": [
-                    {
-                        "problem": "示例：裁判模型对某类错误的扣分力度可能与人工不一致。",
-                        "evidence_refs": [str(gsb_evidence[0].get("row_id") or gsb_evidence[0].get("case_id"))],
-                        "problem_type": "judge_prompt_issue",
-                        "why_it_matters": "会影响人工 GSB 对齐。",
-                        "confidence": "low",
-                    }
-                ],
-                "judge_prompt_changes": [],
-                "candidate_judge_prompt": gsb_judge_prompt if gsb_target != "analysis_only" else "",
-                "extraction_prompt_notes": "模拟模式不生成真实建议。",
-                "candidate_extraction_prompt": "",
-                "risks": ["Mock 结果不能用于真实调参。"],
-                "validation_plan": ["用留出集重新跑 GSB 一致率。"],
-            }
-            raw = ""
-        else:
-            cfg = dict(st.session_state.ui_config)
-            config = build_eval_config(cfg, mock=False)
-            errs = config.validate()
-            if errs:
-                st.error("配置错误：\n" + "\n".join([f"- {e}" for e in errs]))
-                st.stop()
-            with st.spinner("正在生成 GSB 对齐建议..."):
-                result, raw = call_prompt_advisor(
-                    config,
-                    evidence=gsb_evidence,
-                    current_judge_prompt=gsb_judge_prompt,
-                    extraction_prompt=gsb_extraction_prompt,
-                    target=gsb_target,
-                    advisor_mode="gsb_alignment",
-                    min_evidence=gsb_min_evidence,
-                )
-
-        st.session_state.gsb_advisor_result = result
-        st.session_state.gsb_advisor_raw = raw
-
-    render_advisor_result(
-        st.session_state.get("gsb_advisor_result"),
-        st.session_state.get("gsb_advisor_raw", "") or "",
-        "gsb",
-        task_type=TaskType.USER_MD.value,
     )

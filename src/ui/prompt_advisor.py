@@ -5,7 +5,6 @@ import hashlib
 import json
 import re
 import time
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -18,7 +17,6 @@ from src.ui.prompt_advisor_prompts import (
     ABSOLUTE_ADVISOR_SYSTEM_PROMPT,
     EXTRACTION_INTENT_SYSTEM_PROMPT,
     EXTRACTION_PATCH_SYSTEM_PROMPT,
-    GSB_ADVISOR_SYSTEM_PROMPT,
 )
 from src.ui.prompt_patch import PromptSection, apply_prompt_patch, prompt_sections_for_model, split_prompt_sections
 
@@ -36,59 +34,6 @@ ADVISOR_STAGE2_MAX_TOKENS = 1000
 ADVISOR_SECTION_BLOCK_CHARS = 2400
 ADVISOR_SECTION_BLOCK_PREVIEW_CHARS = 180
 ADVISOR_MAX_EDITABLE_BLOCKS = 2
-
-
-def load_prompt_advisor_table(path: str | Path) -> pd.DataFrame:
-    path = Path(path)
-    suffix = path.suffix.lower()
-    if suffix in {".xlsx", ".xls"}:
-        return pd.read_excel(path).fillna("")
-    if suffix == ".csv":
-        return pd.read_csv(path).fillna("")
-    if suffix == ".jsonl":
-        rows = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
-        return pd.DataFrame(rows).fillna("")
-    raise ValueError(f"不支持的文件格式：{suffix}")
-
-
-def collect_gsb_evidence(df: pd.DataFrame, max_items: int = 30) -> list[dict[str, Any]]:
-    required = {"人工GSB", "自动GSB"}
-    if not required.issubset(set(df.columns)):
-        return []
-
-    rows = []
-    for idx, row in df.iterrows():
-        human = _clean(row.get("人工GSB"))
-        auto = _clean(row.get("自动GSB"))
-        if not human or not auto:
-            continue
-        agree = _parse_bool(row.get("是否一致"))
-        if agree is True:
-            continue
-        rows.append({
-            "row_id": _clean(row.get("row_number")) or str(idx + 2),
-            "pair_id": _clean(row.get("pair_id")),
-            "issue_type": _clean(row.get("问题类型")),
-            "human_gsb": human,
-            "auto_gsb": auto,
-            "score_diff": _clean(row.get("score_diff_model1_minus_model2")),
-            "model1_score": _first_existing(row, "_score", prefer_first=True),
-            "model2_score": _first_existing(row, "_score", prefer_first=False),
-            "model1_judge_comment": _first_existing(row, "_judge备注", prefer_first=True),
-            "model2_judge_comment": _first_existing(row, "_judge备注", prefer_first=False),
-            "auto_reason": _clean(row.get("自动判断备注")),
-            "human_remark": _clean(row.get("备注")),
-            "query": _truncate(row.get("query"), 800),
-            "answer": _truncate(row.get("answer"), 800),
-        })
-        if len(rows) >= max_items:
-            break
-    return rows
 
 
 def collect_review_evidence(df: pd.DataFrame, max_items: int = 30) -> list[dict[str, Any]]:
@@ -196,14 +141,9 @@ def build_advisor_user_message(
         extraction_note = extraction_prompt.strip()[:extraction_prompt_limit]
     else:
         extraction_note = "（为降低请求体积，未发送提取 prompt 全文；请只依据 extraction_prompt_sections 的 section_id/title/preview 生成增量 patch。）"
-    if advisor_mode == "gsb_alignment":
-        task = "根据人工 GSB/人工复核证据诊断 prompt 问题并给出受约束的候选修改"
-        evidence_name = "human_gsb_or_review_evidence"
-        warning = "这些证据来自人工标注或人工复核，可用于对齐人工口径，但仍要避免过拟合少量样本。"
-    else:
-        task = "根据单模型绝对评测结果诊断评测链路并给出受约束的改进建议"
-        evidence_name = "absolute_eval_result_evidence"
-        warning = "这些证据来自 Judge 结果，不是人工真值；候选 prompt 必须标注为待人工确认，不能直接视为正确修复。"
+    task = "根据单模型绝对评测结果诊断评测链路并给出受约束的改进建议"
+    evidence_name = "absolute_eval_result_evidence"
+    warning = "这些证据来自 Judge 结果，不是人工真值；候选 prompt 必须标注为待人工确认，不能直接视为正确修复。"
     weak_context_count = sum(1 for item in evidence if item.get("evidence_mode") == "weak_context_from_result")
     loop_constraints = []
     if advisor_mode == "absolute_eval" and target == "extraction_prompt":
@@ -1783,13 +1723,23 @@ def call_prompt_advisor(
     advisor_mode: str = "absolute_eval",
     min_evidence: int = 3,
 ) -> tuple[dict[str, Any] | None, str]:
+    if advisor_mode != "absolute_eval":
+        return {
+            "can_suggest": False,
+            "evidence_summary": f"不支持的提示词建议模式：{advisor_mode}",
+            "diagnoses": [],
+            "judge_prompt_changes": [],
+            "candidate_judge_prompt": "",
+            "extraction_prompt_notes": "",
+            "candidate_extraction_prompt": "",
+            "risks": ["该版本只保留单模型绝对评测建议。"],
+            "validation_plan": ["请使用普通执行评测结果生成建议。"],
+            "evidence_usage": _evidence_usage(len(evidence), 0),
+        }, ""
+
     if len(evidence) < min_evidence:
-        if advisor_mode == "gsb_alignment":
-            summary = f"人工证据少于 {min_evidence} 条，拒绝生成候选 prompt，避免模型凭空调参。"
-            plan = [f"至少收集 {min_evidence} 条有人工标签且自动结果不一致/人工复核指出问题的样本。"]
-        else:
-            summary = f"评测结果证据少于 {min_evidence} 条，拒绝生成候选 prompt，避免根据个例过拟合。"
-            plan = [f"至少收集 {min_evidence} 条低分、带错误标签、带 diagnostics 或 fatal 的普通评测结果。"]
+        summary = f"评测结果证据少于 {min_evidence} 条，拒绝生成候选 prompt，避免根据个例过拟合。"
+        plan = [f"至少收集 {min_evidence} 条低分、带错误标签、带 diagnostics 或 fatal 的普通评测结果。"]
         return {
             "can_suggest": False,
             "evidence_summary": summary,
@@ -1838,7 +1788,7 @@ def call_prompt_advisor(
         return mock_result, json.dumps(mock_result, ensure_ascii=False)
 
     url = RealJudgeClient._normalize_chat_completions_url(config.judge_api_base_url)
-    system_prompt = GSB_ADVISOR_SYSTEM_PROMPT if advisor_mode == "gsb_alignment" else ABSOLUTE_ADVISOR_SYSTEM_PROMPT
+    system_prompt = ABSOLUTE_ADVISOR_SYSTEM_PROMPT
     client = RealJudgeClient(config)
     headers = client._build_headers()
     if target in {"extraction_prompt", "both"} and extraction_prompt.strip():
@@ -2003,22 +1953,3 @@ def _clean(value: Any) -> str:
 def _truncate(value: Any, max_len: int) -> str:
     text = _clean(value)
     return text[:max_len] + ("..." if len(text) > max_len else "")
-
-
-def _parse_bool(value: Any) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    text = _clean(value).lower()
-    if text in {"true", "1", "yes", "y", "是"}:
-        return True
-    if text in {"false", "0", "no", "n", "否"}:
-        return False
-    return None
-
-
-def _first_existing(row: pd.Series, suffix: str, prefer_first: bool) -> str:
-    cols = [c for c in row.index if str(c).endswith(suffix)]
-    if not cols:
-        return ""
-    col = cols[0] if prefer_first else cols[-1]
-    return _clean(row.get(col))
