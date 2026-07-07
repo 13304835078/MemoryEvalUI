@@ -11,6 +11,14 @@ from src.eval.metrics import DIM_LABELS, TAG_LABELS
 from src.ui.rule_ref_validation import rule_ref_validation_rows, validate_result_rule_refs
 
 
+def render_state_file_notice(state: dict | None) -> None:
+    if not isinstance(state, dict) or not state.get("_state_error"):
+        return
+    st.error(state.get("message") or f"状态文件损坏：{state.get('_state_error')}")
+    if state.get("_state_corrupt_path"):
+        st.caption(f"损坏文件备份：{state.get('_state_corrupt_path')}")
+
+
 def make_text_diff(old: str | None, new: str | None) -> str:
     old_lines = (old or "").splitlines()
     new_lines = (new or "").splitlines()

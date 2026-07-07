@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -162,10 +163,20 @@ class LLMChatClient:
         self.url = normalize_chat_completions_url(api_base)
         self.headers = build_headers(api_token)
         self.timeout = timeout
-        self.session = session or requests.Session()
+        self._provided_session = session
+        self._thread_local = threading.local()
+
+    def _session(self) -> requests.Session:
+        if self._provided_session is not None:
+            return self._provided_session
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._thread_local.session = session
+        return session
 
     def post_json(self, payload: dict[str, Any], *, stream: bool = False) -> ChatCompletionData:
-        response = self.session.post(
+        response = self._session().post(
             self.url,
             headers=self.headers,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

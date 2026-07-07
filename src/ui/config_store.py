@@ -7,6 +7,7 @@ from typing import Any
 
 from src.schema import EvalConfig
 from src.runtime_paths import APP_HOME, CONFIG_DIR, ensure_writable_layout
+from src.persistence import atomic_write_text, backup_corrupt_file
 
 
 PROJECT_ROOT = APP_HOME
@@ -67,11 +68,18 @@ def load_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            if isinstance(loaded, dict):
-                config.update(loaded)
-        except Exception:
-            # 配置坏了时不阻塞 UI 启动
-            pass
+            if not isinstance(loaded, dict):
+                raise ValueError("配置文件 JSON 顶层不是 object")
+            config.update(loaded)
+        except Exception as exc:
+            backup_path = ""
+            try:
+                backup = backup_corrupt_file(path)
+                backup_path = str(backup) if backup else ""
+            except Exception as backup_exc:
+                backup_path = f"备份失败：{type(backup_exc).__name__}: {backup_exc}"
+            config["_config_error"] = f"配置文件损坏，已使用默认配置：{type(exc).__name__}: {exc}"
+            config["_config_corrupt_path"] = backup_path
 
     # 环境变量兜底，UI 输入优先级仍然更高
     config["api_base"] = config.get("api_base") or os.environ.get("EVAL_API_BASE_URL", "")
@@ -88,8 +96,9 @@ def save_config(config: dict[str, Any], path: str | Path = CONFIG_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     safe_config = dict(config)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(safe_config, f, ensure_ascii=False, indent=2)
+    safe_config.pop("_config_error", None)
+    safe_config.pop("_config_corrupt_path", None)
+    atomic_write_text(path, json.dumps(safe_config, ensure_ascii=False, indent=2))
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:

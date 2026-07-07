@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from src.persistence import atomic_write_text, backup_corrupt_file
+
 
 def utc_now() -> str:
     return utc_datetime().isoformat()
@@ -43,8 +45,40 @@ def read_json_state(path: str | Path) -> dict[str, Any]:
     try:
         value = json.loads(state_path.read_text(encoding="utf-8"))
     except Exception:
-        return {}
-    return value if isinstance(value, dict) else {}
+        return _mark_corrupt_state(state_path, "状态文件不是合法 JSON")
+    if not isinstance(value, dict):
+        return _mark_corrupt_state(state_path, "状态文件 JSON 顶层不是 object")
+    return value
+
+
+def _mark_corrupt_state(path: Path, message: str) -> dict[str, Any]:
+    try:
+        backup = backup_corrupt_file(path)
+    except Exception as exc:
+        return {
+            "job_id": path.parent.name,
+            "status": "corrupt",
+            "stage": "状态文件损坏",
+            "message": f"{message}；备份失败：{type(exc).__name__}: {exc}",
+            "_state_error": message,
+            "_state_path": str(path),
+        }
+    state = {
+        "job_id": path.parent.name,
+        "status": "corrupt",
+        "stage": "状态文件损坏",
+        "message": f"{message}；已备份到 {backup}",
+        "updated_at": utc_now(),
+        "heartbeat_at": utc_now(),
+        "_state_error": message,
+        "_state_path": str(path),
+        "_state_corrupt_path": str(backup) if backup else "",
+    }
+    try:
+        atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+    return state
 
 
 def list_task_job_ids(base_dir: str | Path) -> list[str]:
@@ -59,7 +93,7 @@ def list_task_job_ids(base_dir: str | Path) -> list[str]:
 def request_stop_file(path: str | Path) -> None:
     stop_file = Path(path)
     stop_file.parent.mkdir(parents=True, exist_ok=True)
-    stop_file.write_text(utc_now(), encoding="utf-8")
+    atomic_write_text(stop_file, utc_now())
 
 
 def stop_file_exists(path: str | Path) -> bool:

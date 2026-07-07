@@ -1,8 +1,10 @@
 import json
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from src.loop import closed_loop
+from src.ui.background_tasks import read_json_state
 from src.ui import eval_job_runner, judge_ab_job_runner, memory_extraction_job_runner, prompt_advisor_job_runner
 
 
@@ -40,6 +42,24 @@ def test_eval_job_is_running_marks_stale_job_interrupted(tmp_path, monkeypatch):
     assert updated["total"] == 5
     assert updated["finished_at"]
     assert updated["heartbeat_at"]
+
+
+def test_read_json_state_marks_corrupt_file_and_keeps_backup(tmp_path):
+    path = tmp_path / "job-1" / "state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{bad json", encoding="utf-8")
+
+    state = read_json_state(path)
+
+    assert state["status"] == "corrupt"
+    assert state["_state_error"]
+    backup_path = state["_state_corrupt_path"]
+    assert backup_path
+    assert Path(backup_path).read_text(encoding="utf-8") == "{bad json"
+
+    restored = read_json_state(path)
+    assert restored["status"] == "corrupt"
+    assert restored["_state_corrupt_path"] == backup_path
 
 
 def test_loop_is_running_marks_stale_loop_interrupted(tmp_path, monkeypatch):

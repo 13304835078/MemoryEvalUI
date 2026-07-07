@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import pytest
 
 from src.llm_api import (
@@ -91,6 +92,32 @@ def test_llm_chat_client_posts_json_with_shared_session():
     assert kwargs["headers"]["Authorization"] == "Bearer token"
     assert kwargs["timeout"] == 7
     assert json.loads(kwargs["data"].decode("utf-8"))["model"] == "m"
+
+
+def test_llm_chat_client_uses_thread_local_sessions_by_default(monkeypatch):
+    created_sessions = []
+    lock = threading.Lock()
+
+    class RecordingSession(_Session):
+        def __init__(self):
+            super().__init__(_Response({"choices": [{"message": {"content": "ok"}}]}))
+            with lock:
+                created_sessions.append(self)
+
+    monkeypatch.setattr("src.llm_api.requests.Session", RecordingSession)
+    client = LLMChatClient("http://example.com/v1", "token")
+
+    def post_once():
+        client.post_json({"model": "m", "messages": []})
+
+    threads = [threading.Thread(target=post_once) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(created_sessions) == 3
+    assert all(len(session.calls) == 1 for session in created_sessions)
 
 
 def test_llm_chat_client_raises_api_error():

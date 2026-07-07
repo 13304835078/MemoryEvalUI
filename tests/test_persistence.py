@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from src.persistence import append_jsonl_rows, atomic_write_jsonl, atomic_write_text, read_jsonl
+from src.persistence import append_jsonl_rows, atomic_write_bytes, atomic_write_jsonl, atomic_write_text, read_jsonl
 from src.schema import EvalResult, append_result_to_jsonl, results_from_jsonl, results_to_jsonl
 
 
@@ -50,6 +50,22 @@ def test_atomic_write_preserves_old_file_when_replace_fails(tmp_path: Path, monk
         atomic_write_text(path, "new", retries=1)
 
     assert path.read_text(encoding="utf-8") == "old"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_atomic_write_bytes_preserves_old_file_when_replace_fails(tmp_path: Path, monkeypatch):
+    path = tmp_path / "report.xlsx"
+    path.write_bytes(b"old")
+
+    def fail_replace(self, target):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    with pytest.raises(PermissionError):
+        atomic_write_bytes(path, b"new", retries=1)
+
+    assert path.read_bytes() == b"old"
     assert not list(tmp_path.glob("*.tmp"))
 
 

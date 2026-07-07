@@ -4,7 +4,7 @@ import json
 import os
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -60,6 +60,60 @@ def atomic_write_text(
                     tmp.unlink()
                 except OSError:
                     pass
+
+
+def atomic_write_bytes(
+    path: str | Path,
+    data: bytes,
+    *,
+    retries: int = 8,
+) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock = file_lock(target)
+
+    with lock:
+        tmp = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            last_error: PermissionError | None = None
+            for attempt in range(max(1, retries)):
+                try:
+                    tmp.replace(target)
+                    return
+                except PermissionError as exc:
+                    last_error = exc
+                    time.sleep(min(0.5, 0.05 * (attempt + 1)))
+            if last_error is not None:
+                raise last_error
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+
+def backup_corrupt_file(path: str | Path, *, suffix: str = "corrupt") -> Path | None:
+    target = Path(path)
+    if not target.exists():
+        return None
+    lock = file_lock(target)
+    with lock:
+        if not target.exists():
+            return None
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        backup = target.with_name(f"{target.name}.{suffix}.{timestamp}")
+        counter = 1
+        while backup.exists():
+            backup = target.with_name(f"{target.name}.{suffix}.{timestamp}.{counter}")
+            counter += 1
+        target.replace(backup)
+        return backup
 
 
 def atomic_write_jsonl(path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
