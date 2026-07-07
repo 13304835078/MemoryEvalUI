@@ -26,6 +26,7 @@ from src.loop import (
 from src.loop.progress import compute_closed_loop_progress
 from src.schema import TASK_TYPE_LABELS, TaskType
 from src.ui.config_store import build_eval_config, load_config
+from src.ui.components import render_state_file_notice
 from src.ui.data_service import save_uploaded_file
 from src.ui.prompt_editor import (
     get_default_extraction_prompt_file,
@@ -240,6 +241,7 @@ def render_state(run_id: str) -> None:
     if not state:
         st.info("暂无这个运行编号的状态。")
         return
+    render_state_file_notice(state)
 
     status = state.get("status", "")
     stage = state.get("stage", "")
@@ -385,7 +387,7 @@ def render_state(run_id: str) -> None:
             "enable_thinking": eval_config.get("judge_enable_thinking"),
             "评测并发": eval_config.get("judge_concurrency"),
             "评测请求间隔": eval_config.get("judge_request_interval"),
-            "最大重试": eval_config.get("judge_max_retries"),
+            "评测最大尝试（含首次）": eval_config.get("judge_max_retries"),
         })
 
     events = state.get("events") or []
@@ -572,7 +574,7 @@ advisor_api_token = cfg.get("advisor_api_token", "") or eval_api_token
 extraction_max_tokens = 50000
 extraction_timeout = int(cfg.get("judge_timeout", 120) or 120)
 extraction_request_interval = float(cfg.get("judge_request_interval", 10.0) or 10.0)
-extraction_max_retries = max(0, int(cfg.get("judge_max_retries", 3) or 3) - 1)
+extraction_max_attempts = max(1, int(cfg.get("judge_max_retries", 3) or 3))
 extraction_retry_sleep = float(cfg.get("judge_qps_backoff", 15.0) or 15.0)
 extraction_concurrency = min(100, max(1, int(cfg.get("judge_concurrency", 1) or 1)))
 extraction_send_enable_thinking = True
@@ -628,13 +630,13 @@ with st.expander("高级运行参数", expanded=False):
         extraction_timeout = st.number_input("提取超时秒数", min_value=10, max_value=600, value=extraction_timeout, step=10)
     with c2:
         extraction_request_interval = st.number_input("提取请求间隔", min_value=0.0, max_value=300.0, value=extraction_request_interval, step=0.5)
-        extraction_max_retries = st.number_input(
-            "提取失败重试次数",
-            min_value=0,
-            max_value=10,
-            value=extraction_max_retries,
+        extraction_max_attempts = st.number_input(
+            "提取最大尝试次数（含首次）",
+            min_value=1,
+            max_value=11,
+            value=extraction_max_attempts,
             step=1,
-            help="这里表示失败后额外重试几次；总尝试次数=1+失败重试次数。",
+            help="例如设置为 3 表示最多请求 3 次：首次 1 次，失败后最多再尝试 2 次。",
         )
         extraction_retry_sleep = st.number_input("提取重试等待", min_value=0.0, max_value=300.0, value=extraction_retry_sleep, step=1.0)
     with c3:
@@ -660,7 +662,7 @@ with st.expander("高级运行参数", expanded=False):
             "提示词改进接口": advisor_api_base,
             "评测并发": min(100, max(1, int(cfg.get("judge_concurrency", 1) or 1))),
             "评测请求间隔": cfg.get("judge_request_interval", 0),
-            "评测最大重试": cfg.get("judge_max_retries", 3),
+            "评测最大尝试（含首次）": cfg.get("judge_max_retries", 3),
             "评测限流等待": cfg.get("judge_qps_backoff", 12),
             "温度": cfg.get("judge_temperature", 0),
             "top_p": cfg.get("judge_top_p", 1.0),
@@ -730,7 +732,7 @@ with st.container(border=True):
             extraction_prompt_version=extraction_prompt_version,
             extraction_max_tokens=int(extraction_max_tokens),
             extraction_request_interval=float(extraction_request_interval),
-            extraction_max_retries=int(extraction_max_retries),
+            extraction_max_retries=max(0, int(extraction_max_attempts) - 1),
             extraction_retry_sleep=float(extraction_retry_sleep),
             extraction_timeout=int(extraction_timeout),
             extraction_concurrency=int(extraction_concurrency),

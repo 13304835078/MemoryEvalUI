@@ -29,6 +29,7 @@ from src.ui.data_service import dataframe_to_excel_bytes
 from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
 from src.ui.prompt_editor import infer_prompt_version
 from src.ui.state_io import atomic_write_json
+from src.persistence import atomic_write_bytes
 
 
 JUDGE_AB_JOBS_DIR = DATA_DIR / "judge_ab_jobs"
@@ -144,6 +145,7 @@ def _safe_config(config: JudgeAbJobConfig) -> dict[str, Any]:
     eval_config = value.get("eval_config")
     if isinstance(eval_config, dict):
         eval_config.pop("judge_api_bearer_token", None)
+        eval_config["judge_max_attempts"] = int(eval_config.get("judge_max_retries") or 1)
     return value
 
 
@@ -412,7 +414,7 @@ def run_judge_ab_job(config: JudgeAbJobConfig, cases: list[Case]) -> None:
         )
         results_to_jsonl(results_b, str(results_b_path(config.job_id)))
         table = result_table(results_a, results_b)
-        table_path(config.job_id).write_bytes(dataframe_to_excel_bytes(table))
+        atomic_write_bytes(table_path(config.job_id), dataframe_to_excel_bytes(table))
         summary_a = summarize_results(results_a)
         summary_b = summarize_results(results_b)
         if stats_b.get("stopped") or judge_ab_stop_requested(config.job_id):

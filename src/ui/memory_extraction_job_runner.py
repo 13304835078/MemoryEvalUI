@@ -147,6 +147,7 @@ def _safe_config(config: MemoryExtractionJobConfig) -> dict[str, Any]:
     extraction_config = value.get("extraction_config")
     if isinstance(extraction_config, dict):
         extraction_config.pop("api_token", None)
+        extraction_config["max_attempts"] = int(extraction_config.get("max_retries") or 0) + 1
     return value
 
 

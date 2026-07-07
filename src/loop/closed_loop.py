@@ -16,6 +16,7 @@ from src.extraction.memory_extractor import (
     sanitize_filename,
 )
 from src.runtime_paths import APP_HOME, DATA_DIR
+from src.persistence import atomic_write_text
 from src.schema import EvalConfig, EvalResult, TaskType, append_result_to_jsonl, results_to_jsonl
 from src.ui.data_service import (
     prepare_cases_from_run_output,
@@ -113,7 +114,7 @@ def write_loop_state(run_id: str, state: dict[str, Any]) -> None:
 def request_stop(run_id: str) -> None:
     path = stop_path(run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(utc_now(), encoding="utf-8")
+    atomic_write_text(path, utc_now())
 
 
 def stop_requested(run_id: str) -> bool:
@@ -196,6 +197,10 @@ def _make_initial_state(config: ClosedLoopConfig) -> dict[str, Any]:
     safe_config.pop("judge_prompt_text", None)
     if isinstance(safe_config.get("eval_config"), dict):
         safe_config["eval_config"].pop("judge_api_bearer_token", None)
+        safe_config["eval_config"]["judge_max_attempts"] = int(
+            safe_config["eval_config"].get("judge_max_retries") or 1
+        )
+    safe_config["extraction_max_attempts"] = int(safe_config.get("extraction_max_retries") or 0) + 1
     return {
         "run_id": config.run_id,
         "status": "running",
@@ -554,7 +559,7 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
             candidate_prompt = str((advisor_result or {}).get("candidate_extraction_prompt") or "").strip()
             candidate_prompt_source = str((advisor_result or {}).get("candidate_prompt_source") or "")
             advisor_path = round_dir / f"advisor_round_{round_index:02d}.json"
-            advisor_path.write_text(json.dumps({
+            atomic_write_text(advisor_path, json.dumps({
                 "result": advisor_result,
                 "raw": raw,
             }, ensure_ascii=False, indent=2), encoding="utf-8")

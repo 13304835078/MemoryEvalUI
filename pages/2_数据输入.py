@@ -224,13 +224,13 @@ elif mode == "运行 USER.md 记忆提取":
             step=0.5,
             key="memory_extract_interval",
         )
-        max_retries = st.number_input(
-            "失败重试次数",
-            min_value=0,
-            max_value=10,
-            value=max(0, int(cfg.get("judge_max_retries", 3) or 3) - 1),
+        max_attempts = st.number_input(
+            "最大尝试次数（含首次）",
+            min_value=1,
+            max_value=11,
+            value=max(1, int(cfg.get("judge_max_retries", 3) or 3)),
             step=1,
-            help="这里表示失败后额外重试几次；总尝试次数=1+失败重试次数。",
+            help="例如设置为 3 表示最多请求 3 次：首次 1 次，失败后最多再尝试 2 次。",
             key="memory_extract_retries",
         )
         retry_sleep = st.number_input(
@@ -308,7 +308,7 @@ elif mode == "运行 USER.md 记忆提取":
                 model=extract_model,
                 max_tokens=int(max_tokens),
                 request_interval=float(request_interval),
-                max_retries=int(max_retries),
+                max_retries=max(0, int(max_attempts) - 1),
                 retry_sleep=float(retry_sleep),
                 enable_thinking=bool(enable_thinking),
                 timeout=int(timeout),

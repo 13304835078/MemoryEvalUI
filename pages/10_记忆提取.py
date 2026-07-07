@@ -19,6 +19,7 @@ from src.extraction.memory_extractor import (
 )
 from src.schema import TASK_TYPE_LABELS, TaskType
 from src.ui.config_store import build_eval_config, load_config
+from src.ui.components import render_state_file_notice
 from src.ui.data_service import (
     save_uploaded_file,
 )
@@ -251,6 +252,7 @@ def render_memory_extraction_job_state(job_id: str) -> None:
     if not state:
         st.info("暂无这个记忆提取任务的状态。")
         return
+    render_state_file_notice(state)
 
     status = str(state.get("status") or "")
     done = int(state.get("done", 0) or 0)
@@ -441,13 +443,13 @@ with st.container(border=True):
             value=float(cfg.get("judge_request_interval", 10.0) or 10.0),
             step=0.5,
         )
-        max_retries = st.number_input(
-            "失败重试次数",
-            min_value=0,
-            max_value=10,
-            value=max(0, int(cfg.get("judge_max_retries", 3) or 3) - 1),
+        max_attempts = st.number_input(
+            "最大尝试次数（含首次）",
+            min_value=1,
+            max_value=11,
+            value=max(1, int(cfg.get("judge_max_retries", 3) or 3)),
             step=1,
-            help="这里表示失败后额外重试几次；总尝试次数 = 1 + 失败重试次数。",
+            help="例如设置为 3 表示最多请求 3 次：首次 1 次，失败后最多再尝试 2 次。",
         )
         retry_sleep = st.number_input(
             "失败后重试等待秒数",
@@ -517,7 +519,7 @@ if st.button("开始记忆提取", type="primary", use_container_width=True, dis
             model=extract_model,
             max_tokens=int(max_tokens),
             request_interval=float(request_interval),
-            max_retries=int(max_retries),
+            max_retries=max(0, int(max_attempts) - 1),
             retry_sleep=float(retry_sleep),
             enable_thinking=bool(enable_thinking),
             timeout=int(timeout),

@@ -24,6 +24,7 @@ from src.ui.data_service import (
     results_to_dataframe,
     dataframe_to_excel_bytes,
 )
+from src.persistence import atomic_write_bytes
 from src.ui.rule_ref_validation import (
     rule_ref_validation_rows,
     summarize_rule_ref_validation,
@@ -311,7 +312,7 @@ with st.expander("选择对照结果并生成稳定性报告", expanded=False):
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}{uploaded_suffix}"
                     )
                     saved_path = RESULTS_DIR / saved_name
-                    saved_path.write_bytes(uploaded_bytes)
+                    atomic_write_bytes(saved_path, uploaded_bytes)
                     st.success(f"已保存：{saved_path}")
             except Exception as exc:
                 st.error(f"上传文件解析失败：{exc}")

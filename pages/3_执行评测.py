@@ -46,6 +46,7 @@ from src.ui.data_service import (
     results_to_dataframe,
     RESULTS_DIR,
 )
+from src.ui.components import render_state_file_notice
 
 
 def get_eval_task_choices() -> list[str]:
@@ -77,6 +78,7 @@ def render_eval_job_state(job_id: str) -> None:
         state = mark_eval_job_interrupted(job_id)
     if not state:
         return
+    render_state_file_notice(state)
 
     total = int(state.get("total", 0) or 0)
     done = int(state.get("done", 0) or 0)
@@ -401,16 +403,13 @@ with st.expander("当前接口配置", expanded=False):
         "裁判模型": cfg.get("judge_model", ""),
         "最大输出长度": cfg.get("judge_max_tokens", 2000),
         "超时秒数": cfg.get("judge_timeout", 120),
-        "最大重试次数": cfg.get("judge_max_retries", 3),
+        "最大尝试次数（含首次）": cfg.get("judge_max_retries", 3),
         "请求间隔": cfg.get("judge_request_interval", 0),
         "并发数": cfg.get("judge_concurrency", 1),
         "限流等待": cfg.get("judge_qps_backoff", 12),
         "温度": cfg.get("judge_temperature", 0),
         "top_p": cfg.get("judge_top_p", 1.0),
         "top_k": cfg.get("judge_top_k", None),
-        "流式响应": cfg.get("judge_stream", False),
-        "鉴权方式": cfg.get("judge_auth_type", "bearer"),
-        "call_from": cfg.get("judge_call_from", "default"),
         "发送enable_thinking": cfg.get("judge_send_enable_thinking", True),
         "思考模式": cfg.get("judge_enable_thinking", False),
         "裁判提示词版本": infer_prompt_version(selected_prompt_file),

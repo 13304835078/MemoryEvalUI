@@ -32,6 +32,12 @@ st.title("配置")
 if "ui_config" not in st.session_state:
     st.session_state.ui_config = load_config()
 
+if st.session_state.ui_config.get("_config_error"):
+    st.warning(
+        f"{st.session_state.ui_config.get('_config_error')}\n\n"
+        f"备份文件：{st.session_state.ui_config.get('_config_corrupt_path') or '未生成'}"
+    )
+
 if "task_type" not in st.session_state:
     st.session_state.task_type = "user_md_update"
 
@@ -163,11 +169,12 @@ with col_api:
             step=10,
         )
         cfg["judge_max_retries"] = st.number_input(
-            "最大重试次数",
+            "最大尝试次数（含首次）",
             min_value=1,
             max_value=10,
             value=int(cfg.get("judge_max_retries", 3)),
             step=1,
+            help="例如设置为 3 表示最多请求 3 次：首次 1 次，失败后最多再尝试 2 次。",
         )
         cfg["judge_request_interval"] = st.number_input(
             "请求间隔秒数",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
@@ -16,7 +17,7 @@ from src.extraction.client import (
     MockMemoryExtractionClient,
     extract_answer_from_response,
 )
-from src.persistence import append_jsonl_rows, atomic_write_jsonl
+from src.persistence import append_jsonl_rows, atomic_write_bytes, atomic_write_jsonl
 from src.runtime_paths import APP_HOME, DATA_DIR
 from src.schema import TaskType
 from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
@@ -567,7 +568,9 @@ class MemoryExtractionRunner:
         for row in final_rows:
             row.pop("__source_order", None)
             row.pop("__session_index", None)
-        pd.DataFrame(final_rows).to_excel(output_path, index=False)
+        excel_buffer = BytesIO()
+        pd.DataFrame(final_rows).to_excel(excel_buffer, index=False)
+        atomic_write_bytes(output_path, excel_buffer.getvalue())
 
         return {
             "output_path": str(output_path),

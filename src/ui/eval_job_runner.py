@@ -138,6 +138,7 @@ def _safe_config(config: EvalJobConfig) -> dict[str, Any]:
     eval_config = value.get("eval_config")
     if isinstance(eval_config, dict):
         eval_config.pop("judge_api_bearer_token", None)
+        eval_config["judge_max_attempts"] = int(eval_config.get("judge_max_retries") or 1)
     value.pop("system_prompt_override", None)
     value.pop("extraction_prompt_text", None)
     return value

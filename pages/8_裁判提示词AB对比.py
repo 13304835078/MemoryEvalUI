@@ -13,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.schema import TaskType
 from src.ui.config_store import build_eval_config, load_config
+from src.ui.components import render_state_file_notice
 from src.ui.data_service import list_case_files, load_cases
 from src.ui.judge_ab_job_runner import (
     JudgeAbJobConfig,
@@ -126,6 +127,7 @@ def render_judge_ab_job_state(job_id: str) -> None:
     if not state:
         st.info("暂无这个 A/B 对比任务的状态。")
         return
+    render_state_file_notice(state)
 
     status = str(state.get("status") or "")
     done = int(state.get("done", 0) or 0)
@@ -340,7 +342,7 @@ with st.expander("当前共用裁判模型配置", expanded=False):
         "请求间隔": cfg.get("judge_request_interval", 0),
         "并发数": cfg.get("judge_concurrency", 1),
         "限流退避": cfg.get("judge_qps_backoff", 12),
-        "最大重试": cfg.get("judge_max_retries", 3),
+        "最大尝试（含首次）": cfg.get("judge_max_retries", 3),
         "提取提示词版本": extraction_prompt_version or "未使用",
         "提取提示词 Hash": extraction_prompt_hash[:12] if extraction_prompt_hash else "",
     })

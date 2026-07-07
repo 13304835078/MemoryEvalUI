@@ -45,6 +45,7 @@ from src.ui.prompt_advisor_job_runner import (
     read_prompt_advisor_job_state,
     request_prompt_advisor_stop,
 )
+from src.ui.components import render_state_file_notice
 
 
 st.title("任务中心")
@@ -180,6 +181,7 @@ if rows:
     selected_type = selected_row["任务类型"]
     selected_id = selected_row["任务ID"]
     selected_state = _read_state(selected_type, selected_id)
+    render_state_file_notice(selected_state)
     st.json(selected_state)
     if selected_state.get("status") == "running":
         if st.button("请求终止该任务", type="secondary", use_container_width=True):

@@ -21,6 +21,7 @@ from src.schema import (
 )
 from src.eval.metrics import flatten_results
 from src.runtime_paths import APP_HOME, DATA_DIR, ensure_writable_layout
+from src.persistence import atomic_write_bytes
 
 
 PROJECT_ROOT = APP_HOME
@@ -262,8 +263,7 @@ def save_uploaded_file(uploaded_file, suffix: str = "") -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = UPLOAD_DIR / f"{stem}_{ts}{ext}"
 
-    with open(out_path, "wb") as f:
-        f.write(uploaded_file.getvalue())
+    atomic_write_bytes(out_path, uploaded_file.getvalue())
 
     return str(out_path)
 
