@@ -122,7 +122,7 @@ config/local_config.json               本地真实配置，已被 Git 忽略
 data/raw/uploads/                      UI 上传文件保存目录
 data/cases/                            标准 case 输出目录
 data/results/                          评测结果与人工复核结果
-data/extraction/                       记忆提取输出和任务状态
+data/extractions/                      记忆提取输出和任务状态
 data/closed_loop/                      闭环实验中间产物和状态
 logs/                                  本地运行日志
 

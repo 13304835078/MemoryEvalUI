@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ def discover_pages(project_root: Path) -> list[Path]:
 
 def run_smoke(project_root: Path, timeout: float = 30.0) -> list[str]:
     failures: list[str] = []
+    os.environ["MEMORY_EVAL_TEST_BYPASS_IDENTITY"] = "1"
     for path in discover_pages(project_root):
         relative_path = path.relative_to(project_root)
         try:
