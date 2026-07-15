@@ -8,69 +8,141 @@ import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
+BRAND_DIR = PROJECT_ROOT / "assets" / "brand"
+HUAWEI_LOGO_PATH = BRAND_DIR / "huawei_logo.png"
+HUAWEI_ICON_PATH = BRAND_DIR / "huawei_icon.svg"
 
 from src.build_info import format_build_label, get_build_info
+from src.ui.theme import render_page_header, workflow_html
+from src.ui.user_identity import render_identity_sidebar, require_user_identity
 
 
 st.set_page_config(
-    page_title="记忆评测工具",
-    page_icon="ME",
+    page_title="记忆评测工作台",
+    page_icon=str(HUAWEI_ICON_PATH) if HUAWEI_ICON_PATH.exists() else "M",
     layout="wide",
+    initial_sidebar_state="auto",
 )
+if HUAWEI_LOGO_PATH.exists():
+    st.logo(
+        str(HUAWEI_LOGO_PATH),
+        size="large",
+        icon_image=str(HUAWEI_ICON_PATH) if HUAWEI_ICON_PATH.exists() else None,
+    )
 
-st.title("记忆评测工具")
-build_info = get_build_info()
-st.caption(f"版本：{format_build_label(build_info)}")
+identity = require_user_identity()
+render_identity_sidebar(identity)
 
-with st.expander("版本和构建信息", expanded=False):
-    st.json(build_info)
+# Import task modules only after the current Streamlit session has activated its
+# workspace. Runtime paths remain contextual for concurrent user sessions.
+from src.ui.task_indicator import render_sidebar_task_indicator
 
-st.markdown(
-    """
-这是一个本地记忆提取、自动评测、人工复核和提示词闭环实验工具。
 
-## 推荐主流程
+def render_home() -> None:
+    build_info = get_build_info()
+    render_page_header(
+        "记忆评测工作台",
+        "按数据起点选择提取或评测路径，再统一进入证据分析与提示词迭代。",
+        category="系统总览",
+    )
+    st.markdown(
+        f'<span class="me-version-pill">当前版本 {format_build_label(build_info)}</span>',
+        unsafe_allow_html=True,
+    )
 
-1. **配置**  
-   配置接口地址、模型名、token、温度、top_p、enable_thinking、并发、重试和限流等待；管理裁判提示词和提取提示词版本。
+    st.markdown("## 选择你的起点")
+    st.markdown("### 从原始对话开始")
+    st.caption("输入是包含轮次、query、answer、评测人的原始对话 Excel。")
+    st.markdown(
+        workflow_html(
+            [
+                ("配置", "设置提取模型、裁判模型和两类提示词"),
+                ("记忆提取", "按 session 和 chunk 生成 USER.md 或 MEMORY.md"),
+                ("生成 case", "提取完成后自动转换为标准评测样本"),
+                ("评测复核", "执行 Judge 评分并查看结果与证据"),
+            ]
+        ),
+        unsafe_allow_html=True,
+    )
 
-2. **数据输入**  
-   支持运行 USER.md 记忆提取、上传 USER.md 提取结果、上传长期记忆 MEMORY.md 提取结果，以及上传通用样本文件。长期记忆结果兼容 `MEMORY.md` 和 `生成的MEMORY.md正文` 两种列名。
+    st.markdown("### 从已有提取结果开始")
+    st.caption("输入已经包含 USER.md、MEMORY.md，或本身就是标准 case。")
+    st.markdown(
+        workflow_html(
+            [
+                ("配置", "确认裁判模型与对应提示词版本"),
+                ("评测数据", "导入已有提取结果或标准 case"),
+                ("执行评测", "后台评分并保留结构化诊断"),
+                ("结果复核", "分析质量、稳定性和失败样本"),
+            ]
+        ),
+        unsafe_allow_html=True,
+    )
 
-3. **执行评测**  
-   对生成的 case 做单模型绝对评测。评测会后台运行，切换页面后进度不会归零；重新回到页面可继续查看当前任务状态。
+    st.markdown("## 常用入口")
+    quick_cols = st.columns(4)
+    quick_links = [
+        ("pages/1_配置.py", "配置", ":material/settings:", "设置接口、模型与提示词版本"),
+        ("pages/10_记忆提取.py", "记忆提取", ":material/memory:", "原始对话生成记忆与评测 case"),
+        ("pages/2_数据输入.py", "评测数据", ":material/dataset:", "已有提取结果或 case 的评测入口"),
+        ("pages/6_任务中心.py", "任务中心", ":material/task_alt:", "集中查看后台运行状态"),
+    ]
+    for col, (page, label, icon, description) in zip(quick_cols, quick_links):
+        with col:
+            st.page_link(page, label=label, icon=icon, width="stretch")
+            st.caption(description)
 
-4. **结果总览**  
-   查看 USER.md 或 MEMORY.md 的平均分、维度分、错误标签、失败样本、稳定性对比和历史结果对比。适合判断两次运行是否只是总分接近，还是具体错误也一致。
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### 评测与复核")
+        st.page_link("pages/3_执行评测.py", label="执行评测", icon=":material/play_circle:")
+        st.page_link("pages/4_结果总览.py", label="结果总览", icon=":material/analytics:")
+        st.page_link("pages/5_样本详情.py", label="样本详情与人工复核", icon=":material/fact_check:")
+    with right:
+        st.markdown("### 优化实验")
+        st.page_link("pages/7_提示词改进建议.py", label="提示词改进建议", icon=":material/edit_note:")
+        st.page_link("pages/8_裁判提示词AB对比.py", label="裁判提示词 A/B 对比", icon=":material/compare_arrows:")
+        st.page_link("pages/9_闭环实验.py", label="闭环实验", icon=":material/autorenew:")
 
-5. **样本详情**  
-   查看单条样本的对话、旧/新 USER.md 或 MEMORY.md、comment、error_tags、规则引用、证据引用、输出引用和得分；可做人工复核。
-
-## 后台任务与扩展功能
-
-6. **任务中心**  
-   集中查看执行评测、记忆提取、闭环实验、提示词建议和 A/B 对比的后台任务状态；可写入停止请求，已发出的单次 API 调用会在返回后停止后续任务。
-
-7. **提示词改进建议**  
-   基于普通绝对评测结果，后台生成裁判提示词/提取提示词的候选修改建议。没有人工确认时，建议只作为实验候选版本，不应直接覆盖线上提示词。
-
-8. **裁判提示词 AB 对比**  
-   后台对同一批 case 用两个裁判提示词分别评估，比较分数、错误标签、诊断数量和差异样本，适合验证新裁判提示词是否更稳定。
-
-9. **闭环实验**  
-   自动串联：记忆提取 → 生成 case → 执行绝对评测 → 生成候选提取提示词 → 下一轮记忆提取。支持 USER.md 和 MEMORY.md 两类任务；闭环后台运行，切换页面后仍会继续。
-
-10. **记忆提取**
-   单独运行 USER.md 或 MEMORY.md 提取，不进入闭环。支持后台进度、终止请求、结果下载、核心列预览和单个 chunk 详情。
-
-## 使用建议
-
-- 首次使用先在 **配置** 页测试连接。
-- 新数据建议先小样本跑通，再扩大并发和样本量。
-- 多个后台任务可以同时运行；同一 API/Token 会共用全局请求启动间隔，避免不同功能叠加超出 QPS。
-- 如果使用闭环实验，先设 `1-2` 轮和少量 case，确认候选提示词没有跑偏后再放大。
-- 所有生成的新提示词默认另存为新版本，不会覆盖原文件。
+    with st.expander("首次使用与运行说明", expanded=False):
+        st.markdown(
+            """
+1. 先在“配置”页测试模型连接，并确认裁判提示词与提取提示词版本。
+2. 原始对话先走“记忆提取”；已有提取结果或 case 走“评测数据”。两条路径都会衔接“执行评测”。
+3. 长任务切换页面后仍会后台运行，可在“任务中心”查看状态、调整可变参数或请求终止。
+4. 提示词建议默认生成候选版本，不覆盖当前文件；进入下一轮前应先复核差异。
+5. USER.md 与 MEMORY.md 是两类独立任务，导入、提取、评测和提示词版本需保持一致。
 """
-)
+        )
 
-st.info("请从左侧页面开始。")
+    with st.expander("版本与构建信息", expanded=False):
+        st.json(build_info)
+
+
+navigation = st.navigation(
+    {
+        "基础设置": [
+            st.Page(render_home, title="总览", icon=":material/dashboard:", default=True),
+            st.Page("pages/1_配置.py", title="配置", icon=":material/settings:"),
+        ],
+        "提取工作流": [
+            st.Page("pages/10_记忆提取.py", title="记忆提取", icon=":material/memory:"),
+        ],
+        "评测工作流": [
+            st.Page("pages/2_数据输入.py", title="评测数据", icon=":material/dataset:"),
+            st.Page("pages/3_执行评测.py", title="执行评测", icon=":material/play_circle:"),
+            st.Page("pages/4_结果总览.py", title="结果总览", icon=":material/analytics:"),
+            st.Page("pages/5_样本详情.py", title="样本复核", icon=":material/fact_check:"),
+        ],
+        "优化实验": [
+            st.Page("pages/7_提示词改进建议.py", title="提示词改进", icon=":material/edit_note:"),
+            st.Page("pages/8_裁判提示词AB对比.py", title="裁判 A/B", icon=":material/compare_arrows:"),
+            st.Page("pages/9_闭环实验.py", title="闭环实验", icon=":material/autorenew:"),
+        ],
+        "运行管理": [
+            st.Page("pages/6_任务中心.py", title="任务中心", icon=":material/task_alt:"),
+        ],
+    }
+)
+render_sidebar_task_indicator()
+navigation.run()

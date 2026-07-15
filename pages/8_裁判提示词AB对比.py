@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -11,10 +10,15 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.ui.user_identity import require_page_identity
+require_page_identity()
+
 from src.schema import TaskType
 from src.ui.config_store import build_eval_config, load_config
 from src.ui.components import render_state_file_notice
 from src.ui.data_service import list_case_files, load_cases
+from src.ui.preflight import build_ab_preflight, render_preflight
+from src.ui.run_presets import render_run_preset_selector
 from src.ui.judge_ab_job_runner import (
     JudgeAbJobConfig,
     avg_dimension_scores,
@@ -25,9 +29,9 @@ from src.ui.judge_ab_job_runner import (
     read_judge_ab_job_state,
     request_judge_ab_stop,
     result_table,
-    run_judge_ab_job,
     summarize_results,
 )
+from src.ui.task_worker import launch_background_task
 from src.ui.prompt_editor import (
     get_default_extraction_prompt_file,
     get_default_prompt_file,
@@ -37,13 +41,18 @@ from src.ui.prompt_editor import (
     load_prompt,
     prompt_text_hash,
 )
+from src.ui.theme import render_page_header
+from src.ui.workspace_context import render_workspace_context, summarize_values
 
 
 NO_EXTRACTION_PROMPT = "不使用提取规则辅助评测"
 
 
-st.title("裁判提示词 A/B 对比")
-st.caption("单模型绝对评测对比：同一批 case、同一个裁判模型配置，只替换裁判提示词 A/B。")
+render_page_header(
+    "裁判提示词 A/B 对比",
+    "保持样本与裁判模型不变，仅比较两版裁判提示词的评分表现。",
+    category="优化实验",
+)
 
 if "ui_config" not in st.session_state:
     st.session_state.ui_config = load_config()
@@ -51,12 +60,6 @@ if "ui_config" not in st.session_state:
 
 def get_task_choices() -> list[str]:
     return [item.value for item in TaskType if item.value != "raw_dialogue"]
-
-
-def ensure_judge_ab_threads() -> dict[str, threading.Thread]:
-    if "judge_ab_threads" not in st.session_state:
-        st.session_state.judge_ab_threads = {}
-    return st.session_state.judge_ab_threads
 
 
 def render_judge_ab_result(job_id: str, state: dict) -> None:
@@ -73,13 +76,14 @@ def render_judge_ab_result(job_id: str, state: dict) -> None:
     c1.metric("A 平均分", f"{float(summary_a.get('avg_score') or 0):.4f}")
     c2.metric("B 平均分", f"{float(summary_b.get('avg_score') or 0):.4f}")
     c3.metric("B-A 平均分差", f"{float(summary_b.get('avg_score') or 0) - float(summary_a.get('avg_score') or 0):.4f}")
-    c4.metric("样本数", int(summary_a.get("total") or 0))
+    c4.metric("A/B 记录数", int(summary_a.get("total") or 0))
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("A fatal", int(summary_a.get("fatal_count") or 0))
-    c2.metric("B fatal", int(summary_b.get("fatal_count") or 0))
-    c3.metric("A 有标签样本", int(summary_a.get("tagged_count") or 0))
-    c4.metric("B 有标签样本", int(summary_b.get("tagged_count") or 0))
+    c1.metric("A Judge失败", int(summary_a.get("judge_failure_count") or 0))
+    c2.metric("B Judge失败", int(summary_b.get("judge_failure_count") or 0))
+    c3.metric("A 成功评分", int(summary_a.get("scored_count") or 0))
+    c4.metric("B 成功评分", int(summary_b.get("scored_count") or 0))
+    st.caption("任一侧 Judge 运行失败的样本不计算分差，也不按 0 分进入平均分。fatal 表示已评分后的严重质量错误。")
 
     dim_a = avg_dimension_scores(results_a)
     dim_b = avg_dimension_scores(results_b)
@@ -93,12 +97,12 @@ def render_judge_ab_result(job_id: str, state: dict) -> None:
         })
     if dim_rows:
         st.markdown("**维度平均分对比**")
-        st.dataframe(pd.DataFrame(dim_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(dim_rows), width="stretch", hide_index=True)
 
     preview_rows = state.get("table_preview") or []
     table = pd.DataFrame(preview_rows) if preview_rows else result_table(results_a, results_b)
     st.markdown("**样本明细**")
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
     table_file = str(state.get("table_path") or "")
     if table_file and Path(table_file).exists():
         st.download_button(
@@ -106,7 +110,7 @@ def render_judge_ab_result(job_id: str, state: dict) -> None:
             data=Path(table_file).read_bytes(),
             file_name=Path(table_file).name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
             key=f"{job_id}_download_ab",
         )
 
@@ -149,7 +153,7 @@ def render_judge_ab_job_state(job_id: str) -> None:
         )
     if status == "running":
         st.info("任务仍在后台运行。切换页面后再回来，进度会从状态文件恢复。")
-        if st.button("请求终止 A/B 对比", type="secondary", use_container_width=True, key=f"{job_id}_stop"):
+        if st.button("请求终止 A/B 对比", type="secondary", width="stretch", key=f"{job_id}_stop"):
             request_judge_ab_stop(job_id)
             st.warning("已写入终止请求。已发出的 API 调用会先返回，后续样本会停止提交。")
             st.rerun()
@@ -195,7 +199,7 @@ def render_judge_ab_job_panel() -> str:
     return selected_job_id
 
 
-with st.expander("使用说明", expanded=True):
+with st.expander("使用说明", expanded=False):
     st.markdown(
         """
 这个页面用于比较两个裁判提示词，而不是比较两个被评测模型。
@@ -211,7 +215,7 @@ with st.expander("使用说明", expanded=True):
 st.subheader("1. 选择样本")
 case_files = list_case_files()
 if not case_files:
-    st.warning("没有可用 case 文件，请先到“数据输入”或“记忆提取”页面生成。")
+    st.warning("没有可用 case 文件，请先到“评测数据”导入，或在“记忆提取”完成后生成。")
     st.stop()
 
 labels = [Path(path).name for path in case_files]
@@ -250,7 +254,7 @@ with st.expander("样本预览", expanded=False):
             }
             for case in run_cases[:50]
         ]),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -306,17 +310,20 @@ else:
     extraction_prompt_hash = prompt_text_hash(extraction_prompt_text)
 
 with st.expander("查看 A/B 提示词全文", expanded=False):
+    prompt_a_text = load_prompt(prompt_a)
+    prompt_b_text = load_prompt(prompt_b)
     left, right = st.columns(2)
     with left:
-        st.text_area("裁判提示词 A", value=load_prompt(prompt_a), height=300, disabled=True)
+        st.text_area("裁判提示词 A", value=prompt_a_text, height=300, disabled=True)
     with right:
-        st.text_area("裁判提示词 B", value=load_prompt(prompt_b), height=300, disabled=True)
+        st.text_area("裁判提示词 B", value=prompt_b_text, height=300, disabled=True)
     if extraction_prompt_text:
         st.text_area("共用提取提示词规则", value=extraction_prompt_text, height=220, disabled=True)
 
 
 st.subheader("3. 运行配置")
 cfg = dict(st.session_state.ui_config)
+render_run_preset_selector(cfg, key="judge_ab")
 mock = st.checkbox("模拟模式", value=bool(cfg.get("mock", False)))
 cfg["judge_concurrency"] = st.number_input(
     "并发数",
@@ -347,12 +354,35 @@ with st.expander("当前共用裁判模型配置", expanded=False):
         "提取提示词 Hash": extraction_prompt_hash[:12] if extraction_prompt_hash else "",
     })
 
-if st.button("开始 A/B 对比", type="primary", use_container_width=True, disabled=not bool(run_cases)):
-    config = build_eval_config(cfg, mock=mock)
-    errors = config.validate()
-    if errors:
-        st.error("配置错误：\n" + "\n".join([f"- {item}" for item in errors]))
-        st.stop()
+config = build_eval_config(cfg, mock=mock)
+render_workspace_context(
+    task_type=task_type,
+    case_count=len(run_cases),
+    cases_file=selected_case_path,
+    model_name=summarize_values(case.model_name for case in run_cases),
+    judge_prompt=f"A {infer_prompt_version(prompt_a)} · B {infer_prompt_version(prompt_b)}",
+    extraction_prompt=selected_extraction_prompt if extraction_prompt_text else "",
+    mock=mock,
+    title="本次 A/B 上下文",
+)
+preflight_checks = build_ab_preflight(
+    cases=run_cases,
+    task_type=task_type,
+    prompt_a_text=prompt_a_text,
+    prompt_b_text=prompt_b_text,
+    prompt_a_name=prompt_a,
+    prompt_b_name=prompt_b,
+    extraction_prompt_text=extraction_prompt_text,
+    eval_config=config,
+)
+preflight_ready = render_preflight(preflight_checks)
+
+if st.button(
+    "开始 A/B 对比",
+    type="primary",
+    width="stretch",
+    disabled=not bool(run_cases) or not preflight_ready,
+):
 
     job_id = f"judge_ab_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     job_config = JudgeAbJobConfig(
@@ -366,16 +396,9 @@ if st.button("开始 A/B 对比", type="primary", use_container_width=True, disa
         extraction_prompt_hash=extraction_prompt_hash,
         eval_config=config,
     )
-    thread = threading.Thread(
-        target=run_judge_ab_job,
-        args=(job_config, run_cases),
-        daemon=True,
-        name=f"judge-ab-{job_id}",
-    )
-    thread.start()
-    ensure_judge_ab_threads()[job_id] = thread
+    launch_background_task("judge_ab", job_config, cases=run_cases)
     st.session_state.judge_ab_job_id = job_id
-    st.success(f"已启动后台 A/B 对比任务：{job_id}")
+    st.success(f"已启动独立后台 A/B 对比进程：{job_id}")
     st.rerun()
 
 

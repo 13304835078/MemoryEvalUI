@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sys
-import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -11,6 +10,9 @@ import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.ui.user_identity import require_page_identity
+require_page_identity()
 
 from src.extraction.memory_extractor import load_generation_prompt_templates, sanitize_filename
 from src.loop import (
@@ -22,14 +24,16 @@ from src.loop import (
     read_loop_controls,
     read_loop_state,
     request_stop,
-    run_closed_loop,
     update_loop_controls,
 )
 from src.loop.progress import compute_closed_loop_progress
 from src.schema import TASK_TYPE_LABELS, TaskType
 from src.ui.config_store import build_eval_config, load_config
 from src.ui.components import render_state_file_notice
-from src.ui.data_service import save_uploaded_file
+from src.ui.data_service import load_results, save_uploaded_file
+from src.ui.next_actions import NextAction, render_next_actions
+from src.ui.preflight import build_closed_loop_preflight, render_preflight
+from src.ui.run_presets import render_run_preset_selector
 from src.ui.prompt_editor import (
     get_default_extraction_prompt_file,
     get_default_prompt_file,
@@ -41,9 +45,25 @@ from src.ui.prompt_editor import (
     prompt_text_hash,
     get_extraction_prompt_path,
 )
+from src.ui.theme import render_page_header
+from src.ui.task_worker import launch_background_task
+from src.ui.workspace_context import render_workspace_context
 
 
 USE_CONFIG_PROMPT = "使用配置页当前编辑文本"
+LOOP_STATUS_LABELS = {
+    "running": "运行中",
+    "completed": "已完成",
+    "completed_no_change": "无需修改，已结束",
+    "max_rounds_reached": "达到设定轮数",
+    "validation_rejected": "候选未通过验证",
+    "invalid_evaluation": "评测不完整",
+    "paused_no_safe_patch": "无安全修改，已暂停",
+    "paused_advisor_failed": "建议模型失败，已暂停",
+    "stopped": "已终止",
+    "interrupted": "已中断",
+    "failed": "失败",
+}
 
 
 def read_text_file(path_like: str | Path) -> str:
@@ -79,6 +99,89 @@ def render_stat_metrics(title: str, stats: dict, fields: list[tuple[str, str]]) 
         cols[index % len(cols)].metric(label, stats.get(key, "-"))
 
 
+def render_run_quality(title: str, quality: dict) -> None:
+    st.markdown(f"**{title}**")
+    if not quality:
+        st.caption("尚未运行")
+        return
+    cols = st.columns(4)
+    cols[0].metric("运行状态", "完整" if quality.get("run_complete") else "不完整")
+    cols[1].metric("条件平均分", f"{float(quality.get('conditional_avg_score') or 0):.2f}/5")
+    cols[2].metric("端到端分数", f"{float(quality.get('end_to_end_score') or 0):.2f}/5")
+    cols[3].metric("提取覆盖率", f"{float(quality.get('extraction_coverage') or 0) * 100:.1f}%")
+    st.caption(
+        f"已评分 {quality.get('scored_cases', 0)}；Judge 失败 {quality.get('judge_failures', 0)}；"
+        f"提取质量失败 {quality.get('extraction_quality_failures', 0)}；"
+        f"提取接口失败 {quality.get('extraction_infrastructure_failures', 0)}。"
+    )
+
+
+def render_trusted_protocol_state(state: dict) -> None:
+    protocol = state.get("protocol") if isinstance(state.get("protocol"), dict) else {}
+    if protocol.get("version") != "v2_holdout":
+        return
+    st.info(
+        "可信闭环已启用：只有 Discovery 可进入提示词建议；Validation 决定候选是否晋升；"
+        "Locked Test 不参与改词，只用于最终报告。Judge 配置和初始提取规则在本次运行中冻结，"
+        "候选提示词不能修改自己的评分标准。"
+    )
+    manifest = state.get("split_manifest") if isinstance(state.get("split_manifest"), dict) else {}
+    if manifest:
+        counts = manifest.get("partition_group_counts") or {}
+        cols = st.columns(3)
+        cols[0].metric("Discovery 评测人", counts.get("discovery", 0))
+        cols[1].metric("Validation 评测人", counts.get("validation", 0))
+        cols[2].metric("Locked Test 评测人", counts.get("locked_test", 0))
+
+    for item in state.get("rounds") or []:
+        with st.expander(f"第 {item.get('round')} 轮可信协议详情", expanded=item is (state.get("rounds") or [])[-1]):
+            discovery = item.get("discovery") if isinstance(item.get("discovery"), dict) else {}
+            render_run_quality("Discovery 当前版本", discovery.get("run_quality") or {})
+            composition = item.get("advisor_evidence_composition") or {}
+            if composition:
+                st.caption(f"提示词建议证据组成：{composition}。Validation 和 Locked Test 证据数固定为 0。")
+            gate = item.get("validation_gate") if isinstance(item.get("validation_gate"), dict) else {}
+            if gate:
+                st.markdown("**Validation 替换门槛**")
+                if gate.get("accepted"):
+                    st.success("候选通过全部门槛，已晋升为下一轮当前版本。")
+                else:
+                    st.error("候选未通过门槛，未替换当前版本。")
+                gate_cols = st.columns(5)
+                gate_cols[0].metric("配对分变化", f"{float(gate.get('paired_score_delta') or 0):+.3f}")
+                gate_cols[1].metric("端到端变化", f"{float(gate.get('end_to_end_delta') or 0):+.3f}")
+                gate_cols[2].metric("覆盖率下降", f"{float(gate.get('extraction_coverage_drop') or 0) * 100:.2f}%")
+                gate_cols[3].metric("样本退化率", f"{float(gate.get('case_regression_rate') or 0) * 100:.1f}%")
+                interval = gate.get("confidence_interval") or {}
+                lower = interval.get("lower")
+                gate_cols[4].metric("95%下界", "不可计算" if lower is None else f"{float(lower):+.3f}")
+                if gate.get("reasons"):
+                    st.markdown("\n".join(f"- {reason}" for reason in gate.get("reasons") or []))
+                with st.expander("查看 Validation 两侧完整统计", expanded=False):
+                    st.json({
+                        "当前版本": gate.get("champion_quality"),
+                        "候选版本": gate.get("candidate_quality"),
+                        "门槛配置": gate.get("config"),
+                    })
+            if item.get("candidate_prompt_draft") or item.get("candidate_prompt_saved"):
+                render_candidate_prompt(item, expanded=False, key_prefix="trusted")
+
+    locked = state.get("locked_test") if isinstance(state.get("locked_test"), dict) else {}
+    if locked:
+        st.subheader("Locked Test 最终报告")
+        st.caption("这部分数据在提示词迭代结束后才读取，未提供给提示词建议模型。")
+        c1, c2 = st.columns(2)
+        with c1:
+            render_run_quality("初始版本", (locked.get("initial") or {}).get("run_quality") or {})
+        with c2:
+            render_run_quality("最终版本", (locked.get("final") or {}).get("run_quality") or {})
+        comparison = locked.get("comparison") or {}
+        st.caption(
+            f"Locked Test 条件分变化 {float(comparison.get('score_delta') or 0):+.3f}；"
+            f"端到端变化 {float(comparison.get('end_to_end_delta') or 0):+.3f}。"
+        )
+
+
 def render_file_table(paths: dict[str, str]) -> None:
     rows = []
     for label, value in paths.items():
@@ -88,11 +191,11 @@ def render_file_table(paths: dict[str, str]) -> None:
         path = Path(value)
         exists = path.exists() if path.is_absolute() else get_extraction_prompt_path(value).exists()
         rows.append({"文件": label, "状态": "存在" if exists else "待确认", "路径/文件名": value})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def render_candidate_prompt(round_item: dict, *, expanded: bool = False, key_prefix: str = "round") -> None:
-    prompt_name = str(round_item.get("candidate_prompt_saved") or "")
+    prompt_name = str(round_item.get("candidate_prompt_saved") or round_item.get("candidate_prompt_draft") or "")
     if not prompt_name:
         reason = round_item.get("no_candidate_reason") if isinstance(round_item.get("no_candidate_reason"), dict) else {}
         title = reason.get("title") or "本轮暂未生成候选提取提示词"
@@ -103,9 +206,15 @@ def render_candidate_prompt(round_item: dict, *, expanded: bool = False, key_pre
                 st.json(reason)
         return
 
-    prompt_text = read_text_file(prompt_name)
+    prompt_path = Path(prompt_name)
+    prompt_text = (
+        prompt_path.read_text(encoding="utf-8", errors="replace")
+        if prompt_path.is_absolute() and prompt_path.exists()
+        else read_text_file(prompt_name)
+    )
     with st.expander("查看候选提取提示词", expanded=expanded):
-        st.caption(f"文件：{prompt_name}；来源：{round_item.get('candidate_prompt_source') or '未记录'}")
+        promotion = "已通过 Validation" if round_item.get("candidate_prompt_saved") else "仅为草稿，尚未通过 Validation"
+        st.caption(f"文件：{prompt_name}；状态：{promotion}；来源：{round_item.get('candidate_prompt_source') or '未记录'}")
         if prompt_text:
             st.text_area(
                 "候选提取提示词内容",
@@ -114,14 +223,14 @@ def render_candidate_prompt(round_item: dict, *, expanded: bool = False, key_pre
                 disabled=True,
                 key=f"{key_prefix}_candidate_prompt_{round_item.get('round')}_{Path(prompt_name).name}",
             )
-            prompt_path = get_extraction_prompt_path(prompt_name)
+            prompt_path = prompt_path if prompt_path.is_absolute() else get_extraction_prompt_path(prompt_name)
             if prompt_path.exists():
                 st.download_button(
                     "下载候选提取提示词",
                     data=prompt_path.read_bytes(),
                     file_name=prompt_path.name,
                     mime="text/markdown",
-                    use_container_width=True,
+                    width="stretch",
                     key=f"{key_prefix}_download_candidate_{round_item.get('round')}_{prompt_path.name}",
                 )
         else:
@@ -144,11 +253,11 @@ def render_advisor_details(round_item: dict) -> None:
         applied = patch_result.get("applied_edits") or []
         if applied:
             with st.expander("已应用 patch", expanded=False):
-                st.dataframe(pd.DataFrame(applied), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(applied), width="stretch", hide_index=True)
         skipped = patch_result.get("skipped_edits") or []
         if skipped:
             with st.expander("未应用 patch 和原因", expanded=False):
-                st.dataframe(pd.DataFrame(skipped), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(skipped), width="stretch", hide_index=True)
 
     diff_text = result.get("extraction_prompt_diff") or patch_result.get("diff") or ""
     if diff_text:
@@ -172,12 +281,6 @@ def list_loop_run_ids() -> list[str]:
     paths = [p for p in CLOSED_LOOP_DIR.iterdir() if p.is_dir()]
     paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return [p.name for p in paths]
-
-
-def ensure_thread_registry() -> dict[str, threading.Thread]:
-    if "closed_loop_threads" not in st.session_state:
-        st.session_state.closed_loop_threads = {}
-    return st.session_state.closed_loop_threads
 
 
 def resolve_sheet_name(raw: str) -> str | int | None:
@@ -217,19 +320,20 @@ def resolve_extraction_prompt(
 
 
 def render_usage_guide(document_name: str) -> None:
-    with st.expander("使用说明和功能介绍", expanded=True):
+    with st.expander("使用说明和功能介绍", expanded=False):
         st.markdown(
             f"""
 **这个页面做什么**
 
-把原本需要人工串起来的几步自动化：记忆提取 → 生成评测 case → 绝对评测 → 生成候选提取提示词 → 用候选提示词进入下一轮。
+把原本需要人工串起来的几步自动化：记忆提取 → 生成评测 case → 绝对评测 → 生成候选提取提示词 → 验证候选 → 决定是否进入下一轮。
 
 **推荐使用方式**
 
 1. 先用少量数据试跑：闭环轮次设为 `1-2`，每轮最多评测 case 设为 `10-30`。
 2. 确认候选提示词没有明显跑偏后，再增加轮次或放开 case 数量。
-3. 每一轮生成的提示词都会另存为新文件，不会覆盖原始提取提示词。
-4. 如果发现方向不对，点击“请求终止闭环”。已经发出去的 API 请求会先返回，之后不再继续下一步。
+3. 推荐使用“可信闭环”：Discovery 生成候选，Validation 通过后才另存正式版本，Locked Test 只做最终报告。
+4. 运行失败不会按 0 分统计，也不能成为改词证据；Validation 有未解决运行失败时禁止替换提示词。
+5. 如果发现方向不对，点击“请求终止闭环”。已经发出去的 API 请求会先返回，之后不再继续下一步。
 
 **输入文件要求**
 
@@ -237,7 +341,7 @@ def render_usage_guide(document_name: str) -> None:
 
 **结果保存位置**
 
-每次运行的状态和中间产物保存在 `data/closed_loop/<运行编号>/`。生成的候选提取提示词保存在 `prompts/generation/`。
+每次运行的状态和中间产物保存在 `data/closed_loop/<运行编号>/`。未验证候选只保存在轮次目录；通过 Validation 的版本才保存到 `prompts/generation/`。
             """
         )
 
@@ -263,7 +367,7 @@ def render_state(run_id: str) -> None:
     progress = compute_closed_loop_progress(state)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("状态", status or "-")
+    c1.metric("状态", LOOP_STATUS_LABELS.get(status, status or "-"))
     c2.metric("当前轮次", f"{progress.get('current_round')}/{progress.get('total_rounds')}")
     c3.metric("当前步骤", progress.get("current_step") or stage or "-")
     c4.metric("更新时间", str(state.get("updated_at", ""))[:19])
@@ -330,7 +434,7 @@ def render_state(run_id: str) -> None:
                     step=0.5,
                     key=f"{run_id}_ctl_judge_interval",
                 )
-            if st.button("应用运行中参数", type="primary", use_container_width=True, key=f"{run_id}_apply_controls"):
+            if st.button("应用运行中参数", type="primary", width="stretch", key=f"{run_id}_apply_controls"):
                 update_loop_controls(run_id, {
                     "target_rounds": int(target_rounds),
                     "priority": int(priority),
@@ -341,18 +445,22 @@ def render_state(run_id: str) -> None:
                 st.success("已保存运行中参数，后台任务会在后续调度点读取。")
                 st.rerun()
         st.caption("终止是协作式停止：当前 API 调用会先返回，然后在下一步边界停止。")
-        if st.button("请求终止闭环", type="secondary", use_container_width=True):
+        if st.button("请求终止闭环", type="secondary", width="stretch"):
             request_stop(run_id)
             st.warning("已写入终止请求。后台任务会在当前阶段的下一个检查点停止。")
             st.rerun()
     elif status == "interrupted":
         st.warning("闭环任务可能已中断：通常是程序关闭或后台线程退出导致。已保存的中间产物仍可在下方查看。")
 
+    render_trusted_protocol_state(state)
+
     if rounds:
         rows = []
         for item in rounds:
-            case_stats = item.get("case_stats") or {}
-            eval_stats = item.get("eval_stats") or {}
+            discovery = item.get("discovery") if isinstance(item.get("discovery"), dict) else {}
+            case_stats = item.get("case_stats") or discovery.get("case_stats") or {}
+            eval_stats = item.get("eval_stats") or discovery.get("eval_stats") or {}
+            run_quality = discovery.get("run_quality") or {}
             no_candidate_reason = item.get("no_candidate_reason") if isinstance(item.get("no_candidate_reason"), dict) else {}
             rows.append({
                 "轮次": item.get("round"),
@@ -367,15 +475,17 @@ def render_state(run_id: str) -> None:
                 "生成case": case_stats.get("generated_cases", ""),
                 "漏抽case": case_stats.get("missed_cases", ""),
                 "平均分": eval_stats.get("avg_score_total", ""),
+                "Judge失败": run_quality.get("judge_failures", ""),
+                "运行完整": run_quality.get("run_complete", ""),
                 "最近消息": item.get("latest_message", ""),
-                "候选提示词": Path(item.get("candidate_prompt_saved", "")).name if item.get("candidate_prompt_saved") else "",
+                "候选提示词": Path(item.get("candidate_prompt_saved") or item.get("candidate_prompt_draft") or "").name,
                 "候选来源": item.get("candidate_prompt_source", ""),
                 "未生成原因": no_candidate_reason.get("title", ""),
             })
         st.subheader("轮次摘要")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-        completed_with_prompt = [item for item in rounds if item.get("candidate_prompt_saved")]
+        completed_with_prompt = [item for item in rounds if item.get("candidate_prompt_saved") or item.get("candidate_prompt_draft")]
         if completed_with_prompt:
             st.subheader("最新候选提取提示词")
             render_candidate_prompt(completed_with_prompt[-1], expanded=True, key_prefix="latest")
@@ -430,7 +540,7 @@ def render_state(run_id: str) -> None:
                             "评测统计": item.get("eval_stats") or {},
                         })
 
-                    if item.get("candidate_prompt_saved") or item.get("advisor_path") or item.get("no_candidate_reason"):
+                    if item.get("candidate_prompt_saved") or item.get("candidate_prompt_draft") or item.get("advisor_path") or item.get("no_candidate_reason"):
                         render_candidate_prompt(item, expanded=False, key_prefix="round_detail")
                     if item.get("advisor_path"):
                         render_advisor_details(item)
@@ -438,10 +548,22 @@ def render_state(run_id: str) -> None:
                     preview = item.get("eval_preview") or []
                     if preview:
                         with st.expander("评测结果预览", expanded=False):
-                            st.dataframe(pd.DataFrame(preview), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(preview), width="stretch", hide_index=True)
 
                     if item.get("latest_message"):
                         st.caption(item.get("latest_message"))
+
+    if status in {"completed", "completed_no_change", "max_rounds_reached", "validation_rejected", "invalid_evaluation", "stopped", "interrupted"} and rounds:
+        latest_discovery = rounds[-1].get("discovery") if isinstance(rounds[-1].get("discovery"), dict) else {}
+        latest_results_path = str(rounds[-1].get("results_path") or latest_discovery.get("results_path") or "")
+        if latest_results_path and Path(latest_results_path).exists():
+            st.session_state.results = load_results(latest_results_path)
+            st.session_state.results_file = latest_results_path
+        actions = []
+        if latest_results_path and Path(latest_results_path).exists():
+            actions.append(NextAction("pages/4_结果总览.py", "查看最后一轮结果", ":material/analytics:"))
+        actions.append(NextAction("pages/7_提示词改进建议.py", "继续分析提示词", ":material/edit_note:"))
+        render_next_actions(actions)
 
     with st.expander("查看本次运行配置", expanded=False):
         st.json({
@@ -471,7 +593,7 @@ def render_state(run_id: str) -> None:
     events = state.get("events") or []
     if events:
         with st.expander("查看运行日志", expanded=False):
-            st.dataframe(pd.DataFrame(events[-80:]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(events[-80:]), width="stretch", hide_index=True)
 
     if state.get("traceback"):
         with st.expander("错误堆栈", expanded=True):
@@ -483,14 +605,17 @@ def render_state_auto(run_id: str) -> None:
     render_state(run_id)
 
 
-st.title("闭环实验")
-st.caption("自动跑多轮提取提示词改进实验；默认只展示必要信息，细节在展开项里。")
+render_page_header(
+    "闭环实验",
+    "后台串联记忆提取、case 生成、绝对评测与下一轮提示词迭代。",
+    category="优化实验",
+)
 
 if "ui_config" not in st.session_state:
     st.session_state.ui_config = load_config()
 
-thread_registry = ensure_thread_registry()
 cfg = dict(st.session_state.ui_config)
+render_run_preset_selector(cfg, key="closed_loop")
 
 st.warning("实验功能：候选提示词可能沿着当前 Judge 的偏差自我强化。建议先小样本试跑，再决定是否扩大。")
 
@@ -515,6 +640,18 @@ with st.container(border=True):
     run_id = sanitize_filename(run_id_raw) or default_run_id
     if run_id != run_id_raw:
         st.caption(f"运行编号会保存为：{run_id}")
+
+    protocol_label = st.radio(
+        "实验协议",
+        ["可信闭环（推荐）", "探索兼容模式"],
+        horizontal=True,
+        help="可信闭环按完整评测人-session 固定切分，并通过 Validation 决定是否替换；探索模式沿用同一批数据边评边改。",
+    )
+    protocol_version = "v2_holdout" if protocol_label.startswith("可信") else "v1_exploratory"
+    if protocol_version == "v2_holdout":
+        st.success("当前模式具备 Discovery / Validation / Locked Test 隔离，适合形成可汇报的可信实验结果。")
+    else:
+        st.warning("探索模式会在同一数据集上发现问题并迭代，结果可能过拟合，只适合快速试验。")
 
     uploaded_excel = st.file_uploader(
         "上传原始对话 Excel",
@@ -549,7 +686,10 @@ with st.container(border=True):
             max_value=100000,
             value=0,
             step=1,
-            help="0 表示全部。试跑时建议设为 10-30，避免一次跑太久。",
+            help=(
+                "0 表示全部。可信闭环必须完整评测固定分区，因此该限制只在探索兼容模式生效。"
+            ),
+            disabled=protocol_version == "v2_holdout",
         )
 
     with st.expander("可选输入设置", expanded=False):
@@ -568,6 +708,64 @@ with st.container(border=True):
             "评测人筛选",
             value="",
             help="可选。多个评测人用逗号分隔；留空表示不筛选。",
+        )
+
+    discovery_ratio, validation_ratio, locked_test_ratio = 0.6, 0.2, 0.2
+    validation_min_score_delta = 0.03
+    validation_min_end_to_end_delta = 0.0
+    validation_max_coverage_drop = 0.005
+    validation_max_case_regression_rate = 0.1
+    validation_max_prompt_growth_ratio = 0.1
+    validation_min_paired_cases = 8
+    validation_min_paired_clusters = 2
+    validation_confidence_level = 0.95
+    validation_bootstrap_samples = 2000
+    with st.expander("可信闭环切分与替换门槛", expanded=False):
+        st.caption(
+            "切分单位是评测人的完整跨-session历史，同一评测人不会跨集合；各集合内部仍保持原始时间顺序。"
+            "三个集合结构上至少各需 1 位评测人；比例和冻结规则只在任务开始时生效。"
+        )
+        r1, r2, r3 = st.columns(3)
+        discovery_ratio = r1.number_input("Discovery 比例", 0.1, 0.9, 0.6, 0.05)
+        validation_ratio = r2.number_input("Validation 比例", 0.05, 0.8, 0.2, 0.05)
+        locked_test_ratio = r3.number_input("Locked Test 比例", 0.05, 0.8, 0.2, 0.05)
+        st.caption("系统会归一化比例，并保证三个集合至少各有一位完整评测人。")
+        g1, g2, g3 = st.columns(3)
+        validation_min_score_delta = g1.number_input(
+            "条件平均分最小提升", 0.0, 2.0, 0.03, 0.01,
+            help="只对 Judge 成功评分的样本计算；运行失败不计 0 分。",
+        )
+        validation_min_end_to_end_delta = g2.number_input(
+            "端到端分数最小提升", -2.0, 2.0, 0.0, 0.01,
+            help="提取成功但没有可用正文属于提取质量失败，会在端到端口径中计入。",
+        )
+        validation_max_coverage_drop = g3.number_input(
+            "最大提取覆盖率下降", 0.0, 1.0, 0.005, 0.005, format="%.3f",
+        )
+        g4, g5 = st.columns(2)
+        validation_max_case_regression_rate = g4.number_input(
+            "最大单样本退化率", 0.0, 1.0, 0.1, 0.05,
+        )
+        validation_max_prompt_growth_ratio = g5.number_input(
+            "最大提示词增长比例", 0.0, 2.0, 0.1, 0.05,
+        )
+        c_conf1, c_conf2 = st.columns(2)
+        validation_min_paired_cases = c_conf1.number_input(
+            "统计验收最少配对case", 2, 10000, 8, 1,
+            help="候选和当前版本都成功评分、且 case_id 相同，才算一个配对 case。",
+        )
+        validation_min_paired_clusters = c_conf2.number_input(
+            "统计验收最少独立评测人/时序簇", 1, 1000, 2, 1,
+            help="同一评测人的跨-session结果具有相关性，因此不能把每个 chunk 都当成独立证据。",
+        )
+        st.caption(
+            f"按当前设置至少需要 {int(validation_min_paired_clusters) + 2} 位不同评测人："
+            f"Discovery 至少 1 位、Validation 至少 {int(validation_min_paired_clusters)} 位、"
+            "Locked Test 至少 1 位。切分器会优先满足该门槛。"
+        )
+        st.info(
+            "Validation Gate 会对同一 case 的分数差做配对比较，并按评测人/时序簇进行确定性 Bootstrap。"
+            "只有平均提升达到门槛、且 95% 置信区间下界高于 0，候选才会晋升；否则标记为证据不足或可能波动。"
         )
 
 st.subheader("2. 提示词设置")
@@ -757,11 +955,47 @@ with st.container(border=True):
     c3.metric("提取并发", int(extraction_concurrency))
     c4.metric("评测并发", min(100, max(1, int(cfg.get("judge_concurrency", 1) or 1))))
 
-    start_disabled = loop_is_running(run_id)
-    if start_disabled:
+    eval_config_preview = build_eval_config({
+        **cfg,
+        "mock": mock,
+        "judge_model": eval_model,
+        "api_base": eval_api_base,
+        "api_token": eval_api_token or default_api_token,
+    }, mock=mock)
+    render_workspace_context(
+        task_type=loop_task_type,
+        case_count=None,
+        cases_file=(uploaded_excel.name if uploaded_excel is not None else local_excel_path),
+        model_name=f"提取 {extraction_model} · 评测 {eval_model} · 改词 {advisor_model}",
+        judge_prompt=selected_judge_prompt,
+        extraction_prompt=extraction_prompt_version,
+        mock=mock,
+        title="本次闭环上下文",
+    )
+    preflight_checks = build_closed_loop_preflight(
+        uploaded_name=uploaded_excel.name if uploaded_excel is not None else "",
+        local_path=local_excel_path,
+        extraction_prompt_text=extraction_prompt_text,
+        judge_prompt_text=judge_prompt_text,
+        eval_config=eval_config_preview,
+        extraction_model=extraction_model,
+        extraction_api_base=extraction_api_base or eval_api_base,
+        extraction_api_token=extraction_api_token or eval_api_token or default_api_token,
+        advisor_model=advisor_model or eval_model,
+        advisor_api_base=advisor_api_base or eval_api_base,
+        advisor_api_token=advisor_api_token or eval_api_token or default_api_token,
+        rounds=int(rounds),
+        concurrency=int(extraction_concurrency),
+        request_interval=float(extraction_request_interval),
+    )
+    preflight_ready = render_preflight(preflight_checks)
+
+    run_active = loop_is_running(run_id)
+    start_disabled = run_active or not preflight_ready
+    if run_active:
         st.info("这个运行编号正在运行中，不能重复启动。")
 
-    if st.button("启动自动闭环", type="primary", use_container_width=True, disabled=start_disabled):
+    if st.button("启动自动闭环", type="primary", width="stretch", disabled=start_disabled):
         if not extraction_prompt_text.strip():
             st.error("初始提取提示词为空。")
             st.stop()
@@ -781,17 +1015,7 @@ with st.container(border=True):
             st.error(f"Excel 文件不存在：{input_excel_path}")
             st.stop()
 
-        eval_config = build_eval_config({
-            **cfg,
-            "mock": mock,
-            "judge_model": eval_model,
-            "api_base": eval_api_base,
-            "api_token": eval_api_token or default_api_token,
-        }, mock=mock)
-        errors = eval_config.validate()
-        if errors:
-            st.error("配置错误：\n" + "\n".join([f"- {item}" for item in errors]))
-            st.stop()
+        eval_config = eval_config_preview
 
         loop_config = ClosedLoopConfig(
             run_id=run_id,
@@ -802,12 +1026,27 @@ with st.container(border=True):
             rounds=int(rounds),
             chunk_size=int(chunk_size),
             max_cases_per_round=int(max_cases_per_round),
+            protocol_version=protocol_version,
+            discovery_ratio=float(discovery_ratio),
+            validation_ratio=float(validation_ratio),
+            locked_test_ratio=float(locked_test_ratio),
+            validation_min_score_delta=float(validation_min_score_delta),
+            validation_min_end_to_end_delta=float(validation_min_end_to_end_delta),
+            validation_max_coverage_drop=float(validation_max_coverage_drop),
+            validation_max_case_regression_rate=float(validation_max_case_regression_rate),
+            validation_max_prompt_growth_ratio=float(validation_max_prompt_growth_ratio),
+            validation_min_paired_cases=int(validation_min_paired_cases),
+            validation_min_paired_clusters=int(validation_min_paired_clusters),
+            validation_confidence_level=float(validation_confidence_level),
+            validation_bootstrap_samples=int(validation_bootstrap_samples),
             extraction_model=extraction_model,
             extraction_api_base=extraction_api_base or eval_api_base,
             extraction_api_token=extraction_api_token or eval_api_token or default_api_token,
             extraction_prompt_text=extraction_prompt_text,
             extraction_create_prompt_text=extraction_create_prompt_text,
             extraction_prompt_version=extraction_prompt_version,
+            evaluation_rule_prompt_text=extraction_prompt_text,
+            evaluation_rule_prompt_version=extraction_prompt_version or "initial_extraction_prompt",
             extraction_max_tokens=int(extraction_max_tokens),
             extraction_request_interval=float(extraction_request_interval),
             extraction_max_retries=max(0, int(extraction_max_attempts) - 1),
@@ -826,11 +1065,9 @@ with st.container(border=True):
             eval_config=eval_config,
         )
 
-        thread = threading.Thread(target=run_closed_loop, args=(loop_config,), daemon=True, name=f"closed-loop-{run_id}")
-        thread.start()
-        thread_registry[run_id] = thread
+        launch_background_task("closed_loop", loop_config)
         st.session_state.closed_loop_last_run_id = run_id
-        st.success(f"已启动闭环实验：{run_id}")
+        st.success(f"已启动独立后台闭环进程：{run_id}")
         st.rerun()
 
 st.subheader("4. 运行状态")
@@ -843,7 +1080,7 @@ if run_ids:
     selected_run_id = st.selectbox("查看运行", run_ids, index=default_index)
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("刷新状态", use_container_width=True):
+        if st.button("刷新状态", width="stretch"):
             st.rerun()
     with c2:
         auto_refresh = st.checkbox(

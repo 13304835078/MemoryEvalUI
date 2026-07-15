@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -11,10 +10,16 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.ui.user_identity import require_page_identity
+require_page_identity()
+
 from src.schema import EVALUATABLE_TASK_TYPES, TASK_TYPE_LABELS, TaskType
 from src.ui.config_store import build_eval_config, load_config
 from src.ui.components import render_state_file_notice
 from src.ui.data_service import list_result_files, load_results, load_results_bytes
+from src.ui.next_actions import NextAction, render_next_actions
+from src.ui.preflight import build_advisor_preflight, render_preflight
+from src.ui.run_presets import render_run_preset_selector
 from src.ui.prompt_advisor import (
     collect_absolute_eval_evidence,
 )
@@ -26,8 +31,8 @@ from src.ui.prompt_advisor_job_runner import (
     prompt_advisor_job_is_stale,
     read_prompt_advisor_job_state,
     request_prompt_advisor_stop,
-    run_prompt_advisor_job,
 )
+from src.ui.task_worker import launch_background_task
 from src.ui.prompt_editor import (
     get_default_extraction_prompt_file,
     get_default_prompt_file,
@@ -37,13 +42,20 @@ from src.ui.prompt_editor import (
     load_prompt,
     save_prompt_version,
 )
+from src.ui.theme import render_page_header
+from src.ui.workspace_context import render_workspace_context
 
 
-st.title("提示词改进建议")
-st.caption("基于普通绝对评测结果生成受约束的裁判提示词/提取提示词候选修改，不会自动覆盖当前提示词。")
+render_page_header(
+    "提示词改进建议",
+    "基于绝对评测证据生成受约束的候选修改，不自动覆盖当前提示词。",
+    category="优化实验",
+)
 
 if "ui_config" not in st.session_state:
     st.session_state.ui_config = load_config()
+
+render_run_preset_selector(st.session_state.ui_config, key="prompt_advisor")
 
 
 def _prompt_task_slug(task_type: str) -> str:
@@ -86,21 +98,21 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str, task_t
         usage_requests = evidence_usage.get("request_metrics") or []
         if usage_requests:
             with st.expander("证据实际使用与请求明细", expanded=False):
-                st.dataframe(pd.DataFrame(usage_requests), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(usage_requests), width="stretch", hide_index=True)
     if result.get("error"):
         st.error(f"生成失败原因：{result.get('error')}")
 
     diagnoses = result.get("diagnoses", [])
     st.markdown("**问题归因**")
     if diagnoses:
-        st.dataframe(pd.DataFrame(diagnoses), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(diagnoses), width="stretch", hide_index=True)
     else:
         st.info("暂无问题归因。")
 
     changes = result.get("judge_prompt_changes", [])
     st.markdown("**裁判提示词修改点**")
     if changes:
-        st.dataframe(pd.DataFrame(changes), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(changes), width="stretch", hide_index=True)
     else:
         st.info("暂无裁判提示词修改点。")
 
@@ -118,7 +130,7 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str, task_t
             value=f"judge_{_prompt_task_slug(task_type)}_advised_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
             key=f"{key_prefix}_judge_save_name",
         )
-        if st.button("保存候选裁判提示词为新版本", use_container_width=True, key=f"{key_prefix}_save_judge"):
+        if st.button("保存候选裁判提示词为新版本", width="stretch", key=f"{key_prefix}_save_judge"):
             saved = save_prompt_version(task_type, candidate_judge_prompt, version_name)
             st.success(f"已保存：prompts/judge/{saved}。注意：尚未自动启用，请到对应页面手动选择。")
 
@@ -141,25 +153,25 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str, task_t
             c4.metric("冲突/错误", len(conflicts) + len(stage_errors))
             if intents:
                 with st.expander("阶段1：定位意图", expanded=False):
-                    st.dataframe(pd.DataFrame(intents), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(intents), width="stretch", hide_index=True)
             if plan:
                 with st.expander("本地合并后的章节计划", expanded=False):
-                    st.dataframe(pd.DataFrame(plan), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(plan), width="stretch", hide_index=True)
             if stage2:
                 with st.expander("阶段2：段落级 patch 生成结果", expanded=False):
-                    st.dataframe(pd.DataFrame(stage2), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(stage2), width="stretch", hide_index=True)
             if request_metrics:
                 with st.expander("各批次请求大小与状态", expanded=False):
-                    st.dataframe(pd.DataFrame(request_metrics), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(request_metrics), width="stretch", hide_index=True)
             if conflicts:
                 with st.expander("冲突修改（未自动采用）", expanded=True):
-                    st.dataframe(pd.DataFrame(conflicts), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(conflicts), width="stretch", hide_index=True)
             if skipped_before_apply:
                 with st.expander("应用前跳过项", expanded=False):
-                    st.dataframe(pd.DataFrame(skipped_before_apply), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(skipped_before_apply), width="stretch", hide_index=True)
             if stage_errors:
                 with st.expander("阶段错误", expanded=True):
-                    st.dataframe(pd.DataFrame(stage_errors), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(stage_errors), width="stretch", hide_index=True)
 
     patch_result = result.get("extraction_prompt_patch_result") or {}
     if patch_result:
@@ -172,11 +184,11 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str, task_t
         applied_edits = patch_result.get("applied_edits") or []
         if applied_edits:
             with st.expander("查看已应用 patch", expanded=True):
-                st.dataframe(pd.DataFrame(applied_edits), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(applied_edits), width="stretch", hide_index=True)
         skipped_edits = patch_result.get("skipped_edits") or []
         if skipped_edits:
             with st.expander("查看未应用 patch 和原因", expanded=True):
-                st.dataframe(pd.DataFrame(skipped_edits), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(skipped_edits), width="stretch", hide_index=True)
 
         diff_text = result.get("extraction_prompt_diff") or patch_result.get("diff") or ""
         if diff_text:
@@ -210,7 +222,7 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str, task_t
             value=f"extract_{_prompt_task_slug(task_type)}_advised_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
             key=f"{key_prefix}_extract_save_name",
         )
-        if st.button("保存候选提取提示词为新版本", use_container_width=True, key=f"{key_prefix}_save_extract"):
+        if st.button("保存候选提取提示词为新版本", width="stretch", key=f"{key_prefix}_save_extract"):
             saved = save_prompt_version(
                 task_type,
                 candidate_extraction_prompt,
@@ -221,6 +233,12 @@ def render_advisor_result(result: dict | None, raw: str, key_prefix: str, task_t
 
     with st.expander("原始模型输出", expanded=False):
         st.code(raw or "", language="json")
+
+    render_next_actions([
+        NextAction("pages/1_配置.py", "比较并管理提示词版本", ":material/settings:"),
+        NextAction("pages/10_记忆提取.py", "用新版本重新提取", ":material/memory:"),
+        NextAction("pages/9_闭环实验.py", "进入闭环实验", ":material/autorenew:"),
+    ])
 
 
 def load_prompt_selectors(
@@ -235,12 +253,6 @@ def load_prompt_selectors(
         prompt_files,
         index=prompt_files.index(default_prompt) if default_prompt in prompt_files else 0,
         key=f"{key_prefix}_judge_prompt_file",
-    )
-    judge_prompt = st.text_area(
-        "当前裁判提示词内容",
-        value=load_prompt(selected_prompt),
-        height=300,
-        key=f"{key_prefix}_judge_prompt_text::{selected_prompt}",
     )
 
     extraction_files = list_extraction_prompt_files()
@@ -269,16 +281,24 @@ def load_prompt_selectors(
         extraction_default_text = st.session_state.get("extraction_prompt_text", "")
     else:
         extraction_default_text = load_prompt(selected_extraction, prompt_kind="extraction")
-    extraction_prompt = st.text_area(
-        "当前提取提示词内容",
-        value=extraction_default_text,
-        height=240,
-        key=f"{key_prefix}_extraction_prompt_text::{selected_extraction}",
-    )
     st.caption(
         f"裁判提示词版本：{infer_prompt_version(selected_prompt)}；"
         f"提取提示词版本：{infer_prompt_version(selected_extraction) if selected_extraction != '不提供提取提示词' else '未提供'}"
     )
+    with st.expander("查看或临时编辑提示词全文", expanded=False):
+        st.caption("这里的修改只影响本次建议任务，不会覆盖磁盘中的提示词文件。")
+        judge_prompt = st.text_area(
+            "当前裁判提示词内容",
+            value=load_prompt(selected_prompt),
+            height=300,
+            key=f"{key_prefix}_judge_prompt_text::{selected_prompt}",
+        )
+        extraction_prompt = st.text_area(
+            "当前提取提示词内容",
+            value=extraction_default_text,
+            height=240,
+            key=f"{key_prefix}_extraction_prompt_text::{selected_extraction}",
+        )
     return judge_prompt, extraction_prompt
 
 
@@ -303,12 +323,6 @@ def render_generation_controls(key_prefix: str) -> tuple[bool, int, str]:
         }
         target_label = st.selectbox("希望优化的对象", list(target_options.keys()), key=f"{key_prefix}_target")
     return mock, int(min_evidence), target_options[target_label]
-
-
-def ensure_prompt_advisor_threads() -> dict[str, threading.Thread]:
-    if "prompt_advisor_threads" not in st.session_state:
-        st.session_state.prompt_advisor_threads = {}
-    return st.session_state.prompt_advisor_threads
 
 
 def render_prompt_advisor_job_state(job_id: str) -> None:
@@ -338,7 +352,7 @@ def render_prompt_advisor_job_state(job_id: str) -> None:
 
     if status == "running":
         st.info("任务仍在后台运行。切换页面后再回来，进度会从状态文件恢复。")
-        if st.button("请求终止提示词建议", type="secondary", use_container_width=True, key=f"{job_id}_stop"):
+        if st.button("请求终止提示词建议", type="secondary", width="stretch", key=f"{job_id}_stop"):
             request_prompt_advisor_stop(job_id)
             st.warning("已写入终止请求。若任务正在等待或下一次调用前，会尽快停止；正在进行的单次模型调用无法强制中断。")
             st.rerun()
@@ -459,11 +473,20 @@ with tab_absolute:
 
     absolute_candidates = collect_absolute_eval_evidence(
         absolute_results,
-        max_items=max(1, len(absolute_results)),
+        max_items=int(max_items),
         score_threshold=float(score_threshold),
         include_all=bool(no_gate_extraction_loop),
+        positive_boundary_limit=0 if no_gate_extraction_loop else min(3, max(1, int(max_items) // 10)),
     ) if absolute_results else []
-    absolute_evidence = absolute_candidates[:int(max_items)]
+    absolute_evidence = absolute_candidates
+    evidence_composition: dict[str, int] = {}
+    for item in absolute_evidence:
+        mode = str(item.get("evidence_mode") or "unknown")
+        evidence_composition[mode] = evidence_composition.get(mode, 0) + 1
+    actionable_evidence_count = sum(
+        count for mode, count in evidence_composition.items()
+        if mode not in {"positive_boundary", "regression_boundary", "weak_context_from_result"}
+    )
     absolute_task_type = infer_single_task_type(absolute_results) if absolute_results else TaskType.USER_MD.value
 
     if absolute_results:
@@ -477,6 +500,10 @@ with tab_absolute:
         c3.metric("本次已选择", len(absolute_evidence))
         c4.metric("设置上限", int(max_items))
         st.caption(f"来源：{absolute_source_name or '未命名'}。证据按问题严重程度排序后取前 {int(max_items)} 条。")
+        st.caption(
+            f"证据组成：问题证据 {actionable_evidence_count}；正例/回归/弱上下文边界 "
+            f"{len(absolute_evidence) - actionable_evidence_count}。运行失败已自动排除。"
+        )
 
     if no_gate_extraction_loop:
         st.caption(f"当前会用于生成提取提示词候选的结果上下文：{len(absolute_evidence)} 条")
@@ -484,12 +511,12 @@ with tab_absolute:
         st.caption(f"当前会用于生成建议的普通评测证据：{len(absolute_evidence)} 条")
     if absolute_evidence:
         preview_cols = [
-            "case_id", "score_total", "fatal_error", "error_tags", "comment",
+            "evidence_mode", "case_id", "score_total", "fatal_error", "error_tags", "comment",
             "rule_refs", "evidence_refs", "output_refs",
         ]
         st.dataframe(
             pd.DataFrame(absolute_evidence).head(30)[[c for c in preview_cols if c in absolute_evidence[0]]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -506,22 +533,44 @@ with tab_absolute:
         abs_target = "extraction_prompt"
         st.caption("实验模式已开启：本次会跳过证据条数门槛，并强制目标为“只优化提取提示词”。")
 
-    if st.button("生成单模型评测建议", type="primary", use_container_width=True, key="abs_generate"):
+    cfg = dict(st.session_state.ui_config)
+    config = build_eval_config(cfg, mock=abs_mock)
+    render_workspace_context(
+        task_type=absolute_task_type,
+        case_count=len(absolute_results),
+        cases_file=absolute_source_name,
+        model_name=cfg.get("judge_model", ""),
+        judge_prompt=st.session_state.get("absolute_judge_prompt_file", ""),
+        extraction_prompt=st.session_state.get("absolute_extraction_prompt_file", ""),
+        mock=abs_mock,
+        title="本次提示词建议上下文",
+    )
+    advisor_checks = build_advisor_preflight(
+        results_count=len(absolute_results),
+        evidence_count=actionable_evidence_count if not no_gate_extraction_loop else len(absolute_evidence),
+        min_evidence=abs_min_evidence,
+        target=abs_target,
+        judge_prompt_text=absolute_judge_prompt,
+        extraction_prompt_text=absolute_extraction_prompt,
+        eval_config=config,
+    )
+    advisor_ready = render_preflight(advisor_checks)
+
+    if st.button(
+        "生成单模型评测建议",
+        type="primary",
+        width="stretch",
+        key="abs_generate",
+        disabled=not advisor_ready,
+    ):
         if not absolute_results:
             st.error("请先加载普通评测结果文件。无门槛模式也需要基于一批结果生成候选提取提示词。")
             st.stop()
         if no_gate_extraction_loop and not absolute_extraction_prompt.strip():
             st.error("无门槛生成提取提示词候选需要提供当前提取提示词，否则模型会编造完整 prompt。请先选择或粘贴提取提示词。")
             st.stop()
-        if len(absolute_evidence) < abs_min_evidence:
-            st.error(f"证据少于 {abs_min_evidence} 条，拒绝生成候选提示词。可以降低阈值或积累更多评测结果。")
-            st.stop()
-
-        cfg = dict(st.session_state.ui_config)
-        config = build_eval_config(cfg, mock=abs_mock)
-        errs = config.validate()
-        if errs:
-            st.error("配置错误：\n" + "\n".join([f"- {e}" for e in errs]))
+        if actionable_evidence_count < abs_min_evidence:
+            st.error(f"问题证据少于 {abs_min_evidence} 条，拒绝生成候选提示词。正例边界不计入门槛。")
             st.stop()
 
         job_id = f"advisor_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -537,16 +586,9 @@ with tab_absolute:
             source_name=absolute_source_name,
             eval_config=config,
         )
-        thread = threading.Thread(
-            target=run_prompt_advisor_job,
-            args=(job_config,),
-            daemon=True,
-            name=f"prompt-advisor-{job_id}",
-        )
-        thread.start()
-        ensure_prompt_advisor_threads()[job_id] = thread
+        launch_background_task("prompt_advisor", job_config)
         st.session_state.prompt_advisor_job_id = job_id
-        st.success(f"已启动后台提示词建议任务：{job_id}")
+        st.success(f"已启动独立后台提示词建议进程：{job_id}")
         st.rerun()
 
     st.divider()

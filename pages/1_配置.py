@@ -8,6 +8,9 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.ui.user_identity import require_page_identity
+require_page_identity()
+
 from src.schema import DIMENSION_WEIGHTS, EVALUATABLE_TASK_TYPES, TASK_TYPE_LABELS
 from src.eval.judge_client import RealJudgeClient
 from src.ui.config_store import load_config, save_config, build_eval_config, mask_token
@@ -21,13 +24,58 @@ from src.ui.prompt_editor import (
     infer_prompt_version,
     load_rubric,
 )
+from src.ui.prompt_diff import analyze_prompt_diff
+from src.ui.run_presets import render_run_preset_selector, render_save_current_preset
+from src.ui.theme import render_page_header
 
 
 def get_eval_task_choices() -> list[str]:
     return [task.value for task in EVALUATABLE_TASK_TYPES]
 
 
-st.title("配置")
+def render_prompt_comparison(
+    *,
+    current_file: str,
+    current_text: str,
+    prompt_files: list[str],
+    prompt_kind: str,
+    key: str,
+) -> None:
+    with st.expander("版本差异对比", expanded=False):
+        if not prompt_files:
+            st.info("暂无可对比的提示词版本。")
+            return
+        default_index = next((i for i, name in enumerate(prompt_files) if name != current_file), 0)
+        compare_file = st.selectbox(
+            "选择对照版本",
+            prompt_files,
+            index=default_index,
+            key=f"{key}_compare_file",
+        )
+        compare_text = load_prompt(compare_file, prompt_kind=prompt_kind)
+        summary = analyze_prompt_diff(
+            current_text,
+            compare_text,
+            old_name=current_file or "当前编辑文本",
+            new_name=compare_file,
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("新增行", summary.added_lines)
+        c2.metric("删除行", summary.removed_lines)
+        c3.metric("长度变化", f"{summary.growth_ratio * 100:+.1f}%")
+        c4.metric("重复标题", len(summary.duplicate_headings))
+        st.caption(
+            f"当前 Hash {summary.old_hash[:12]} · 对照 Hash {summary.new_hash[:12]} · "
+            f"字符数 {summary.old_chars} → {summary.new_chars}"
+        )
+        if summary.duplicate_headings:
+            st.warning("对照版本包含重复标题：" + "；".join(summary.duplicate_headings))
+        if summary.growth_ratio > 0.2:
+            st.warning("对照版本长度增长超过 20%，建议检查是否存在重复规则或针对具体 case 的补丁。")
+        st.code(summary.diff_text or "两个版本内容一致。", language="diff")
+
+
+render_page_header("配置", "管理模型接口、运行参数以及裁判与提取提示词版本。", category="基础设置")
 
 if "ui_config" not in st.session_state:
     st.session_state.ui_config = load_config()
@@ -65,6 +113,9 @@ if st.session_state.get("selected_prompt_task_type") != st.session_state.task_ty
         prompt_kind="extraction",
     )
     st.session_state.selected_prompt_task_type = st.session_state.task_type
+
+
+render_run_preset_selector(st.session_state.ui_config, key="config")
 
 
 col_api, col_prompt = st.columns([1, 1])
@@ -200,6 +251,14 @@ with col_api:
             step=1.0,
             help="遇到 QPS limit exceeded 时等待多久再重试。",
         )
+        prompt_cache_enabled = st.checkbox(
+            "启用接口 Prompt Cache",
+            value=str(cfg.get("judge_prompt_cache_location", "none") or "none") != "none",
+            help=(
+                "仅在接口说明明确支持 promptCacheId 时开启。系统会按任务类型和提示词内容自动生成缓存 ID。"
+                "它可减少相同长提示词的重复计算，但不会减少请求本身占用的上下文长度。"
+            ),
+        )
 
     cfg["judge_bearer_header_name"] = "Authorization"
     cfg["judge_call_from"] = ""
@@ -208,7 +267,7 @@ with col_api:
     cfg["judge_send_skip_special_tokens"] = True
     cfg["judge_skip_special_tokens"] = False
     cfg["judge_moderation_action"] = ""
-    cfg["judge_prompt_cache_location"] = "none"
+    cfg["judge_prompt_cache_location"] = "extra" if prompt_cache_enabled else "none"
     cfg["judge_prompt_cache_id"] = ""
     cfg["judge_extra_body_json"] = "{}"
     cfg["judge_custom_headers_json"] = "{}"
@@ -217,13 +276,13 @@ with col_api:
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("保存接口配置", use_container_width=True):
+        if st.button("保存接口配置", width="stretch"):
             st.session_state.ui_config = cfg
             save_config(cfg)
             st.success("已保存到 config/local_config.json")
 
     with c2:
-        if st.button("测试连接", use_container_width=True):
+        if st.button("测试连接", width="stretch"):
             test_cfg = build_eval_config(cfg, mock=False)
             errs = test_cfg.validate()
             if errs:
@@ -250,6 +309,8 @@ with col_api:
 
     if cfg.get("api_token"):
         st.caption(f"当前 token：{mask_token(cfg.get('api_token', ''))}")
+
+    render_save_current_preset(cfg, key="config")
 
 
 with col_prompt:
@@ -300,29 +361,38 @@ with col_prompt:
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("重新加载裁判提示词", use_container_width=True):
+            if st.button("重新加载裁判提示词", width="stretch"):
                 st.session_state.judge_prompt_text = load_prompt(st.session_state.selected_prompt_file)
                 st.rerun()
 
         with c2:
             st.caption(f"当前版本：{infer_prompt_version(st.session_state.selected_prompt_file)}")
 
-        st.session_state.judge_prompt_text = st.text_area(
-            "裁判提示词内容",
-            value=st.session_state.judge_prompt_text,
-            height=360,
-        )
+        with st.expander("查看、编辑并另存裁判提示词", expanded=False):
+            st.session_state.judge_prompt_text = st.text_area(
+                "裁判提示词内容",
+                value=st.session_state.judge_prompt_text,
+                height=360,
+            )
 
-        version_name = st.text_input(
-            "保存为新版本文件名",
-            value=f"judge_{task_type}_custom.md",
-            key="judge_prompt_save_name",
-        )
+            version_name = st.text_input(
+                "保存为新版本文件名",
+                value=f"judge_{task_type}_custom.md",
+                key="judge_prompt_save_name",
+            )
 
-        if st.button("保存为新裁判提示词版本", use_container_width=True):
-            saved = save_prompt_version(task_type, st.session_state.judge_prompt_text, version_name)
-            st.session_state.selected_prompt_file = saved
-            st.success(f"已保存：prompts/judge/{saved}")
+            if st.button("保存为新裁判提示词版本", width="stretch"):
+                saved = save_prompt_version(task_type, st.session_state.judge_prompt_text, version_name)
+                st.session_state.selected_prompt_file = saved
+                st.success(f"已保存：prompts/judge/{saved}")
+
+        render_prompt_comparison(
+            current_file=st.session_state.selected_prompt_file,
+            current_text=st.session_state.judge_prompt_text,
+            prompt_files=prompt_files,
+            prompt_kind="judge",
+            key="judge_prompt",
+        )
 
     with tab_extract:
         extraction_files = list_extraction_prompt_files()
@@ -352,7 +422,7 @@ with col_prompt:
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("重新加载提取提示词", use_container_width=True):
+            if st.button("重新加载提取提示词", width="stretch"):
                 st.session_state.extraction_prompt_text = load_prompt(
                     st.session_state.selected_extraction_prompt_file,
                     prompt_kind="extraction",
@@ -362,28 +432,37 @@ with col_prompt:
         with c2:
             st.caption(f"当前版本：{infer_prompt_version(st.session_state.selected_extraction_prompt_file)}")
 
-        st.session_state.extraction_prompt_text = st.text_area(
-            "提取提示词内容",
-            value=st.session_state.extraction_prompt_text,
-            height=360,
-            help=f"建议把真实线上提取 prompt 粘贴到这里，再另存为版本；裁判会引用这里的规则判断 {document_name} 是否稳定。",
-        )
-
-        extraction_version_name = st.text_input(
-            "保存为新版本文件名",
-            value=f"extract_{task_type}_custom.md",
-            key="extraction_prompt_save_name",
-        )
-
-        if st.button("保存为新提取提示词版本", use_container_width=True):
-            saved = save_prompt_version(
-                task_type,
-                st.session_state.extraction_prompt_text,
-                extraction_version_name,
-                prompt_kind="extraction",
+        with st.expander("查看、编辑并另存提取提示词", expanded=False):
+            st.session_state.extraction_prompt_text = st.text_area(
+                "提取提示词内容",
+                value=st.session_state.extraction_prompt_text,
+                height=360,
+                help=f"建议把真实线上提取 prompt 粘贴到这里，再另存为版本；裁判会引用这里的规则判断 {document_name} 是否稳定。",
             )
-            st.session_state.selected_extraction_prompt_file = saved
-            st.success(f"已保存：prompts/generation/{saved}")
+
+            extraction_version_name = st.text_input(
+                "保存为新版本文件名",
+                value=f"extract_{task_type}_custom.md",
+                key="extraction_prompt_save_name",
+            )
+
+            if st.button("保存为新提取提示词版本", width="stretch"):
+                saved = save_prompt_version(
+                    task_type,
+                    st.session_state.extraction_prompt_text,
+                    extraction_version_name,
+                    prompt_kind="extraction",
+                )
+                st.session_state.selected_extraction_prompt_file = saved
+                st.success(f"已保存：prompts/generation/{saved}")
+
+        render_prompt_comparison(
+            current_file=st.session_state.selected_extraction_prompt_file,
+            current_text=st.session_state.extraction_prompt_text,
+            prompt_files=extraction_files,
+            prompt_kind="extraction",
+            key="extraction_prompt",
+        )
 
 
 st.subheader("当前评分标准和权重")

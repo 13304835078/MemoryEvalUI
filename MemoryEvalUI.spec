@@ -22,6 +22,7 @@ datas = [
     (".streamlit", ".streamlit"),
     ("pages", "pages"),
     ("src", "src"),  # Keep src as a real directory under _internal/src.
+    ("assets", "assets"),
     ("prompts", "prompts"),
     ("rules", "rules"),
 ]

@@ -1,8 +1,11 @@
 [server]
 maxUploadSize = 1024
-enableXsrfProtection = false
-enableCORS = false
+enableXsrfProtection = true
+enableCORS = true
 fileWatcherType = "none"
 
 [global]
 developmentMode = false
+
+[client]
+showSidebarNavigation = true

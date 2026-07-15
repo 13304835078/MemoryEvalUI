@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +8,9 @@ import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.ui.user_identity import require_page_identity
+require_page_identity()
 
 from src.schema import (
     EVALUATABLE_TASK_TYPES,
@@ -20,6 +22,7 @@ from src.ui.config_store import load_config, build_eval_config
 from src.ui.eval_job_runner import (
     EvalJobConfig,
     RESUME_SKIP_ALL,
+    RESUME_SKIP_NON_FATAL,
     RESUME_STRATEGIES,
     eval_job_is_running,
     eval_job_is_stale,
@@ -28,8 +31,8 @@ from src.ui.eval_job_runner import (
     mark_eval_job_interrupted,
     read_eval_job_state,
     request_eval_stop,
-    run_eval_job,
 )
+from src.ui.task_worker import launch_background_task
 from src.ui.prompt_editor import (
     get_default_prompt_file,
     get_default_extraction_prompt_file,
@@ -47,6 +50,11 @@ from src.ui.data_service import (
     RESULTS_DIR,
 )
 from src.ui.components import render_state_file_notice
+from src.ui.next_actions import NextAction, render_next_actions
+from src.ui.preflight import build_eval_preflight, render_preflight
+from src.ui.run_presets import render_run_preset_selector
+from src.ui.theme import render_page_header
+from src.ui.workspace_context import render_workspace_context
 
 
 def get_eval_task_choices() -> list[str]:
@@ -66,12 +74,6 @@ def find_extraction_prompt_file(version: str = "", prompt_hash: str = "") -> str
     return ""
 
 
-def ensure_eval_job_threads() -> dict[str, threading.Thread]:
-    if "eval_job_threads" not in st.session_state:
-        st.session_state.eval_job_threads = {}
-    return st.session_state.eval_job_threads
-
-
 def render_eval_job_state(job_id: str) -> None:
     state = read_eval_job_state(job_id)
     if eval_job_is_stale(state):
@@ -87,12 +89,15 @@ def render_eval_job_state(job_id: str) -> None:
 
     st.subheader("后台评测进度")
     st.progress(progress_value)
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("状态", status or "-")
     c2.metric("进度", f"{done}/{total}")
     c3.metric("新增评测", int(state.get("evaluated", 0) or 0))
     c4.metric("跳过", int(state.get("skipped", 0) or 0))
-    c5.metric("严重失败", int(state.get("fatal_count", 0) or 0))
+    c5.metric("成功评分", int(state.get("scored_count", 0) or 0))
+    c6.metric("Judge失败", int(state.get("judge_failure_count", 0) or 0))
+    if int(state.get("fatal_count", 0) or 0):
+        st.caption(f"已成功评分的结果中，Judge 判定严重质量错误 {int(state.get('fatal_count', 0) or 0)} 条。")
 
     st.write(state.get("message", ""))
     if state.get("effective_request_interval") is not None:
@@ -105,17 +110,17 @@ def render_eval_job_state(job_id: str) -> None:
 
     if status == "running":
         st.info("任务仍在后台运行。切换页面后再回来，进度会从状态文件恢复。")
-        if st.button("请求终止评测任务", type="secondary", use_container_width=True, key=f"{job_id}_stop"):
+        if st.button("请求终止评测任务", type="secondary", width="stretch", key=f"{job_id}_stop"):
             request_eval_stop(job_id)
             st.warning("已写入终止请求。已发出的单次 Judge 调用无法立即强制中断，会在下一个检查点停止，未开始的样本不会继续提交。")
             st.rerun()
     elif status == "interrupted":
-        st.warning("任务状态为已中断。通常是程序关闭或后台线程退出导致；可以重新开始评测，或选择已有结果文件断点续跑。")
+        st.warning("任务状态为已中断。通常是后台进程异常退出或机器重启导致；可以重新开始评测，或选择已有结果文件断点续跑。")
     elif status == "stopped":
         st.warning("任务已按请求终止。已完成结果保留在结果文件中，可以断点续跑。")
 
     if status in {"interrupted", "stopped"}:
-        if st.button("载入该任务并从中断处继续", key=f"{job_id}_resume_interrupted", use_container_width=True):
+        if st.button("载入该任务并从中断处继续", key=f"{job_id}_resume_interrupted", width="stretch"):
             job_config = state.get("config") if isinstance(state.get("config"), dict) else {}
             extraction_file = find_extraction_prompt_file(
                 str(job_config.get("extraction_prompt_version") or ""),
@@ -123,7 +128,7 @@ def render_eval_job_state(job_id: str) -> None:
             )
             st.session_state.resume_prefill = {
                 "resume_enabled": True,
-                "resume_strategy": RESUME_SKIP_ALL,
+                "resume_strategy": RESUME_SKIP_NON_FATAL,
                 "resume_result_path": state.get("output_path", ""),
                 "task_type": job_config.get("task_type", ""),
                 "selected_prompt_file": job_config.get("prompt_file", ""),
@@ -140,7 +145,11 @@ def render_eval_job_state(job_id: str) -> None:
         if results:
             st.session_state.results = results
             st.session_state.results_file = state.get("output_path", "")
-            st.dataframe(results_to_dataframe(results).head(50), use_container_width=True, hide_index=True)
+            st.dataframe(results_to_dataframe(results).head(50), width="stretch", hide_index=True)
+            render_next_actions([
+                NextAction("pages/4_结果总览.py", "查看结果总览", ":material/analytics:"),
+                NextAction("pages/5_样本详情.py", "复核样本详情", ":material/fact_check:"),
+            ])
 
     if state.get("traceback"):
         with st.expander("错误堆栈", expanded=True):
@@ -201,7 +210,7 @@ def render_eval_job_panel(job_ids: list[str], last_job_id: str = "") -> str:
     return last_job_id
 
 
-st.title("执行评测")
+render_page_header("执行评测", "使用裁判模型对 USER.md 或 MEMORY.md 做单模型绝对评测。", category="评测工作流")
 
 if "cases" not in st.session_state:
     st.session_state.cases = []
@@ -255,7 +264,7 @@ if cases:
 else:
     files = list_case_files()
     if not files:
-        st.warning("没有可用样本文件，请先到「数据输入」页生成。")
+        st.warning("没有可用样本文件，请先到「评测数据」页导入，或在「记忆提取」完成后加载 case。")
         if job_ids:
             st.divider()
             st.info("当前没有加载样本，但可以先查看已有后台任务进度。")
@@ -266,7 +275,7 @@ else:
     selected = st.selectbox("选择样本文件", labels)
     selected_path = files[labels.index(selected)]
 
-    if st.button("加载样本文件", use_container_width=True):
+    if st.button("加载样本文件", width="stretch"):
         cases = cases_from_jsonl(selected_path)
         st.session_state.cases = cases
         st.session_state.cases_file = selected_path
@@ -309,6 +318,7 @@ task_type = st.selectbox(
 st.session_state.task_type = task_type
 
 cfg = dict(st.session_state.ui_config)
+render_run_preset_selector(cfg, key="eval")
 mock = st.checkbox("模拟模式", value=bool(cfg.get("mock", True)))
 limit = st.number_input("评测条数（0 表示全部）", min_value=0, value=0, step=1)
 cfg["judge_concurrency"] = st.number_input(
@@ -350,6 +360,11 @@ st.session_state.selected_prompt_file = selected_prompt_file
 use_edited_prompt = st.checkbox(
     "使用配置页中编辑过的裁判提示词文本覆盖文件内容",
     value=False,
+)
+judge_prompt_preview_text = (
+    st.session_state.get("judge_prompt_text", "")
+    if use_edited_prompt
+    else load_prompt(selected_prompt_file)
 )
 
 extraction_prompt_files = list_extraction_prompt_files()
@@ -396,6 +411,19 @@ else:
         f"Hash {extraction_prompt_hash_preview[:12] if extraction_prompt_hash_preview else '空'}"
     )
 
+render_workspace_context(
+    task_type=task_type,
+    case_count=len(cases),
+    cases_file=st.session_state.get("cases_file", ""),
+    model_name=cfg.get("judge_model", ""),
+    judge_prompt=selected_prompt_file,
+    extraction_prompt=(
+        selected_extraction_prompt_file
+        if selected_extraction_prompt_file != NO_EXTRACTION_PROMPT else ""
+    ),
+    mock=mock,
+)
+
 with st.expander("当前接口配置", expanded=False):
     st.write({
         "模拟模式": mock,
@@ -415,6 +443,7 @@ with st.expander("当前接口配置", expanded=False):
         "裁判提示词版本": infer_prompt_version(selected_prompt_file),
         "提取提示词版本": extraction_prompt_version_preview or "未使用",
         "提取提示词Hash": extraction_prompt_hash_preview[:12] if extraction_prompt_hash_preview else "",
+        "接口 Prompt Cache": "启用" if str(cfg.get("judge_prompt_cache_location", "none")) != "none" else "关闭",
     })
 
 
@@ -437,6 +466,10 @@ if st.session_state.get("resume_notice"):
     st.info(st.session_state.pop("resume_notice"))
 
 resume_enabled = st.checkbox("从已有结果文件断点续跑", key="resume_enabled")
+st.caption(
+    "系统会比较样本正文、reasoning、裁判提示词、提取规则、模型接口和解码参数的完整评测指纹。"
+    "只有指纹完全一致才复用；旧版无指纹结果会安全地重新评测。"
+)
 resume_strategy = st.selectbox(
     "已有结果处理",
     RESUME_STRATEGIES,
@@ -467,8 +500,24 @@ active_running = bool(last_job_id and eval_job_is_running(last_job_id))
 if active_running:
     st.info("当前已有后台评测任务运行中。进度不会因为切换页面丢失。")
 
-if st.button("开始评测", type="primary", use_container_width=True, disabled=active_running):
-    run_cases = cases[:limit] if limit and limit > 0 else cases
+run_cases = cases[:limit] if limit and limit > 0 else cases
+config = build_eval_config(cfg, mock=mock)
+preflight_checks = build_eval_preflight(
+    cases=run_cases,
+    task_type=task_type,
+    eval_config=config,
+    judge_prompt_text=judge_prompt_preview_text,
+    extraction_prompt_text=extraction_prompt_preview_text,
+    extraction_prompt_selected=selected_extraction_prompt_file != NO_EXTRACTION_PROMPT,
+)
+preflight_ready = render_preflight(preflight_checks)
+
+if st.button(
+    "开始评测",
+    type="primary",
+    width="stretch",
+    disabled=active_running or not preflight_ready,
+):
     interval = float(cfg.get("judge_request_interval", 0) or 0) if not mock else 0.0
     concurrency = min(100, max(1, int(cfg.get("judge_concurrency", 1) or 1)))
     if interval > 0:
@@ -477,12 +526,6 @@ if st.button("开始评测", type="primary", use_container_width=True, disabled=
             f"当前设置了请求间隔 {interval:.1f}s，并发数 {concurrency}。"
             f"请求启动会按间隔排队，预计至少需要约 {estimated/60:.1f} 分钟。"
         )
-
-    config = build_eval_config(cfg, mock=mock)
-    errs = config.validate()
-    if errs:
-        st.error("配置错误：\n" + "\n".join([f"- {e}" for e in errs]))
-        st.stop()
 
     system_prompt_override = st.session_state.get("judge_prompt_text", "") if use_edited_prompt else ""
     judge_prompt_version = infer_prompt_version(selected_prompt_file)
@@ -528,15 +571,8 @@ if st.button("开始评测", type="primary", use_container_width=True, disabled=
         eval_config=config,
     )
 
-    thread = threading.Thread(
-        target=run_eval_job,
-        args=(job_config, run_cases, existing_results),
-        daemon=True,
-        name=f"eval-job-{job_id}",
-    )
-    thread.start()
-    ensure_eval_job_threads()[job_id] = thread
+    launch_background_task("eval", job_config, cases=run_cases, existing_results=existing_results)
     st.session_state.eval_job_id = job_id
     st.session_state.results_file = str(out_path)
-    st.success(f"已启动后台评测任务：{job_id}")
+    st.success(f"已启动独立后台评测进程：{job_id}。切换页面或重启 Streamlit 不会终止正在运行的任务。")
     st.rerun()

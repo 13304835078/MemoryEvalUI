@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -11,15 +10,21 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.ui.user_identity import require_page_identity
+require_page_identity()
+
 from src.extraction.memory_extractor import (
     EXTRACTION_OUTPUT_DIR,
     MemoryExtractionConfig,
     load_generation_prompt_templates,
     sanitize_filename,
 )
-from src.schema import TASK_TYPE_LABELS, TaskType
+from src.schema import TASK_TYPE_LABELS, TaskType, cases_from_jsonl
 from src.ui.config_store import build_eval_config, load_config
 from src.ui.components import render_state_file_notice
+from src.ui.next_actions import NextAction, render_next_actions
+from src.ui.preflight import build_extraction_preflight, render_preflight
+from src.ui.run_presets import render_run_preset_selector
 from src.ui.data_service import (
     save_uploaded_file,
 )
@@ -39,8 +44,10 @@ from src.ui.memory_extraction_job_runner import (
     memory_extraction_job_is_stale,
     read_memory_extraction_job_state,
     request_memory_extraction_stop,
-    run_memory_extraction_job,
 )
+from src.ui.task_worker import launch_background_task
+from src.ui.theme import render_page_header
+from src.ui.workspace_context import render_workspace_context
 
 
 CONFIG_PROMPT = "使用配置页当前编辑文本"
@@ -54,14 +61,31 @@ EXTRACTION_CORE_COLUMNS = [
     "轮次",
     "query",
     "answer",
-    "status",
+    "call_status",
+    "parse_status",
+    "case_status",
+    "propagation_status",
     "error",
     "user.md",
     "旧MEMORY.md",
     "MEMORY.md",
     "当前使用的模板",
 ]
-EXTRACTION_DETAIL_COLUMNS = EXTRACTION_CORE_COLUMNS + ["reasoning", "result", "模型原始返回"]
+EXTRACTION_DETAIL_COLUMNS = EXTRACTION_CORE_COLUMNS + [
+    "status",
+    "task_profile_id",
+    "inheritance_source",
+    "parse_method",
+    "parse_confidence",
+    "parse_warnings",
+    "old_effective_document",
+    "raw_output",
+    "parsed_document",
+    "effective_document",
+    "reasoning",
+    "result",
+    "模型原始返回",
+]
 
 
 def existing_columns(df: pd.DataFrame, columns: list[str]) -> list[str]:
@@ -72,7 +96,18 @@ def chunk_result_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     markers = [
-        col for col in ["status", "user.md", "MEMORY.md", "error", "result", "模型原始返回", "reasoning"]
+        col for col in [
+            "case_status",
+            "status",
+            "effective_document",
+            "user.md",
+            "MEMORY.md",
+            "error",
+            "raw_output",
+            "result",
+            "模型原始返回",
+            "reasoning",
+        ]
         if col in df.columns
     ]
     if not markers:
@@ -93,7 +128,7 @@ def render_extraction_dataframe_preview(df: pd.DataFrame, *, max_rows: int = 80)
     result_df = chunk_result_rows(df.fillna(""))
     st.dataframe(
         core_extraction_view(result_df.head(max_rows)),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -106,14 +141,23 @@ def render_extraction_detail_view(output_path: str, key_prefix: str) -> None:
     with st.expander("详细查看提取结果", expanded=False):
         full_df = pd.read_excel(path).fillna("")
         result_df = chunk_result_rows(full_df)
+        if "propagation_status" in result_df.columns:
+            blocked = int((result_df["propagation_status"].astype(str) == "blocked_low_confidence").sum())
+            if blocked:
+                st.warning(
+                    f"有 {blocked} 个低置信解析结果被保留为待复核候选，但未继承到后续 chunk。"
+                    "后续提取继续使用最近一次可靠正文，避免错误传播。"
+                )
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Excel总行数", len(full_df))
         c2.metric("chunk结果行", len(result_df))
-        if "status" in result_df.columns:
-            c3.metric("成功chunk", int((result_df["status"].astype(str) == "SUCCESS").sum()))
+        if "call_status" in result_df.columns:
+            c3.metric("调用成功chunk", int((result_df["call_status"].astype(str) == "success").sum()))
+        elif "status" in result_df.columns:
+            c3.metric("调用成功chunk", int(result_df["status"].astype(str).str.startswith("SUCCESS").sum()))
         else:
-            c3.metric("成功chunk", "-")
+            c3.metric("调用成功chunk", "-")
 
         filter_df = result_df.copy()
         f1, f2 = st.columns(2)
@@ -122,14 +166,15 @@ def render_extraction_detail_view(output_path: str, key_prefix: str) -> None:
             selected_reviewer = f1.selectbox("筛选评测人", reviewers, key=f"{key_prefix}_reviewer")
             if selected_reviewer != "全部":
                 filter_df = filter_df[filter_df["评测人"].astype(str) == selected_reviewer]
-        if "status" in filter_df.columns:
-            statuses = ["全部"] + sorted([x for x in filter_df["status"].astype(str).unique() if x])
-            selected_status = f2.selectbox("筛选状态", statuses, key=f"{key_prefix}_status")
+        filter_status_column = "case_status" if "case_status" in filter_df.columns else "status"
+        if filter_status_column in filter_df.columns:
+            statuses = ["全部"] + sorted([x for x in filter_df[filter_status_column].astype(str).unique() if x])
+            selected_status = f2.selectbox("筛选Case状态", statuses, key=f"{key_prefix}_status")
             if selected_status != "全部":
-                filter_df = filter_df[filter_df["status"].astype(str) == selected_status]
+                filter_df = filter_df[filter_df[filter_status_column].astype(str) == selected_status]
 
         st.markdown("**chunk结果列表**")
-        st.dataframe(core_extraction_view(filter_df, detail=False), use_container_width=True, hide_index=True)
+        st.dataframe(core_extraction_view(filter_df, detail=False), width="stretch", hide_index=True)
 
         if not filter_df.empty:
             labels = []
@@ -137,7 +182,7 @@ def render_extraction_detail_view(output_path: str, key_prefix: str) -> None:
             for idx, row in filter_df.iterrows():
                 labels.append(
                     f"行{idx + 2} | {row.get('评测人', '')} | session {row.get('session_id', '')} | "
-                    f"chunk {row.get('chunk_id', '')} | {row.get('status', '')}"
+                    f"chunk {row.get('chunk_id', '')} | {row.get('case_status', '') or row.get('status', '')}"
                 )
             selected_label = st.selectbox("查看单个chunk详情", labels, key=f"{key_prefix}_chunk_select")
             selected_index = index_values[labels.index(selected_label)]
@@ -150,24 +195,26 @@ def render_extraction_detail_view(output_path: str, key_prefix: str) -> None:
                     chunk_df = chunk_df[chunk_df[col].astype(str) == str(row.get(col, ""))]
             dialogue_cols = existing_columns(chunk_df, ["轮次", "query", "answer"])
             if dialogue_cols:
-                st.dataframe(chunk_df[dialogue_cols], use_container_width=True, hide_index=True)
+                st.dataframe(chunk_df[dialogue_cols], width="stretch", hide_index=True)
 
             t1, t2 = st.columns(2)
             output_column = "MEMORY.md" if "MEMORY.md" in row.index else "user.md"
             document_name = "MEMORY.md" if output_column == "MEMORY.md" else "USER.md"
             raw_column = "模型原始返回" if "模型原始返回" in row.index else "result"
+            old_document = str(row.get("old_effective_document", "") or row.get("旧MEMORY.md", ""))
+            effective_document = str(row.get("effective_document", "") or row.get(output_column, ""))
+            raw_output = str(row.get("raw_output", "") or row.get(raw_column, ""))
             with t1:
-                if document_name == "MEMORY.md":
-                    st.text_area(
-                        "提取前的 MEMORY.md",
-                        value=str(row.get("旧MEMORY.md", "")),
-                        height=140,
-                        disabled=True,
-                        key=f"{key_prefix}_old_memory",
-                    )
                 st.text_area(
-                    f"提取后的 {document_name}",
-                    value=str(row.get(output_column, "")),
+                    f"提取前的 {document_name}",
+                    value=old_document,
+                    height=140,
+                    disabled=True,
+                    key=f"{key_prefix}_old_memory",
+                )
+                st.text_area(
+                    f"本轮生效的 {document_name}",
+                    value=effective_document,
                     height=220,
                     disabled=True,
                     key=f"{key_prefix}_document",
@@ -177,12 +224,28 @@ def render_extraction_detail_view(output_path: str, key_prefix: str) -> None:
             with t2:
                 if document_name == "MEMORY.md":
                     st.caption(f"本次模板：{row.get('当前使用的模板', '') or '未记录'}")
+                if str(row.get("call_status", "")).strip():
+                    st.caption(
+                        "处理状态："
+                        f"调用 {row.get('call_status', '')} / "
+                        f"解析 {row.get('parse_status', '') or '未记录'} / "
+                        f"Case {row.get('case_status', '') or '未记录'} / "
+                        f"继承来源 {row.get('inheritance_source', '') or '未记录'}"
+                    )
+                if str(row.get("parse_method", "")).strip():
+                    confidence = row.get("parse_confidence", "")
+                    st.caption(
+                        f"正文解析：{row.get('parse_method', '')}"
+                        + (f"，置信度 {confidence}" if str(confidence).strip() else "")
+                    )
+                if str(row.get("parse_warnings", "")).strip():
+                    st.warning(f"解析提示：{row.get('parse_warnings', '')}")
                 st.text_area("模型 reasoning", value=str(row.get("reasoning", "")), height=160, disabled=True, key=f"{key_prefix}_reasoning")
-                st.text_area("模型原始输出", value=str(row.get(raw_column, "")), height=180, disabled=True, key=f"{key_prefix}_result")
+                st.text_area("模型原始输出", value=raw_output, height=180, disabled=True, key=f"{key_prefix}_result")
 
         with st.expander("排查用：查看完整Excel原始列", expanded=False):
             st.caption("这里保留所有原始列，例如 soul.md 检索召回、研发说明、备注摘要等，只在排查输入数据时查看。")
-            st.dataframe(full_df.head(300), use_container_width=True, hide_index=True)
+            st.dataframe(full_df.head(300), width="stretch", hide_index=True)
 
 
 def resolve_sheet_name(raw: str) -> str | int | None:
@@ -239,12 +302,6 @@ def load_input_excel(uploaded_file, local_path: str) -> str:
     return local_path
 
 
-def ensure_memory_extraction_threads() -> dict[str, threading.Thread]:
-    if "memory_extraction_threads" not in st.session_state:
-        st.session_state.memory_extraction_threads = {}
-    return st.session_state.memory_extraction_threads
-
-
 def render_memory_extraction_job_state(job_id: str) -> None:
     state = read_memory_extraction_job_state(job_id)
     if memory_extraction_job_is_stale(state):
@@ -269,7 +326,7 @@ def render_memory_extraction_job_state(job_id: str) -> None:
     st.write(state.get("message", ""))
 
     if status == "running":
-        if st.button("请求终止记忆提取", type="secondary", use_container_width=True, key=f"{job_id}_stop"):
+        if st.button("请求终止记忆提取", type="secondary", width="stretch", key=f"{job_id}_stop"):
             request_memory_extraction_stop(job_id)
             st.warning("已写入终止请求。当前 API 调用返回后会在下一个检查点停止。")
             st.rerun()
@@ -295,6 +352,19 @@ def render_memory_extraction_job_state(job_id: str) -> None:
             st.json(stats)
     case_stats = state.get("case_stats") or {}
     if case_stats:
+        call_counts = case_stats.get("call_status_counts") or {}
+        parse_counts = case_stats.get("parse_status_counts") or {}
+        case_counts = case_stats.get("case_status_counts") or {}
+        st.markdown("**提取运行完整度**")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("可评测 case", case_stats.get("generated_cases", 0))
+        s2.metric("需人工确认", case_counts.get("review_required", 0))
+        s3.metric("提取正文为空", parse_counts.get("empty", 0))
+        s4.metric("接口失败/终止", int(call_counts.get("failed", 0)) + int(call_counts.get("stopped", 0)))
+        st.caption(
+            "接口失败/终止属于运行问题，不计为模型质量 0 分；接口成功但没有可用正文属于提取质量失败。"
+            "raw_fallback 会生成“需人工确认”的 case，而不是静默丢弃。"
+        )
         with st.expander("查看 case 生成统计", expanded=False):
             st.json(case_stats)
 
@@ -310,10 +380,29 @@ def render_memory_extraction_job_state(job_id: str) -> None:
             data=Path(output_path).read_bytes(),
             file_name=Path(output_path).name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
             key=f"{job_id}_download_output",
         )
         render_extraction_detail_view(output_path, key_prefix=f"{job_id}_detail")
+
+    cases_path = str(state.get("cases_path") or "")
+    if status == "completed" and cases_path and Path(cases_path).exists():
+        if st.button(
+            "加载 case 并进入执行评测",
+            type="primary",
+            width="stretch",
+            key=f"{job_id}_open_eval",
+        ):
+            loaded_cases = cases_from_jsonl(cases_path)
+            st.session_state.cases = loaded_cases
+            st.session_state.cases_file = cases_path
+            missed_cases_path = str(state.get("missed_cases_path") or "")
+            if missed_cases_path and Path(missed_cases_path).exists():
+                st.session_state.missed_cases = cases_from_jsonl(missed_cases_path)
+                st.session_state.missed_cases_file = missed_cases_path
+            if loaded_cases:
+                st.session_state.task_type = loaded_cases[0].task_type.value
+            st.switch_page("pages/3_执行评测.py")
 
     if state.get("traceback"):
         with st.expander("错误堆栈", expanded=True):
@@ -325,8 +414,11 @@ def render_memory_extraction_job_state_auto(job_id: str) -> None:
     render_memory_extraction_job_state(job_id)
 
 
-st.title("记忆提取")
-st.caption("单独运行 USER.md 用户画像或 MEMORY.md 长期记忆提取；可选继续生成评测 case。")
+render_page_header(
+    "记忆提取",
+    "从原始对话 Excel 生成 USER.md 用户画像或 MEMORY.md 长期记忆，并可自动生成评测 case。",
+    category="提取工作流",
+)
 
 if "ui_config" not in st.session_state:
     st.session_state.ui_config = load_config()
@@ -336,6 +428,7 @@ if "cases_file" not in st.session_state:
     st.session_state.cases_file = ""
 
 cfg = dict(st.session_state.ui_config)
+render_run_preset_selector(cfg, key="memory_extraction")
 extraction_task_type = st.selectbox(
     "提取任务",
     [TaskType.USER_MD.value, TaskType.LONG_MEMORY.value],
@@ -344,7 +437,7 @@ extraction_task_type = st.selectbox(
 )
 document_name = "MEMORY.md" if extraction_task_type == TaskType.LONG_MEMORY.value else "USER.md"
 
-with st.expander("使用说明", expanded=True):
+with st.expander("使用说明", expanded=False):
     st.markdown(
         f"""
 1. 上传或填写原始对话 Excel，列至少包含：`轮次`、`query`、`answer`、`评测人`。
@@ -379,10 +472,9 @@ with st.container(border=True):
     if default_extraction_prompt and default_extraction_prompt not in extraction_prompt_files:
         extraction_prompt_files = [default_extraction_prompt] + extraction_prompt_files
 
-    prompt_source = st.radio(
+    prompt_source = st.selectbox(
         "提示词来源",
         [SAVED_PROMPT, CONFIG_PROMPT, LOCAL_PROMPT],
-        horizontal=True,
         help="推荐使用已保存文件，便于记录版本和复现。",
     )
 
@@ -503,17 +595,40 @@ job_ids = list_memory_extraction_job_ids()
 last_job_id = st.session_state.get("memory_extraction_job_id", "")
 active_running = bool(last_job_id and memory_extraction_job_is_running(last_job_id))
 
-if st.button("开始记忆提取", type="primary", use_container_width=True, disabled=not input_ready or active_running):
+eval_config = build_eval_config({**cfg, "judge_model": extract_model, "mock": mock}, mock=mock)
+render_workspace_context(
+    task_type=extraction_task_type,
+    case_count=None,
+    cases_file=(uploaded.name if uploaded is not None else local_excel_path),
+    model_name=extract_model,
+    extraction_prompt=selected_prompt_file or extraction_prompt_version,
+    mock=mock,
+)
+preflight_checks = build_extraction_preflight(
+    uploaded_name=uploaded.name if uploaded is not None else "",
+    local_path=local_excel_path,
+    prompt_text=extraction_prompt_text,
+    eval_config=eval_config,
+    model_name=extract_model,
+    concurrency=int(extraction_concurrency),
+    request_interval=float(request_interval),
+    auto_make_cases=bool(auto_make_cases),
+    case_model_name=model_name_for_case,
+    case_prompt_version=prompt_version_for_case,
+)
+preflight_ready = render_preflight(preflight_checks)
+
+if st.button(
+    "开始记忆提取",
+    type="primary",
+    width="stretch",
+    disabled=not input_ready or active_running or not preflight_ready,
+):
     try:
         if not extraction_prompt_text.strip():
             raise ValueError("提取提示词为空，请先选择或填写提取 prompt。")
 
         input_path = load_input_excel(uploaded, local_excel_path)
-        eval_config = build_eval_config({**cfg, "mock": mock}, mock=mock)
-        errors = eval_config.validate()
-        if errors:
-            raise ValueError("接口配置错误：\n" + "\n".join([f"- {item}" for item in errors]))
-
         extraction_config = MemoryExtractionConfig.from_eval_config(
             eval_config,
             model=extract_model,
@@ -554,16 +669,9 @@ if st.button("开始记忆提取", type="primary", use_container_width=True, dis
             case_prompt_version=prompt_version_for_case,
             extraction_config=extraction_config,
         )
-        thread = threading.Thread(
-            target=run_memory_extraction_job,
-            args=(job_config,),
-            daemon=True,
-            name=f"memory-extraction-{job_id}",
-        )
-        thread.start()
-        ensure_memory_extraction_threads()[job_id] = thread
+        launch_background_task("memory_extraction", job_config)
         st.session_state.memory_extraction_job_id = job_id
-        st.success(f"已启动后台记忆提取任务：{job_id}")
+        st.success(f"已启动独立后台记忆提取进程：{job_id}")
         st.rerun()
     except Exception as exc:
         st.error(f"记忆提取失败：{exc}")
@@ -612,7 +720,7 @@ if files:
     selected_label = st.selectbox("选择历史提取 Excel", labels)
     selected_path = files[labels.index(selected_label)]
     st.caption(str(selected_path))
-    if st.button("预览历史提取结果", use_container_width=True):
+    if st.button("预览历史提取结果", width="stretch"):
         st.markdown("**历史提取结果预览（核心列）**")
         render_extraction_dataframe_preview(pd.read_excel(selected_path).fillna(""), max_rows=80)
         render_extraction_detail_view(str(selected_path), key_prefix=f"history_{selected_path.stem}")
@@ -621,7 +729,7 @@ if files:
         data=selected_path.read_bytes(),
         file_name=selected_path.name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
     )
 else:
     st.info("暂无历史提取结果。")

@@ -8,6 +8,8 @@ data/**
 !data/**/.gitkeep
 logs/**
 !logs/.gitkeep
+system/**
+workspaces/**
 
 # build artifacts
 build/

@@ -10,6 +10,9 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.ui.user_identity import require_page_identity
+require_page_identity()
+
 from src.loop.closed_loop import (
     CLOSED_LOOP_DIR,
     loop_state_is_stale,
@@ -56,10 +59,15 @@ from src.ui.prompt_advisor_job_runner import (
     update_prompt_advisor_job_controls,
 )
 from src.ui.components import render_state_file_notice
+from src.ui.theme import render_page_header
 
 
-st.title("任务中心")
-st.caption("集中查看后台任务状态。切换页面不会中断后台任务，但关闭应用进程会中断正在运行的线程。")
+render_page_header(
+    "任务中心",
+    "集中查看后台任务状态、调整可变参数与提交终止请求。",
+    category="运行管理",
+)
+st.caption("切换页面不会中断后台任务；关闭应用进程会中断正在运行的线程。")
 
 
 def _list_loop_ids() -> list[str]:
@@ -245,7 +253,7 @@ def _render_runtime_controls(task_type: str, job_id: str, state: dict[str, Any])
             else:
                 c2.info("该任务当前只支持调整优先级。")
 
-            submitted = st.form_submit_button("保存运行中参数", type="primary", use_container_width=True)
+            submitted = st.form_submit_button("保存运行中参数", type="primary", width="stretch")
             if submitted:
                 if _update_controls(task_type, job_id, updates):
                     st.success("已保存运行中参数，后台任务会在后续调度点读取。")
@@ -284,7 +292,7 @@ def _job_rows() -> list[dict[str, Any]]:
     return rows
 
 
-with st.expander("使用说明", expanded=True):
+with st.expander("使用说明", expanded=False):
     st.markdown(
         """
 - 这里展示所有后台任务：执行评测、记忆提取、闭环实验、提示词建议、裁判提示词 A/B 对比。
@@ -310,7 +318,7 @@ def render_task_table() -> None:
         return
 
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
 
     running_count = int((df["状态"] == "running").sum()) if "状态" in df else 0
     c1, c2, c3 = st.columns(3)
@@ -339,7 +347,7 @@ if rows:
     st.json(selected_state)
     _render_runtime_controls(selected_type, selected_id, selected_state)
     if selected_state.get("status") == "running":
-        if st.button("请求终止该任务", type="secondary", use_container_width=True):
+        if st.button("请求终止该任务", type="secondary", width="stretch"):
             if _request_stop(selected_type, selected_id):
                 st.warning("已写入终止请求。已发出的单次 API 调用无法立即强制中断，会在下一个检查点停止。")
                 st.rerun()
