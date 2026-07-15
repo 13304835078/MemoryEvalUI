@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -8,6 +9,15 @@ from typing import Any
 
 import pandas as pd
 
+from src.extraction.document_parser import normalize_memory_document_body
+from src.extraction.contracts import (
+    CallStatus,
+    CaseStatus,
+    InheritanceSource,
+    ParseStatus,
+    coerce_extraction_state,
+    get_extraction_task_profile,
+)
 from src.schema import (
     Case,
     DialogueTurn,
@@ -20,6 +30,7 @@ from src.schema import (
     results_from_jsonl,
 )
 from src.eval.metrics import flatten_results
+from src.eval.result_status import STATUS_LABELS, result_evaluation_status, result_is_score_eligible
 from src.runtime_paths import APP_HOME, DATA_DIR, ensure_writable_layout
 from src.persistence import atomic_write_bytes
 
@@ -37,6 +48,18 @@ def _first_nonempty_cell(row: dict, columns: tuple[str, ...]) -> str:
         if value:
             return value
     return ""
+
+
+def _safe_storage_filename(filename: str, default_name: str) -> str:
+    name = Path(str(filename or "")).name.strip().strip(".")
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name).strip()
+    return name or default_name
+
+
+def _status_skip_reason(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    safe = "".join(char if char.isalnum() else "_" for char in normalized).strip("_")
+    return f"upstream_status_{safe or 'failed'}"
 
 
 def ensure_dirs() -> None:
@@ -134,26 +157,42 @@ def results_from_dataframe(df: pd.DataFrame) -> list[EvalResult]:
             except (TypeError, ValueError):
                 row_errors.append(f"第 {index + 2} 行 score_{dimension} 不是数字")
 
-        results.append(EvalResult(
-            case_id=case_id,
-            task_type=_cell_text(row.get("task_type")) or TaskType.USER_MD.value,
-            score_total=score_total,
-            scores=scores,
-            comment=_cell_text(row.get("comment")),
-            error_tags=_parse_table_list(row.get("error_tags"), primary_separator=","),
-            fatal_error=_parse_table_bool(row.get("fatal_error")),
-            model_name=_cell_text(row.get("model_name")) or "unknown",
-            prompt_version=_cell_text(row.get("prompt_version")) or "unknown",
-            judge_model=_cell_text(row.get("judge_model")),
-            judge_prompt_version=_cell_text(row.get("judge_prompt_version")),
-            extraction_prompt_version=_cell_text(row.get("extraction_prompt_version")),
-            extraction_prompt_hash=_cell_text(row.get("extraction_prompt_hash")),
-            diagnostics=_parse_diagnostics(row.get("diagnostics")),
-            rule_refs=_parse_table_list(row.get("rule_refs"), primary_separator=";"),
-            evidence_refs=_parse_table_list(row.get("evidence_refs"), primary_separator=";"),
-            output_refs=_parse_table_list(row.get("output_refs"), primary_separator=";"),
-            timestamp=_cell_text(row.get("timestamp")),
-        ))
+        result_data = {
+            "case_id": case_id,
+            "task_type": _cell_text(row.get("task_type")) or TaskType.USER_MD.value,
+            "score_total": score_total,
+            "scores": scores,
+            "comment": _cell_text(row.get("comment")),
+            "error_tags": _parse_table_list(row.get("error_tags"), primary_separator=","),
+            "fatal_error": _parse_table_bool(row.get("fatal_error")),
+            "model_name": _cell_text(row.get("model_name")) or "unknown",
+            "prompt_version": _cell_text(row.get("prompt_version")) or "unknown",
+            "judge_model": _cell_text(row.get("judge_model")),
+            "judge_prompt_version": _cell_text(row.get("judge_prompt_version")),
+            "extraction_prompt_version": _cell_text(row.get("extraction_prompt_version")),
+            "extraction_prompt_hash": _cell_text(row.get("extraction_prompt_hash")),
+            "judge_prompt_hash": _cell_text(row.get("judge_prompt_hash")),
+            "scoring_schema_version": _cell_text(row.get("scoring_schema_version")),
+            "dimension_weights_version": _cell_text(row.get("dimension_weights_version")),
+            "scoring_config_hash": _cell_text(row.get("scoring_config_hash")),
+            "case_input_hash": _cell_text(row.get("case_input_hash")),
+            "evaluation_fingerprint": _cell_text(row.get("evaluation_fingerprint")),
+            "diagnostics": _parse_diagnostics(row.get("diagnostics")),
+            "rule_refs": _parse_table_list(row.get("rule_refs"), primary_separator=";"),
+            "evidence_refs": _parse_table_list(row.get("evidence_refs"), primary_separator=";"),
+            "output_refs": _parse_table_list(row.get("output_refs"), primary_separator=";"),
+            "reasoning_refs": _parse_table_list(row.get("reasoning_refs"), primary_separator=";"),
+            "failure_type": _cell_text(row.get("failure_type")),
+            "failure_message": _cell_text(row.get("failure_message")),
+            "timestamp": _cell_text(row.get("timestamp")),
+        }
+        evaluation_status = _cell_text(row.get("evaluation_status"))
+        score_eligible_value = _cell_text(row.get("score_eligible"))
+        if evaluation_status:
+            result_data["evaluation_status"] = evaluation_status
+        if score_eligible_value:
+            result_data["score_eligible"] = _parse_table_bool(row.get("score_eligible"))
+        results.append(EvalResult.from_dict(result_data))
 
     if row_errors:
         preview = "；".join(row_errors[:5])
@@ -211,7 +250,8 @@ def resume_result_key(
     judge_model: str = "",
     judge_prompt_version: str = "",
     extraction_prompt_hash: str = "",
-) -> tuple[str, str, str, str, str, str]:
+    evaluation_fingerprint: str = "",
+) -> tuple[str, str, str, str, str, str, str]:
     return (
         case_id,
         model_name or "unknown",
@@ -219,6 +259,7 @@ def resume_result_key(
         judge_model or "",
         judge_prompt_version or "",
         extraction_prompt_hash or "",
+        evaluation_fingerprint or "",
     )
 
 
@@ -227,7 +268,8 @@ def case_resume_key(
     judge_model: str = "",
     judge_prompt_version: str = "",
     extraction_prompt_hash: str = "",
-) -> tuple[str, str, str, str, str, str]:
+    evaluation_fingerprint: str = "",
+) -> tuple[str, str, str, str, str, str, str]:
     return resume_result_key(
         case.case_id,
         case.model_name,
@@ -235,10 +277,11 @@ def case_resume_key(
         judge_model,
         judge_prompt_version,
         extraction_prompt_hash,
+        evaluation_fingerprint,
     )
 
 
-def eval_result_resume_key(result: EvalResult) -> tuple[str, str, str, str, str, str]:
+def eval_result_resume_key(result: EvalResult) -> tuple[str, str, str, str, str, str, str]:
     return resume_result_key(
         result.case_id,
         result.model_name,
@@ -246,6 +289,7 @@ def eval_result_resume_key(result: EvalResult) -> tuple[str, str, str, str, str,
         result.judge_model,
         result.judge_prompt_version,
         result.extraction_prompt_hash,
+        result.evaluation_fingerprint,
     )
 
 
@@ -257,10 +301,13 @@ def save_uploaded_file(uploaded_file, suffix: str = "") -> str:
     """保存 Streamlit UploadedFile 到 data/raw/uploads，返回本地路径。"""
     ensure_dirs()
 
-    original = uploaded_file.name
+    original = _safe_storage_filename(uploaded_file.name, "upload")
     ext = suffix or Path(original).suffix
-    stem = Path(original).stem
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = re.sub(r"[^A-Za-z0-9.]", "", str(ext or ""))
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    stem = _safe_storage_filename(Path(original).stem, "upload")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     out_path = UPLOAD_DIR / f"{stem}_{ts}{ext}"
 
     atomic_write_bytes(out_path, uploaded_file.getvalue())
@@ -272,8 +319,9 @@ def save_cases(cases: list[Case], filename: str = "") -> str:
     ensure_dirs()
 
     if not filename:
-        filename = f"cases_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-    if not filename.endswith(".jsonl"):
+        filename = f"cases_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jsonl"
+    filename = _safe_storage_filename(filename, "cases.jsonl")
+    if not filename.lower().endswith(".jsonl"):
         filename += ".jsonl"
 
     path = CASES_DIR / filename
@@ -322,6 +370,17 @@ def cases_to_dataframe(cases: list[Case]) -> pd.DataFrame:
             "row_end": metadata.get("row_end", ""),
             "boundary_row": metadata.get("boundary_row", ""),
             "reviewer": metadata.get("reviewer", ""),
+            "upstream_status": metadata.get("status", ""),
+            "task_profile_id": metadata.get("task_profile_id", ""),
+            "call_status": metadata.get("call_status", ""),
+            "parse_status": metadata.get("parse_status", ""),
+            "case_status": metadata.get("case_status", ""),
+            "inheritance_source": metadata.get("inheritance_source", ""),
+            "parse_method": metadata.get("parse_method", ""),
+            "parse_confidence": metadata.get("parse_confidence", ""),
+            "parse_warnings": metadata.get("parse_warnings", ""),
+            "raw_output_preview": _shorten(metadata.get("raw_output") or metadata.get("raw_result")),
+            "parsed_document_preview": _shorten(metadata.get("parsed_document")),
             "old_memory_preview": _shorten(c.old_memory),
             "candidate_output_preview": _shorten(c.candidate_output),
             "reasoning_preview": _shorten(metadata.get("reasoning")),
@@ -386,16 +445,29 @@ def merge_cases_results(cases: list[Case], results: list[EvalResult]) -> pd.Data
             "model_name": r.model_name,
             "prompt_version": r.prompt_version,
             "score_total": r.score_total,
+            "score_display": f"{r.score_total:.2f}" if result_is_score_eligible(r) else "未评分",
             "fatal_error": r.fatal_error,
+            "evaluation_status": result_evaluation_status(r),
+            "evaluation_status_label": STATUS_LABELS.get(result_evaluation_status(r), result_evaluation_status(r)),
+            "score_eligible": result_is_score_eligible(r),
+            "failure_type": r.failure_type,
+            "failure_message": r.failure_message,
             "comment": r.comment,
             "error_tags": ",".join(r.error_tags or []),
             "judge_model": r.judge_model,
             "judge_prompt_version": r.judge_prompt_version,
             "extraction_prompt_version": r.extraction_prompt_version,
             "extraction_prompt_hash": r.extraction_prompt_hash,
+            "judge_prompt_hash": r.judge_prompt_hash,
+            "scoring_schema_version": r.scoring_schema_version,
+            "dimension_weights_version": r.dimension_weights_version,
+            "scoring_config_hash": r.scoring_config_hash,
+            "case_input_hash": r.case_input_hash,
+            "evaluation_fingerprint": r.evaluation_fingerprint,
             "rule_refs": "; ".join(r.rule_refs or []),
             "evidence_refs": "; ".join(r.evidence_refs or []),
             "output_refs": "; ".join(r.output_refs or []),
+            "reasoning_refs": "; ".join(r.reasoning_refs or []),
             "diagnostics_count": len(r.diagnostics or []),
             "timestamp": r.timestamp,
         }
@@ -444,11 +516,11 @@ def prepare_cases_from_run_output(
     return_missed: bool = False,
     *,
     task_type: TaskType = TaskType.USER_MD,
-    candidate_columns: tuple[str, ...] = ("user.md",),
-    raw_result_columns: tuple[str, ...] = ("result",),
-    explicit_old_columns: tuple[str, ...] = (),
-    document_name: str = "USER.md",
-    reset_on_reviewer_change: bool = False,
+    candidate_columns: tuple[str, ...] | None = None,
+    raw_result_columns: tuple[str, ...] | None = None,
+    explicit_old_columns: tuple[str, ...] | None = None,
+    document_name: str | None = None,
+    reset_on_reviewer_change: bool | None = None,
 ) -> list[Case] | tuple[list[Case], dict[str, Any]] | tuple[list[Case], list[Case], dict[str, Any]]:
     """把按 session/chunk 生成的记忆 Excel 转成评测 cases。
 
@@ -462,6 +534,15 @@ def prepare_cases_from_run_output(
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size 必须大于 0")
+
+    task_type = TaskType(task_type)
+    task_profile = get_extraction_task_profile(task_type)
+    candidate_columns = tuple(candidate_columns or task_profile.candidate_columns)
+    raw_result_columns = tuple(raw_result_columns or task_profile.raw_output_columns)
+    explicit_old_columns = tuple(explicit_old_columns or task_profile.old_document_columns)
+    document_name = document_name or task_profile.document_name
+    if reset_on_reviewer_change is None:
+        reset_on_reviewer_change = task_profile.reset_on_reviewer_change
 
     input_path = Path(input_path)
     df = pd.read_excel(input_path).fillna("")
@@ -495,6 +576,9 @@ def prepare_cases_from_run_output(
     skipped_chunks: list[dict[str, Any]] = []
     global_chunk_idx = 0
     total_chunks = 0
+    call_status_counts: dict[str, int] = {}
+    parse_status_counts: dict[str, int] = {}
+    case_status_counts: dict[str, int] = {}
 
     for session_idx, (session_start, session_end) in enumerate(session_ranges):
         session_row = rows[session_start]
@@ -531,6 +615,45 @@ def prepare_cases_from_run_output(
             reasoning = str(boundary_row.get("reasoning", "")).strip()
             status = str(boundary_row.get("status", "")).strip()
             error = str(boundary_row.get("error", "")).strip()
+            parse_method = str(boundary_row.get("parse_method", "")).strip()
+            parse_confidence = boundary_row.get("parse_confidence", "")
+            parse_warnings = str(boundary_row.get("parse_warnings", "")).strip()
+            task_profile_id = str(boundary_row.get("task_profile_id", "")).strip() or task_profile.profile_id
+            parsed_document = str(boundary_row.get("parsed_document", "")).strip()
+            inheritance_source = str(boundary_row.get("inheritance_source", "")).strip()
+            propagation_status = str(boundary_row.get("propagation_status", "")).strip()
+            state = coerce_extraction_state(
+                call_status=boundary_row.get("call_status", ""),
+                parse_status=boundary_row.get("parse_status", ""),
+                case_status=boundary_row.get("case_status", ""),
+                legacy_status=status,
+                has_effective_document=bool(current_user_md),
+                has_raw_output=bool(result),
+                has_reasoning=bool(reasoning),
+            )
+            if not current_user_md and result and state.parse_status == ParseStatus.RAW_FALLBACK:
+                current_user_md = normalize_memory_document_body(result, document_name)
+                if current_user_md:
+                    parse_method = parse_method or "legacy_raw_fallback"
+                    fallback_warning = "未可靠识别正文边界，已按原始输出生成候选 case"
+                    parse_warnings = "；".join(filter(None, (parse_warnings, fallback_warning)))
+                    if parse_confidence in (None, ""):
+                        parse_confidence = 0.25
+            if not inheritance_source:
+                if state.parse_status == ParseStatus.RAW_FALLBACK and current_user_md:
+                    inheritance_source = InheritanceSource.RAW_OUTPUT.value
+                elif current_user_md:
+                    inheritance_source = InheritanceSource.PARSED_DOCUMENT.value
+                else:
+                    inheritance_source = InheritanceSource.NONE.value
+            low_confidence_candidate = (
+                state.parse_status == ParseStatus.RAW_FALLBACK
+                or propagation_status == "blocked_low_confidence"
+            )
+            if low_confidence_candidate:
+                propagation_status = "blocked_low_confidence"
+                propagation_warning = "低置信候选不会作为后续 case 的旧记忆"
+                parse_warnings = "；".join(filter(None, (parse_warnings, propagation_warning)))
             reviewer = str(boundary_row.get("评测人", "")).strip()
             if not reviewer:
                 for row in rows[start:end]:
@@ -552,11 +675,24 @@ def prepare_cases_from_run_output(
             if has_explicit_old_column:
                 previous_user_md = _first_nonempty_cell(boundary_row, explicit_old_columns)
 
-            has_extraction = bool(current_user_md or result or reasoning)
-            if not has_extraction:
-                missing_fields = "_".join(
-                    [candidate_columns[0], raw_result_columns[0], "reasoning"]
-                ).replace(" ", "_").replace(".", "_")
+            for target, value in (
+                (call_status_counts, state.call_status.value),
+                (parse_status_counts, state.parse_status.value),
+                (case_status_counts, state.case_status.value),
+            ):
+                target[value] = target.get(value, 0) + 1
+
+            case_eligible = state.case_status in {CaseStatus.READY, CaseStatus.REVIEW_REQUIRED}
+            if not case_eligible:
+                if status:
+                    skip_reason = _status_skip_reason(status)
+                elif state.call_status != CallStatus.NOT_ATTEMPTED:
+                    skip_reason = f"upstream_call_status_{state.call_status.value}"
+                else:
+                    missing_fields = "_".join(
+                        [task_profile.legacy_candidate_column, task_profile.legacy_raw_output_column, "reasoning"]
+                    ).replace(" ", "_").replace(".", "_")
+                    skip_reason = f"chunk_last_row_missing_{missing_fields}"
                 skip_detail = {
                     "source_file": input_path.name,
                     "source_session_id": source_session_id,
@@ -568,7 +704,7 @@ def prepare_cases_from_run_output(
                     "row_end": boundary + 1,
                     "boundary_row": boundary + 1,
                     "reviewer": reviewer,
-                    "skip_reason": f"chunk_last_row_missing_{missing_fields}",
+                    "skip_reason": skip_reason,
                 }
                 skipped_chunks.append(skip_detail)
                 missed_cases.append(Case(
@@ -583,9 +719,22 @@ def prepare_cases_from_run_output(
                     metadata={
                         **skip_detail,
                         "status": status,
+                        "task_profile_id": task_profile_id,
+                        "call_status": state.call_status.value,
+                        "parse_status": state.parse_status.value,
+                        "case_status": state.case_status.value,
                         "error": error,
                         "raw_result": result,
+                        "raw_output": result,
+                        "parsed_document": parsed_document,
+                        "effective_document": current_user_md,
+                        "old_effective_document": previous_user_md,
+                        "inheritance_source": inheritance_source,
+                        "propagation_status": propagation_status,
                         "reasoning": reasoning,
+                        "parse_method": parse_method,
+                        "parse_confidence": parse_confidence,
+                        "parse_warnings": parse_warnings,
                         "loader": "prepare_cases_from_run_output",
                         "document_name": document_name,
                         "extraction_status": "missed_extraction",
@@ -619,32 +768,50 @@ def prepare_cases_from_run_output(
                     "boundary_row": boundary + 1,
                     "reviewer": reviewer,
                     "status": status,
+                    "task_profile_id": task_profile_id,
+                    "call_status": state.call_status.value,
+                    "parse_status": state.parse_status.value,
+                    "case_status": state.case_status.value,
                     "error": error,
                     "raw_result": result,
+                    "raw_output": result,
+                    "parsed_document": parsed_document,
+                    "effective_document": current_user_md,
+                    "old_effective_document": previous_user_md,
+                    "inheritance_source": inheritance_source,
+                    "propagation_status": propagation_status,
                     "reasoning": reasoning,
+                    "parse_method": parse_method,
+                    "parse_confidence": parse_confidence,
+                    "parse_warnings": parse_warnings,
                     "loader": "prepare_cases_from_run_output",
                     "document_name": document_name,
                     "candidate_source_column": next(
                         (column for column in candidate_columns if str(boundary_row.get(column, "")).strip()),
                         candidate_columns[0],
                     ),
-                    "extraction_status": f"has_{document_name.lower().replace('.', '_')}",
+                    "extraction_status": (
+                        "needs_parse_review"
+                        if state.case_status == CaseStatus.REVIEW_REQUIRED
+                        else f"has_{document_name.lower().replace('.', '_')}"
+                    ),
                     "is_missed_case": False,
                 },
             )
             cases.append(case)
             if reset_on_reviewer_change:
-                if current_user_md:
+                if current_user_md and not low_confidence_candidate:
                     sequential_memory = current_user_md
             else:
-                previous_user_md_by_reviewer[safe_reviewer] = current_user_md
+                if not low_confidence_candidate:
+                    previous_user_md_by_reviewer[safe_reviewer] = current_user_md
             global_chunk_idx += 1
             chunk_in_session += 1
 
     if not cases and not return_missed:
         raise ValueError(
             f"未生成任何 case：所有 chunk 的最后一行都没有 "
-            f"{candidate_columns[0]}/{raw_result_columns[0]}/reasoning。"
+            f"{task_profile.legacy_candidate_column}/{task_profile.legacy_raw_output_column}/reasoning。"
         )
 
     stats = {
@@ -653,6 +820,15 @@ def prepare_cases_from_run_output(
         "missed_cases": len(missed_cases),
         "skipped_chunks": len(skipped_chunks),
         "skipped_chunk_details": skipped_chunks,
+        "task_profile_id": task_profile.profile_id,
+        "call_status_counts": call_status_counts,
+        "parse_status_counts": parse_status_counts,
+        "case_status_counts": case_status_counts,
+        "missed_reason_counts": {
+            reason: sum(1 for item in skipped_chunks if item.get("skip_reason") == reason)
+            for reason in sorted({str(item.get("skip_reason") or "") for item in skipped_chunks})
+            if reason
+        },
     }
     if return_missed:
         return cases, missed_cases, stats
@@ -680,9 +856,4 @@ def prepare_long_memory_cases_from_run_output(
         return_stats=return_stats,
         return_missed=return_missed,
         task_type=TaskType.LONG_MEMORY,
-        candidate_columns=("MEMORY.md", "生成的MEMORY.md正文", "memory.md"),
-        raw_result_columns=("模型原始返回", "result"),
-        explicit_old_columns=("旧MEMORY.md", "old_memory"),
-        document_name="MEMORY.md",
-        reset_on_reviewer_change=True,
     )

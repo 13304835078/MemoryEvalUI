@@ -7,7 +7,7 @@ from typing import Any
 import requests
 
 from src.eval.judge_client import RealJudgeClient
-from src.llm_api import retry_wait_seconds
+from src.llm_api import apply_prompt_cache, make_prompt_cache_id, retry_wait_seconds
 from src.schema import EvalConfig
 from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
 
@@ -267,6 +267,11 @@ def _call_advisor_json(
                 "skip_special_tokens": False,
             },
         }
+        cache_location = str(getattr(config, "judge_prompt_cache_location", "none") or "none")
+        cache_id = str(getattr(config, "judge_prompt_cache_id", "") or "")
+        if cache_location != "none" and not cache_id:
+            cache_id = make_prompt_cache_id("memory_eval_advisor", config.judge_model, system_prompt)
+        apply_prompt_cache(payload, cache_id, cache_location)
         try:
             wait_for_global_rate_slot(rate_scope, request_interval, disabled=bool(config.mock))
             response = requests.post(
@@ -274,11 +279,12 @@ def _call_advisor_json(
                 headers=headers,
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 timeout=config.judge_timeout,
+                stream=True,
             )
-            raw_text = response.text
             if hasattr(response, "iter_lines"):
                 response.raise_for_status()
                 content, stream_error = client._extract_stream_content(response)
+                raw_text = content
                 parsed = RealJudgeClient._parse_json_response(content)
                 if isinstance(parsed, dict):
                     return parsed, content or raw_text, stream_error
@@ -286,6 +292,7 @@ def _call_advisor_json(
                 if attempt < max_attempts:
                     time.sleep(_advisor_retry_wait_seconds(config, last_error, attempt))
                 continue
+            raw_text = response.text
             try:
                 data = response.json()
             except Exception:

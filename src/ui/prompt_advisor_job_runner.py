@@ -297,21 +297,33 @@ def run_prompt_advisor_job(config: PromptAdvisorJobConfig) -> None:
             min_evidence=config.min_evidence,
             progress_callback=on_progress,
         )
-        status = "completed" if result and result.get("can_suggest") is not False else "completed"
+        result_error = str((result or {}).get("error") or "").strip()
+        status = "failed" if result is None or result_error else "completed"
+        stage = "失败" if status == "failed" else "完成"
+        message = (
+            f"提示词建议生成失败：{result_error or '模型未返回结果'}"
+            if status == "failed"
+            else (
+                "提示词建议生成完成。"
+                if (result or {}).get("can_suggest") is not False
+                else "提示词建议分析完成，本次未生成候选提示词。"
+            )
+        )
         saved_result_path, saved_raw_path = _write_result_files(config.job_id, result or {}, raw or "")
         state = read_prompt_advisor_job_state(config.job_id)
         _write_state(
             config,
             status=status,
-            stage="完成",
+            stage=stage,
             done=int(state.get("total", 1) or 1),
             total=int(state.get("total", 1) or 1),
-            message="提示词建议生成完成。",
+            message=message,
             started_at=started_at,
             extra={
                 "result_path": str(saved_result_path),
                 "raw_path": str(saved_raw_path),
                 "summary": _result_summary(result or {}),
+                "error": result_error,
                 "finished_at": utc_now(),
             },
         )

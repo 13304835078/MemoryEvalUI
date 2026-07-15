@@ -62,6 +62,18 @@ def test_read_json_state_marks_corrupt_file_and_keeps_backup(tmp_path):
     assert restored["_state_corrupt_path"] == backup_path
 
 
+def test_closed_loop_reader_marks_corrupt_state_and_keeps_backup(tmp_path, monkeypatch):
+    monkeypatch.setattr(closed_loop, "CLOSED_LOOP_DIR", tmp_path)
+    path = tmp_path / "loop-corrupt" / "state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{bad json", encoding="utf-8")
+
+    state = closed_loop.read_loop_state("loop-corrupt")
+
+    assert state["status"] == "corrupt"
+    assert Path(state["_state_corrupt_path"]).read_text(encoding="utf-8") == "{bad json"
+
+
 def test_loop_is_running_marks_stale_loop_interrupted(tmp_path, monkeypatch):
     monkeypatch.setattr(closed_loop, "CLOSED_LOOP_DIR", tmp_path)
     path = tmp_path / "loop-1" / "state.json"

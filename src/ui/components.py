@@ -8,6 +8,8 @@ import streamlit as st
 
 from src.schema import Case, EvalResult, TaskType
 from src.eval.metrics import DIM_LABELS, TAG_LABELS
+from src.eval.result_status import STATUS_LABELS, result_evaluation_status, result_is_score_eligible
+from src.ui.error_diagnostics import classify_eval_result
 from src.ui.rule_ref_validation import rule_ref_validation_rows, validate_result_rule_refs
 
 
@@ -33,13 +35,17 @@ def make_text_diff(old: str | None, new: str | None) -> str:
 
 
 def render_score_cards(result: EvalResult) -> None:
+    if not result_is_score_eligible(result):
+        st.metric("加权总分", "未评分")
+        st.caption("Judge 未成功产出可用评分，本样本不参与平均分、维度均分和错误标签统计。")
+        return
     dims = ["correctness", "coverage", "update_logic", "memory_boundary", "conciseness", "format"]
-    cols = st.columns(len(dims))
-
-    for col, dim in zip(cols, dims):
-        score = result.scores.get(dim, 0)
-        label = DIM_LABELS.get(dim, dim)
-        col.metric(label, f"{score:.1f}/5")
+    for start in range(0, len(dims), 3):
+        cols = st.columns(3)
+        for col, dim in zip(cols, dims[start:start + 3]):
+            score = result.scores.get(dim, 0)
+            label = DIM_LABELS.get(dim, dim)
+            col.metric(label, f"{score:.1f}/5")
 
     st.metric("加权总分", f"{result.score_total:.2f}/5")
 
@@ -69,11 +75,11 @@ def render_rule_ref_validation(result: EvalResult) -> None:
 
         rows = rule_ref_validation_rows(report)
         if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
         elif report.get("valid_refs"):
             st.dataframe(
                 pd.DataFrame([{"有效规则引用": ref} for ref in report.get("valid_refs", [])]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -81,11 +87,20 @@ def render_rule_ref_validation(result: EvalResult) -> None:
 def render_eval_result(result: EvalResult) -> None:
     st.subheader("评测结果")
     document_name = "MEMORY.md" if result.task_type == TaskType.LONG_MEMORY.value else "USER.md"
+    failure = classify_eval_result(result)
 
-    if result.fatal_error:
-        st.error("严重失败：是")
+    eligible = result_is_score_eligible(result)
+    status = result_evaluation_status(result)
+    if not eligible:
+        if failure:
+            st.error(f"未评分 · {failure.label}：{failure.summary}")
+            st.caption(f"处理建议：{failure.action}")
+        else:
+            st.error(f"未评分：{STATUS_LABELS.get(status, status)}")
+    elif result.fatal_error:
+        st.error("评分成功，但 Judge 判定存在严重质量错误。")
     else:
-        st.success("严重失败：否")
+        st.success("评分成功，未判定严重质量错误。")
 
     render_score_cards(result)
 
@@ -94,25 +109,34 @@ def render_eval_result(result: EvalResult) -> None:
         for dim, score in result.scores.items()
     )
     key_rows = [
-        {"字段": "加权总分", "内容": f"{result.score_total:.2f}/5"},
+        {"字段": "评测状态", "内容": STATUS_LABELS.get(status, status)},
+        {"字段": "加权总分", "内容": f"{result.score_total:.2f}/5" if eligible else "未评分"},
+        {
+            "字段": "失败类型",
+            "内容": failure.label if failure else "（无）",
+        },
         {"字段": "维度得分", "内容": dim_scores or "（无）"},
         {"字段": "comment", "内容": result.comment or "（无）"},
         {"字段": "error_tags", "内容": "; ".join(result.error_tags or []) or "（无）"},
         {"字段": "rule_refs", "内容": "\n".join(result.rule_refs or []) or "（无）"},
         {"字段": "evidence_refs", "内容": "\n".join(result.evidence_refs or []) or "（无）"},
         {"字段": "output_refs / out_refs", "内容": "\n".join(result.output_refs or []) or "（无）"},
+        {"字段": "reasoning_refs", "内容": "\n".join(result.reasoning_refs or []) or "（无）"},
         {"字段": "diagnostics_count", "内容": str(len(result.diagnostics or []))},
     ]
     st.markdown("**核心结果字段**")
-    st.dataframe(pd.DataFrame(key_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(key_rows), width="stretch", hide_index=True)
     st.caption(
         f"output_refs / out_refs 指裁判引用的新 {document_name} 候选输出片段；"
         "它不是事实证据，事实证据在 evidence_refs。"
     )
 
-    render_rule_ref_validation(result)
+    if eligible:
+        render_rule_ref_validation(result)
 
-    if result.error_tags:
+    if not eligible:
+        st.info("运行失败不产生质量错误标签，也不会被当作 0 分。")
+    elif result.error_tags:
         tag_text = ", ".join([TAG_LABELS.get(t, t) for t in result.error_tags])
         st.warning(f"错误标签：{tag_text}")
     else:
@@ -134,7 +158,16 @@ def render_eval_result(result: EvalResult) -> None:
             f"提取提示词Hash：{result.extraction_prompt_hash[:12] if result.extraction_prompt_hash else '未记录'}"
         )
 
-    if result.diagnostics or result.rule_refs or result.evidence_refs or result.output_refs:
+    with st.expander("评分可比性元数据", expanded=False):
+        st.caption("只有评分配置哈希一致的结果，才适合直接比较分数变化。")
+        st.dataframe(pd.DataFrame([
+            {"字段": "裁判提示词 Hash", "内容": result.judge_prompt_hash or "旧结果未记录"},
+            {"字段": "评分协议版本", "内容": result.scoring_schema_version or "旧结果未记录"},
+            {"字段": "维度权重版本", "内容": result.dimension_weights_version or "旧结果未记录"},
+            {"字段": "评分配置 Hash", "内容": result.scoring_config_hash or "旧结果未记录"},
+        ]), width="stretch", hide_index=True)
+
+    if result.diagnostics or result.rule_refs or result.evidence_refs or result.output_refs or result.reasoning_refs:
         with st.expander("规则与证据引用", expanded=True):
             if result.diagnostics:
                 rows = []
@@ -145,29 +178,30 @@ def render_eval_result(result: EvalResult) -> None:
                         "规则引用": "; ".join(item.get("rule_refs") or []),
                         "证据引用": "; ".join(item.get("evidence_refs") or []),
                         "输出引用": "; ".join(item.get("output_refs") or []),
+                        "推理过程引用": "; ".join(item.get("reasoning_refs") or []),
                         "原因": item.get("reason", ""),
                     })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
             refs = []
             for label, values in [
                 ("规则引用", result.rule_refs),
                 ("证据引用", result.evidence_refs),
                 ("输出引用（output_refs / out_refs）", result.output_refs),
+                ("推理过程引用（仅诊断）", result.reasoning_refs),
             ]:
                 if values:
                     refs.append({"类型": label, "内容": "\n".join(values)})
             if refs:
-                st.dataframe(pd.DataFrame(refs), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(refs), width="stretch", hide_index=True)
 
 
 def _render_dialogue_turn(turn, i: int) -> None:
     role = turn.role.lower()
-    icon = "👤" if role in {"user", "query"} else "🤖"
     name = "用户" if role in {"user", "query"} else "助手"
 
     with st.chat_message("user" if role in {"user", "query"} else "assistant"):
-        st.markdown(f"**{icon} {name} #{i}**")
+        st.markdown(f"**{name} · 第 {i} 条**")
         st.write(turn.content)
 
         if getattr(turn, "metadata", None):
@@ -274,7 +308,7 @@ def render_case_metadata(case: Case) -> None:
         if metadata.get(key) not in (None, "")
     ]
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     raw_result = str(metadata.get("raw_result") or "").strip()
     if raw_result:
@@ -286,7 +320,7 @@ def render_case_metadata(case: Case) -> None:
 
 
 def render_raw_response(result: EvalResult) -> None:
-    with st.expander("裁判模型原始响应", expanded=False):
+    with st.expander("技术详情：裁判模型原始响应", expanded=False):
         raw = result.raw_response or ""
         try:
             parsed = json.loads(raw)

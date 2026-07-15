@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+import hashlib
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,8 @@ class ChatPayloadOptions:
     enable_thinking: bool = False
     send_enable_thinking: bool = True
     skip_special_tokens: bool = False
+    prompt_cache_id: str = ""
+    prompt_cache_location: str = "none"
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,33 @@ def build_chat_payload(messages: list[dict[str, str]], options: ChatPayloadOptio
         payload["top_k"] = int(options.top_k)
     if options.send_enable_thinking:
         payload["extra_body"]["enable_thinking"] = bool(options.enable_thinking)
+    apply_prompt_cache(
+        payload,
+        options.prompt_cache_id,
+        options.prompt_cache_location,
+    )
+    return payload
+
+
+def make_prompt_cache_id(namespace: str, *parts: str) -> str:
+    prefix = re.sub(r"[^0-9a-z_-]+", "_", str(namespace or "memory_eval").strip().lower()).strip("_")
+    prefix = prefix or "memory_eval"
+    digest = hashlib.sha256("|".join(str(part or "") for part in parts).encode("utf-8")).hexdigest()[:24]
+    return f"{prefix[:48]}_{digest}"
+
+
+def apply_prompt_cache(payload: dict[str, Any], prompt_cache_id: str, location: str = "none") -> dict[str, Any]:
+    cache_id = str(prompt_cache_id or "").strip().lower()
+    cache_location = str(location or "none").strip().lower()
+    if cache_id:
+        if not re.fullmatch(r"[0-9a-z_-]+", cache_id):
+            raise ValueError("promptCacheId 只能包含 0-9、a-z、下划线和连字符")
+        if cache_location not in {"top", "extra", "both"}:
+            raise ValueError("promptCacheId 已设置，但 prompt_cache_location 不是 top/extra/both")
+        if cache_location in {"top", "both"}:
+            payload["promptCacheId"] = cache_id
+        if cache_location in {"extra", "both"}:
+            payload.setdefault("extra_body", {})["promptCacheId"] = cache_id
     return payload
 
 

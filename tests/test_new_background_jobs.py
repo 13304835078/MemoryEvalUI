@@ -70,6 +70,29 @@ def test_prompt_advisor_result_loader_keeps_legacy_embedded_state(tmp_path, monk
     assert raw == "legacy raw"
 
 
+def test_prompt_advisor_background_job_marks_model_call_error_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(prompt_advisor_job_runner, "PROMPT_ADVISOR_JOBS_DIR", tmp_path)
+    monkeypatch.setattr(
+        prompt_advisor_job_runner,
+        "call_prompt_advisor",
+        lambda *args, **kwargs: ({"can_suggest": False, "error": "Connection Idle Timeout"}, "raw"),
+    )
+    config = PromptAdvisorJobConfig(
+        job_id="advisor-failed",
+        task_type=TaskType.USER_MD.value,
+        evidence=[{"case_id": "c1"}],
+        current_judge_prompt="judge",
+        eval_config=EvalConfig(mock=False),
+    )
+
+    run_prompt_advisor_job(config)
+
+    state = prompt_advisor_job_runner.read_prompt_advisor_job_state("advisor-failed")
+    assert state["status"] == "failed"
+    assert state["stage"] == "失败"
+    assert state["error"] == "Connection Idle Timeout"
+
+
 def test_eval_background_job_can_stop_before_writing_failure_results(tmp_path, monkeypatch):
     monkeypatch.setattr(eval_job_runner, "EVAL_JOBS_DIR", tmp_path / "jobs")
     output_path = tmp_path / "results.jsonl"

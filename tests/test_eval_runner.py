@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.schema import Case, TaskType, EvalConfig, results_from_jsonl, cases_to_jsonl, DialogueTurn
 from src.eval.eval_runner import EvalRunner
+from src.ui.data_service import case_resume_key, eval_result_resume_key
 
 
 def make_simple_cases() -> list[Case]:
@@ -80,6 +81,7 @@ def test_runner_build_user_message_with_extraction_prompt():
     assert "## 提取规则（仅作为规则依据，不是事实来源）" in msg
     assert "## 1. 只基于 user 提取" in msg
     assert "不能把其中的描述当作用户事实" in msg
+    assert "模型 reasoning 只用于过程诊断，不能证明用户事实" in msg
     assert "## 可引用的提取规则标题清单" in msg
     assert "- ## 1. 只基于 user 提取" in msg
     assert "不要发明规则编号" in msg
@@ -88,6 +90,67 @@ def test_runner_build_user_message_with_extraction_prompt():
     assert "## 旧 USER.md" in msg
     assert "提取规则辅助评测稳定契约" in runner.system_prompt
     assert runner.extraction_prompt_hash
+
+
+def test_runner_records_scoring_comparability_metadata():
+    runner = EvalRunner(EvalConfig(mock=True, judge_model="mock"), TaskType.USER_MD)
+    result = runner.evaluate_one(make_simple_cases()[0])
+
+    assert result.score_eligible is True
+    assert result.evaluation_status == "success"
+    assert result.judge_prompt_hash
+    assert result.scoring_schema_version == "absolute_eval_schema_v2"
+    assert result.dimension_weights_version == "user_md_update_weights_v1"
+    assert result.scoring_config_hash
+    assert result.case_input_hash
+    assert result.evaluation_fingerprint
+
+
+def test_evaluation_fingerprint_changes_with_case_prompt_and_sampling_config():
+    case = make_simple_cases()[0]
+    base = EvalRunner(
+        EvalConfig(mock=True, judge_model="mock", judge_max_tokens=2000),
+        TaskType.USER_MD,
+        extraction_prompt_text="# 规则 A",
+    )
+    changed_prompt = EvalRunner(
+        EvalConfig(mock=True, judge_model="mock", judge_max_tokens=2000),
+        TaskType.USER_MD,
+        extraction_prompt_text="# 规则 B",
+    )
+    changed_config = EvalRunner(
+        EvalConfig(mock=True, judge_model="mock", judge_max_tokens=3000),
+        TaskType.USER_MD,
+        extraction_prompt_text="# 规则 A",
+    )
+    real_mode = EvalRunner(
+        EvalConfig(mock=False, judge_model="mock", judge_max_tokens=2000),
+        TaskType.USER_MD,
+        extraction_prompt_text="# 规则 A",
+    )
+    changed_case = Case.from_dict(case.to_dict())
+    changed_case.candidate_output = "不同候选输出"
+
+    assert base.evaluation_fingerprint(case) != base.evaluation_fingerprint(changed_case)
+    assert base.evaluation_fingerprint(case) != changed_prompt.evaluation_fingerprint(case)
+    assert base.evaluation_fingerprint(case) != changed_config.evaluation_fingerprint(case)
+    assert base.evaluation_fingerprint(case) != real_mode.evaluation_fingerprint(case)
+
+    result = base.evaluate_one(case)
+    assert case_resume_key(
+        case,
+        base.config.judge_model or "mock",
+        base.resolved_judge_prompt_version,
+        base.extraction_prompt_hash,
+        base.evaluation_fingerprint(case),
+    ) == eval_result_resume_key(result)
+    assert case_resume_key(
+        changed_case,
+        base.config.judge_model or "mock",
+        base.resolved_judge_prompt_version,
+        base.extraction_prompt_hash,
+        base.evaluation_fingerprint(changed_case),
+    ) != eval_result_resume_key(result)
 
 
 def test_long_memory_message_uses_memory_document_labels():

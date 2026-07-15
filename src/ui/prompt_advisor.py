@@ -91,11 +91,14 @@ def build_advisor_user_message(
     evidence_name = "absolute_eval_result_evidence"
     warning = "这些证据来自 Judge 结果，不是人工真值；候选 prompt 必须标注为待人工确认，不能直接视为正确修复。"
     weak_context_count = sum(1 for item in evidence if item.get("evidence_mode") == "weak_context_from_result")
+    positive_boundary_count = sum(1 for item in evidence if item.get("evidence_mode") == "positive_boundary")
+    regression_boundary_count = sum(1 for item in evidence if item.get("evidence_mode") == "regression_boundary")
     loop_constraints = []
     if advisor_mode == "absolute_eval" and target == "extraction_prompt":
         loop_constraints = [
             "本次目标是生成下一轮提取实验使用的候选提取 prompt。",
             "如果 evidence 包含 weak_context_from_result，说明这些样本不是错误证据，只能作为结果分布上下文。",
+            "positive_boundary 和 regression_boundary 是防回归边界，只能用于约束改法，不能据此新增问题规则。",
             "不要声称候选 prompt 已经被人工确认；必须在 risks 中说明可能沿着 Judge 偏差自我强化。",
             "默认不要完整重写提取 prompt；请输出 extraction_prompt_patch，由系统应用 patch 得到候选全文。",
             "patch 只能引用 extraction_prompt_sections 中真实存在的 section_id。",
@@ -103,6 +106,9 @@ def build_advisor_user_message(
             "优先使用 replace_within_section 合并到已有规则；冗余或冲突规则可用 delete_within_section 删除；append_to_section 只能作为最后手段。",
             "append_to_section 必须匹配目标章节原格式；如果目标章节是列表，新增内容必须是同级列表项。",
             "候选提取 prompt 应保留原 prompt 的核心约束，只做可解释、可回滚的增量澄清。",
+            "修改必须是跨样本可复用的通用规则，禁止写入具体 case 的人名、地点、作品名、原句或一次性事实。",
+            "优先合并、替换或删除已有重复规则；除非现有章节完全无法承载，否则禁止追加新规则。",
+            "控制提示词规模：候选全文长度和规则数量不得无理由增长，多个同义问题必须合并为一次修改。",
             "validation_plan 必须包含：另存新版本、重新提取、重新评测、稳定性对比、抽样人工复核、必要时回滚。",
         ]
     extraction_sections = prompt_sections_for_model(
@@ -161,6 +167,8 @@ def build_advisor_user_message(
         "target": target,
         "evidence_count": len(evidence),
         "weak_context_count": weak_context_count,
+        "positive_boundary_count": positive_boundary_count,
+        "regression_boundary_count": regression_boundary_count,
         "evidence_name": evidence_name,
         "evidence_warning": warning,
         "retry_note": retry_note,
@@ -1327,9 +1335,13 @@ def call_prompt_advisor(
             "evidence_usage": _evidence_usage(len(evidence), 0),
         }, ""
 
-    if len(evidence) < min_evidence:
+    boundary_modes = {"positive_boundary", "regression_boundary", "weak_context_from_result"}
+    actionable_evidence_count = sum(
+        1 for item in evidence if str(item.get("evidence_mode") or "") not in boundary_modes
+    )
+    if actionable_evidence_count < min_evidence:
         _emit_advisor_progress(progress_callback, 1, 1, "证据不足", "证据条数不足，未生成候选提示词。")
-        summary = f"评测结果证据少于 {min_evidence} 条，拒绝生成候选 prompt，避免根据个例过拟合。"
+        summary = f"可用于修改的评测结果证据少于 {min_evidence} 条，拒绝生成候选 prompt，避免根据正例边界或个例过拟合。"
         plan = [f"至少收集 {min_evidence} 条低分、带错误标签、带 diagnostics 或 fatal 的普通评测结果。"]
         return {
             "can_suggest": False,
@@ -1342,6 +1354,10 @@ def call_prompt_advisor(
             "risks": ["证据不足"],
             "validation_plan": plan,
             "evidence_usage": _evidence_usage(len(evidence), 0),
+            "evidence_composition": {
+                "actionable": actionable_evidence_count,
+                "boundary": len(evidence) - actionable_evidence_count,
+            },
         }, ""
 
     if config.mock:

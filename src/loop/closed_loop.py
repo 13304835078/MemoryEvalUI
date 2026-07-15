@@ -8,8 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from src.eval.eval_runner import EvalRunner
+from src.eval.eval_runner import EvalRunner, SCORING_SCHEMA_VERSION
 from src.eval.metrics import compute_aggregations, flatten_results
+from src.eval.result_status import result_is_score_eligible
 from src.extraction.memory_extractor import (
     MemoryExtractionConfig,
     MemoryExtractionRunner,
@@ -23,6 +24,7 @@ from src.ui.data_service import (
     prepare_long_memory_cases_from_run_output,
     save_cases,
 )
+from src.ui.background_tasks import read_json_state
 from src.ui.global_rate_limiter import api_rate_scope, set_current_task_priority, wait_for_global_rate_slot
 from src.ui.prompt_advisor import call_prompt_advisor, collect_absolute_eval_evidence
 from src.ui.prompt_editor import prompt_text_hash, save_prompt_version
@@ -52,6 +54,20 @@ class ClosedLoopConfig:
     chunk_size: int = 10
     max_cases_per_round: int = 0
     task_type: str = TaskType.USER_MD.value
+    protocol_version: str = "v1_exploratory"
+    discovery_ratio: float = 0.6
+    validation_ratio: float = 0.2
+    locked_test_ratio: float = 0.2
+    split_seed: str = "memory-eval-v1"
+    validation_min_score_delta: float = 0.03
+    validation_min_end_to_end_delta: float = 0.0
+    validation_max_coverage_drop: float = 0.005
+    validation_max_case_regression_rate: float = 0.1
+    validation_max_prompt_growth_ratio: float = 0.1
+    validation_min_paired_cases: int = 8
+    validation_min_paired_clusters: int = 2
+    validation_confidence_level: float = 0.95
+    validation_bootstrap_samples: int = 2000
 
     extraction_model: str = ""
     extraction_api_base: str = ""
@@ -59,6 +75,8 @@ class ClosedLoopConfig:
     extraction_prompt_text: str = ""
     extraction_create_prompt_text: str = ""
     extraction_prompt_version: str = ""
+    evaluation_rule_prompt_text: str = ""
+    evaluation_rule_prompt_version: str = ""
     extraction_max_tokens: int = 50000
     extraction_request_interval: float = 10.0
     extraction_max_retries: int = 2
@@ -109,13 +127,7 @@ def controls_path(run_id: str) -> Path:
 
 
 def read_loop_state(run_id: str) -> dict[str, Any]:
-    path = state_path(run_id)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return read_json_state(state_path(run_id))
 
 
 def write_loop_state(run_id: str, state: dict[str, Any]) -> None:
@@ -218,6 +230,7 @@ def _make_initial_state(config: ClosedLoopConfig) -> dict[str, Any]:
     safe_config.pop("advisor_api_token", None)
     safe_config.pop("extraction_prompt_text", None)
     safe_config.pop("extraction_create_prompt_text", None)
+    safe_config.pop("evaluation_rule_prompt_text", None)
     safe_config.pop("judge_prompt_text", None)
     if isinstance(safe_config.get("eval_config"), dict):
         safe_config["eval_config"].pop("judge_api_bearer_token", None)
@@ -337,13 +350,13 @@ def _classify_no_candidate_reason(
 ) -> dict[str, Any]:
     advisor_result = advisor_result or {}
     total = len(results)
-    fatal_count = sum(1 for result in results if result.fatal_error)
-    valid_count = max(0, total - fatal_count)
-    fatal_rate = (fatal_count / total) if total else 0.0
+    runtime_failure_count = sum(1 for result in results if not result_is_score_eligible(result))
+    valid_count = max(0, total - runtime_failure_count)
+    runtime_failure_rate = (runtime_failure_count / total) if total else 0.0
     issue_evidence_count = sum(
         1
         for item in evidence
-        if not item.get("fatal_error") and item.get("evidence_mode") == "issue_or_low_score"
+        if item.get("evidence_mode") == "issue_or_low_score"
     )
     weak_context_count = sum(1 for item in evidence if item.get("evidence_mode") == "weak_context_from_result")
     risks = [str(item) for item in (advisor_result.get("risks") or []) if str(item).strip()]
@@ -354,8 +367,8 @@ def _classify_no_candidate_reason(
     base = {
         "total_results": total,
         "valid_results": valid_count,
-        "fatal_results": fatal_count,
-        "fatal_rate": round(fatal_rate, 4),
+        "runtime_failure_results": runtime_failure_count,
+        "runtime_failure_rate": round(runtime_failure_rate, 4),
         "evidence_count": len(evidence),
         "issue_evidence_count": issue_evidence_count,
         "weak_context_count": weak_context_count,
@@ -375,7 +388,7 @@ def _classify_no_candidate_reason(
             "message": "本轮没有生成评测结果，不能判断是否需要修改提取提示词。",
         }
 
-    if valid_count == 0 or (fatal_rate >= 0.5 and issue_evidence_count == 0):
+    if valid_count == 0 or (runtime_failure_rate >= 0.5 and issue_evidence_count == 0):
         return {
             **base,
             "category": "eval_chain_failed",
@@ -434,15 +447,21 @@ def _evaluate_cases(
     result_path: Path,
 ) -> list[EvalResult]:
     task_type = TaskType(config.task_type)
+    evaluation_rule_prompt = config.evaluation_rule_prompt_text or config.extraction_prompt_text
+    evaluation_rule_version = (
+        config.evaluation_rule_prompt_version
+        or config.extraction_prompt_version
+        or "initial_extraction_prompt"
+    )
     runner = EvalRunner(
         config=config.eval_config,
         task_type=task_type,
         prompt_file=config.judge_prompt_file,
         judge_prompt_version=config.judge_prompt_version,
         system_prompt_override=config.judge_prompt_text,
-        extraction_prompt_text=current_prompt_text,
-        extraction_prompt_version=current_prompt_version,
-        extraction_prompt_hash=prompt_text_hash(current_prompt_text),
+        extraction_prompt_text=evaluation_rule_prompt,
+        extraction_prompt_version=evaluation_rule_version,
+        extraction_prompt_hash=prompt_text_hash(evaluation_rule_prompt),
     )
 
     run_cases = cases[: config.max_cases_per_round] if config.max_cases_per_round and config.max_cases_per_round > 0 else cases
@@ -526,9 +545,15 @@ def _evaluate_cases(
                             model_name=case.model_name,
                             prompt_version=case.prompt_version,
                             judge_model=config.eval_config.judge_model or "mock",
-                            judge_prompt_version=config.judge_prompt_version,
-                            extraction_prompt_version=current_prompt_version,
-                            extraction_prompt_hash=prompt_text_hash(current_prompt_text),
+                            judge_prompt_version=runner.resolved_judge_prompt_version,
+                            extraction_prompt_version=evaluation_rule_version,
+                            extraction_prompt_hash=prompt_text_hash(evaluation_rule_prompt),
+                            judge_prompt_hash=runner.judge_prompt_hash,
+                            scoring_schema_version=SCORING_SCHEMA_VERSION,
+                            dimension_weights_version=runner.dimension_weights_version,
+                            scoring_config_hash=runner.scoring_config_hash,
+                            case_input_hash=runner.case_input_hash(case),
+                            evaluation_fingerprint=runner.evaluation_fingerprint(case),
                         )
 
                     results_by_index[idx] = result
@@ -555,7 +580,7 @@ def _evaluate_cases(
     return ordered_results
 
 
-def run_closed_loop(config: ClosedLoopConfig) -> None:
+def _run_exploratory_closed_loop(config: ClosedLoopConfig) -> None:
     loop_dir = run_dir(config.run_id)
     loop_dir.mkdir(parents=True, exist_ok=True)
     if stop_path(config.run_id).exists():
@@ -569,7 +594,20 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
     })
 
     state = _make_initial_state(config)
+    evaluation_rule_prompt = config.evaluation_rule_prompt_text or config.extraction_prompt_text
+    evaluation_rule_version = (
+        config.evaluation_rule_prompt_version
+        or config.extraction_prompt_version
+        or "initial_extraction_prompt"
+    )
+    state["evaluation_contract"] = {
+        "frozen": True,
+        "version": evaluation_rule_version,
+        "prompt_hash": prompt_text_hash(evaluation_rule_prompt),
+        "description": "所有轮次均按实验启动时冻结的提取规则评测；候选提示词只负责生成输出。",
+    }
     append_event(state, "闭环实验启动")
+    append_event(state, f"评测规则已冻结：{evaluation_rule_version}")
     write_loop_state(config.run_id, state)
 
     current_prompt_text = config.extraction_prompt_text
@@ -843,3 +881,12 @@ def run_closed_loop(config: ClosedLoopConfig) -> None:
             }),
             append_event(state, f"闭环实验失败：{type(exc).__name__}: {exc}", "error"),
         ))
+
+
+def run_closed_loop(config: ClosedLoopConfig) -> None:
+    if config.protocol_version == "v2_holdout":
+        from src.loop.trusted_closed_loop import run_trusted_closed_loop
+
+        run_trusted_closed_loop(config)
+        return
+    _run_exploratory_closed_loop(config)

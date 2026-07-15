@@ -115,6 +115,12 @@ def _as_optional_int(value: Any) -> int | None:
     return int(value)
 
 
+def _as_float(value: Any, default: float) -> float:
+    if value in (None, ""):
+        return float(default)
+    return float(value)
+
+
 def _as_stop_list(value: Any) -> list[str]:
     if value in (None, ""):
         return []
@@ -152,8 +158,8 @@ def build_eval_config(config: dict[str, Any], mock: bool | None = None) -> EvalC
         judge_send_enable_thinking=_as_bool(config.get("judge_send_enable_thinking", True), True),
         judge_send_skip_special_tokens=_as_bool(config.get("judge_send_skip_special_tokens", True), True),
         judge_skip_special_tokens=_as_bool(config.get("judge_skip_special_tokens", False)),
-        judge_temperature=float(config.get("judge_temperature", 0.0) or 0.0),
-        judge_top_p=float(config.get("judge_top_p", 1.0) or 1.0),
+        judge_temperature=_as_float(config.get("judge_temperature"), 0.0),
+        judge_top_p=_as_float(config.get("judge_top_p"), 1.0),
         judge_top_k=_as_optional_int(config.get("judge_top_k")),
         judge_stop=_as_stop_list(config.get("judge_stop", [])),
         judge_stream=_as_bool(config.get("judge_stream", False)),

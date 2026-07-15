@@ -17,6 +17,7 @@ from ..llm_api import (
     normalize_chat_completions_url,
     parse_qps_limit,
     rate_limit_backoff,
+    retry_wait_seconds,
 )
 from ..schema import EvalConfig
 from .judge_validation import (
@@ -74,13 +75,15 @@ class RealJudgeClient(JudgeClient):
             ChatPayloadOptions(
                 model=self.config.judge_model,
                 max_tokens=self.config.judge_max_tokens,
-                temperature=float(getattr(self.config, "judge_temperature", 0.0) or 0.0),
-                top_p=float(getattr(self.config, "judge_top_p", 1.0) or 1.0),
+                temperature=float(getattr(self.config, "judge_temperature", 0.0)),
+                top_p=float(getattr(self.config, "judge_top_p", 1.0)),
                 top_k=getattr(self.config, "judge_top_k", None),
                 stream=False,
                 enable_thinking=bool(getattr(self.config, "judge_enable_thinking", False)),
                 send_enable_thinking=bool(getattr(self.config, "judge_send_enable_thinking", True)),
                 skip_special_tokens=False,
+                prompt_cache_id=str(getattr(self.config, "judge_prompt_cache_id", "") or ""),
+                prompt_cache_location=str(getattr(self.config, "judge_prompt_cache_location", "none") or "none"),
             ),
         )
 
@@ -148,17 +151,6 @@ class RealJudgeClient(JudgeClient):
 
             except RuntimeError as e:
                 last_error = str(e)
-                if attempt < self.config.judge_max_retries:
-                    if self._is_rate_limit_error(last_error):
-                        time.sleep(self._get_rate_limit_backoff(last_error))
-                        if self.rate_limit_wait_callback is not None:
-                            self.rate_limit_wait_callback()
-                    elif self._is_retryable_transient_error(last_error):
-                        time.sleep(max(float(getattr(self.config, "judge_qps_backoff", 12.0) or 12.0), 2 ** attempt))
-                    else:
-                        time.sleep(2 ** attempt)
-                    continue
-                return None, last_error
             except ValueError as e:
                 last_error = str(e)
             except requests.exceptions.Timeout:
@@ -169,7 +161,13 @@ class RealJudgeClient(JudgeClient):
                 last_error = f"未知错误 ({attempt}/{self.config.judge_max_retries}): {e}"
 
             if attempt < self.config.judge_max_retries:
-                time.sleep(2 ** attempt)
+                time.sleep(retry_wait_seconds(
+                    last_error or "",
+                    attempt,
+                    float(getattr(self.config, "judge_qps_backoff", 12.0) or 12.0),
+                ))
+                if self.rate_limit_wait_callback is not None:
+                    self.rate_limit_wait_callback()
 
         return None, last_error
 
@@ -366,6 +364,7 @@ class RealJudgeClient(JudgeClient):
             "rule_refs": ("rule_refs", "rule_references", "rules", "规则引用", "规则依据"),
             "evidence_refs": ("evidence_refs", "evidence_references", "evidence", "证据引用", "事实证据"),
             "output_refs": ("output_refs", "output_references", "output_evidence", "输出引用", "候选输出引用"),
+            "reasoning_refs": ("reasoning_refs", "reasoning_references", "推理引用", "推理过程引用"),
         }
         for target, aliases in optional_aliases.items():
             if target in normalized:

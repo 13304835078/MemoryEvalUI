@@ -277,7 +277,7 @@ def test_resume_key_and_append_result():
         append_result(tmp, result)
         restored = load_results(tmp)
         assert len(restored) == 1
-        assert eval_result_resume_key(restored[0]) == ("c1", "m", "p", "judge", "judge_v1", "")
+        assert eval_result_resume_key(restored[0]) == ("c1", "m", "p", "judge", "judge_v1", "", "")
 
         case = Case(
             case_id="c1",

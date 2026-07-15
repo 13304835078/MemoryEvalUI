@@ -5,6 +5,7 @@ from typing import Any
 import pandas as pd
 
 from src.schema import EvalResult
+from src.eval.result_status import result_is_score_eligible
 
 
 def collect_review_evidence(df: pd.DataFrame, max_items: int = 30) -> list[dict[str, Any]]:
@@ -42,9 +43,15 @@ def collect_absolute_eval_evidence(
     score_threshold: float = 4.8,
     include_high_score_with_diagnostics: bool = True,
     include_all: bool = False,
+    positive_boundary_limit: int = 0,
+    regression_results: list[EvalResult] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    positive_rows: list[dict[str, Any]] = []
     for result in results:
+        # API/network/JSON failures describe runtime health, not prompt quality.
+        if not result_is_score_eligible(result):
+            continue
         diagnostics = result.diagnostics or []
         error_tags = result.error_tags or []
         score_total = float(result.score_total or 0.0)
@@ -54,7 +61,10 @@ def collect_absolute_eval_evidence(
             or bool(error_tags)
             or (include_high_score_with_diagnostics and bool(diagnostics))
         )
-        if not include_all and not has_issue:
+        evidence_mode = "issue_or_low_score" if has_issue else "weak_context_from_result"
+        if not has_issue and positive_boundary_limit > 0:
+            evidence_mode = "positive_boundary"
+        elif not include_all and not has_issue:
             continue
 
         severity = 0
@@ -64,9 +74,9 @@ def collect_absolute_eval_evidence(
         severity += len(error_tags) * 5
         severity += len(diagnostics) * 3
 
-        rows.append({
+        row = {
             "_severity": severity,
-            "evidence_mode": "issue_or_low_score" if has_issue else "weak_context_from_result",
+            "evidence_mode": evidence_mode,
             "case_id": result.case_id,
             "model_name": result.model_name,
             "prompt_version": result.prompt_version,
@@ -83,12 +93,49 @@ def collect_absolute_eval_evidence(
             "judge_prompt_version": result.judge_prompt_version,
             "extraction_prompt_version": result.extraction_prompt_version,
             "extraction_prompt_hash": result.extraction_prompt_hash,
+        }
+        if evidence_mode == "positive_boundary":
+            positive_rows.append(row)
+        else:
+            rows.append(row)
+
+    for result in regression_results or []:
+        if not result_is_score_eligible(result):
+            continue
+        if (
+            float(result.score_total or 0.0) < score_threshold
+            or result.fatal_error
+            or result.error_tags
+        ):
+            continue
+        rows.append({
+            "_severity": 1,
+            "evidence_mode": "regression_boundary",
+            "case_id": result.case_id,
+            "model_name": result.model_name,
+            "prompt_version": result.prompt_version,
+            "score_total": round(float(result.score_total or 0.0), 4),
+            "scores": result.scores or {},
+            "fatal_error": bool(result.fatal_error),
+            "error_tags": result.error_tags or [],
+            "comment": _truncate(result.comment, 1000),
+            "diagnostics": (result.diagnostics or [])[:5],
+            "rule_refs": (result.rule_refs or [])[:10],
+            "evidence_refs": (result.evidence_refs or [])[:10],
+            "output_refs": (result.output_refs or [])[:10],
+            "judge_model": result.judge_model,
+            "judge_prompt_version": result.judge_prompt_version,
+            "extraction_prompt_version": result.extraction_prompt_version,
+            "extraction_prompt_hash": result.extraction_prompt_hash,
         })
 
     rows.sort(key=lambda item: item.get("_severity", 0), reverse=True)
+    positive_rows.sort(key=lambda item: float(item.get("score_total") or 0.0), reverse=True)
+    selected_positive = positive_rows[:min(max(0, int(positive_boundary_limit)), max_items)]
+    rows = rows[:max(0, max_items - len(selected_positive))] + selected_positive
     for row in rows:
         row.pop("_severity", None)
-    return rows[:max_items]
+    return rows
 
 
 def _clean(value: Any) -> str:

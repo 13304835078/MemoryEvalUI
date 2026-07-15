@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 
 from src.eval.eval_runner import EvalRunner
+from src.eval.result_status import STATUS_LABELS, result_evaluation_status, result_is_score_eligible
 from src.runtime_paths import DATA_DIR
 from src.schema import Case, EvalConfig, EvalResult, TaskType, append_result_to_jsonl, results_from_jsonl, results_to_jsonl
 from src.ui.background_tasks import (
@@ -178,17 +179,23 @@ def summarize_results(results: list[EvalResult]) -> dict[str, Any]:
             "fatal_count": 0,
             "tagged_count": 0,
             "diagnostics_count": 0,
+            "scored_count": 0,
+            "judge_failure_count": 0,
         }
+    scored = [item for item in results if result_is_score_eligible(item)]
     return {
         "total": len(results),
-        "avg_score": round(mean(float(item.score_total or 0) for item in results), 4),
-        "fatal_count": sum(1 for item in results if item.fatal_error),
-        "tagged_count": sum(1 for item in results if item.error_tags),
-        "diagnostics_count": sum(len(item.diagnostics or []) for item in results),
+        "scored_count": len(scored),
+        "judge_failure_count": len(results) - len(scored),
+        "avg_score": round(mean(float(item.score_total or 0) for item in scored), 4) if scored else 0.0,
+        "fatal_count": sum(1 for item in scored if item.fatal_error),
+        "tagged_count": sum(1 for item in scored if item.error_tags),
+        "diagnostics_count": sum(len(item.diagnostics or []) for item in scored),
     }
 
 
 def avg_dimension_scores(results: list[EvalResult]) -> dict[str, float]:
+    results = [result for result in results if result_is_score_eligible(result)]
     dims = sorted({dim for result in results for dim in (result.scores or {})})
     rows: dict[str, float] = {}
     for dim in dims:
@@ -200,13 +207,16 @@ def avg_dimension_scores(results: list[EvalResult]) -> dict[str, float]:
 def result_table(results_a: list[EvalResult], results_b: list[EvalResult]) -> pd.DataFrame:
     rows = []
     for a, b in zip(results_a, results_b):
+        pair_eligible = result_is_score_eligible(a) and result_is_score_eligible(b)
         rows.append({
             "case_id": a.case_id,
             "model_name": a.model_name,
             "candidate_prompt_version": a.prompt_version,
-            "score_A": a.score_total,
-            "score_B": b.score_total,
-            "score_delta_B_minus_A": round(float(b.score_total or 0) - float(a.score_total or 0), 4),
+            "status_A": STATUS_LABELS.get(result_evaluation_status(a), result_evaluation_status(a)),
+            "status_B": STATUS_LABELS.get(result_evaluation_status(b), result_evaluation_status(b)),
+            "score_A": a.score_total if result_is_score_eligible(a) else None,
+            "score_B": b.score_total if result_is_score_eligible(b) else None,
+            "score_delta_B_minus_A": round(float(b.score_total) - float(a.score_total), 4) if pair_eligible else None,
             "fatal_A": a.fatal_error,
             "fatal_B": b.fatal_error,
             "error_tags_A": ", ".join(a.error_tags or []),

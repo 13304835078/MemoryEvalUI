@@ -95,7 +95,8 @@ def test_compare_eval_stability_splits_explanation_instability():
     assert row["错误标签变化"] == "否"
     assert row["证据引用变化"] == "是"
     assert row["评语变化"] == "是"
-    assert row["不稳定类型"] == "证据引用变化；评语变化"
+    # 评语措辞变化单独展示，但不再把同一结构化诊断误判为质量不稳定。
+    assert row["不稳定类型"] == "证据引用变化"
 
 
 def test_compare_eval_stability_supports_strict_key_mode():
@@ -123,3 +124,17 @@ def test_results_from_jsonl_text():
 
     assert [r.case_id for r in results] == ["c1", "c2"]
     assert results[1].score_total == 4
+
+
+def test_stability_excludes_runtime_failure_pairs():
+    baseline = [make_result("c1", 4.0)]
+    current = [EvalResult.from_parse_failure(
+        case_id="c1", task_type="user_md_update", raw="API error: timeout"
+    )]
+
+    report = compare_eval_stability(current, baseline)
+
+    assert report["summary"]["matched_count"] == 1
+    assert report["summary"]["common_count"] == 0
+    assert report["summary"]["execution_failure_pair_count"] == 1
+    assert len(report["execution_failure_rows"]) == 1

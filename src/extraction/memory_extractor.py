@@ -11,6 +11,22 @@ from typing import Any, Callable
 import pandas as pd
 import yaml
 
+from src.extraction.document_parser import (
+    DocumentParseResult,
+    extract_long_memory,
+    extract_memory_document,
+    extract_user_md,
+    normalize_memory_document_body,
+    normalize_user_md_body,
+    parse_memory_document,
+)
+from src.extraction.contracts import (
+    CallStatus,
+    CaseStatus,
+    InheritanceSource,
+    ParseStatus,
+    get_extraction_task_profile,
+)
 from src.extraction.client import (
     MemoryExtractionClient,
     MemoryExtractionConfig,
@@ -21,6 +37,7 @@ from src.persistence import append_jsonl_rows, atomic_write_bytes, atomic_write_
 from src.runtime_paths import APP_HOME, DATA_DIR
 from src.schema import TaskType
 from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
+from src.llm_api import make_prompt_cache_id
 
 PROJECT_ROOT = APP_HOME
 EXTRACTION_OUTPUT_DIR = DATA_DIR / "extractions"
@@ -41,80 +58,6 @@ def sanitize_filename(name: str) -> str:
     if not name:
         return "ALL"
     return re.sub(r'[\\/:*?"<>|，,\s]+', "_", str(name).strip())
-
-
-def normalize_memory_document_body(body: str | None, document_name: str) -> str:
-    if body is None:
-        return ""
-
-    text = str(body).strip()
-    if not text:
-        return ""
-
-    lines: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        escaped_name = re.escape(document_name)
-        if re.match(rf"^---+\s*{escaped_name}\s*---+$", line, flags=re.IGNORECASE):
-            continue
-        if re.match(
-            rf"^#{{1,6}}\s*(Think|Reasoning|Output|{escaped_name})\s*$",
-            line,
-            flags=re.IGNORECASE,
-        ):
-            continue
-
-        line = re.sub(r"^[*•]\s+", "- ", line)
-        line = re.sub(r"^\d+[.、]\s+", "- ", line)
-        lines.append(line)
-
-    return "\n".join(lines).strip()
-
-
-def normalize_user_md_body(body: str | None) -> str:
-    return normalize_memory_document_body(body, "USER.md")
-
-
-def extract_memory_document(text: str | None, document_name: str) -> str | None:
-    if text is None:
-        return None
-
-    raw = str(text).strip()
-    if not raw:
-        return None
-
-    raw = re.sub(r"^\s*```(?:markdown|md|text)?\s*", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\s*```\s*$", "", raw)
-
-    has_think = re.search(r"(?im)^\s*#{1,6}\s*(Think|Reasoning)\b", raw)
-    escaped_name = re.escape(document_name)
-    marker_pattern = rf"(?im)^\s*#{{1,6}}\s*Output\s*$|---+\s*{escaped_name}\s*---+"
-    has_output_or_document = re.search(
-        marker_pattern,
-        raw,
-    )
-    if has_think and not has_output_or_document:
-        return None
-
-    markers = list(re.finditer(marker_pattern, raw))
-    if markers:
-        content = raw[markers[-1].end():].strip()
-        return normalize_memory_document_body(content, document_name)
-
-    if re.search(r"(?m)^\s*[-*•]\s*\S+[:：]", raw):
-        return normalize_memory_document_body(raw, document_name)
-
-    return None
-
-
-def extract_user_md(text: str | None) -> str | None:
-    return extract_memory_document(text, "USER.md")
-
-
-def extract_long_memory(text: str | None) -> str | None:
-    return extract_memory_document(text, "MEMORY.md")
 
 
 def parse_generation_prompt_templates(text: str, suffix: str = "") -> dict[str, str]:
@@ -206,24 +149,13 @@ def build_dialogue_history(chunk: list[dict[str, Any]]) -> str:
 
 
 def build_user_prompt(current_user_md: str, formatted_history: str) -> str:
-    current_user_md = clean_cell(current_user_md)
-    existing_block = f"--- USER.md ---\n{current_user_md}" if current_user_md else "--- USER.md ---"
-    return (
-        f"## [现有文件内容]\n"
-        f"{existing_block}\n\n"
-        f"## [最新对话内容]\n"
-        f"{formatted_history}"
-    )
+    profile = get_extraction_task_profile(TaskType.USER_MD)
+    return profile.build_user_message(clean_cell(current_user_md), formatted_history)
 
 
 def build_long_memory_prompt(current_memory: str, formatted_history: str) -> str:
-    current_memory = clean_cell(current_memory)
-    if not current_memory:
-        return f"#输入：*新增对话记录*\n{formatted_history}\n输出"
-    return (
-        f"#输入：\n*现有长期记忆*\n{current_memory}\n\n"
-        f"*新增对话记录*\n{formatted_history}\n\n输出"
-    )
+    profile = get_extraction_task_profile(TaskType.LONG_MEMORY)
+    return profile.build_user_message(clean_cell(current_memory), formatted_history)
 
 
 class MemoryExtractionRunner:
@@ -239,10 +171,18 @@ class MemoryExtractionRunner:
     ):
         self.config = config
         self.task_type = TaskType(task_type)
-        self.document_name = "MEMORY.md" if self.task_type == TaskType.LONG_MEMORY else "USER.md"
+        self.task_profile = get_extraction_task_profile(self.task_type)
+        self.document_name = self.task_profile.document_name
         self.prompt_text = update_prompt_text or prompt_text
         self.create_prompt_text = create_prompt_text or self.prompt_text
         self.update_prompt_text = update_prompt_text or prompt_text or self.create_prompt_text
+        if self.config.prompt_cache_location != "none" and not self.config.prompt_cache_id:
+            self.config.prompt_cache_id = make_prompt_cache_id(
+                f"memory_extract_{self.task_type.value}",
+                self.config.model,
+                self.create_prompt_text,
+                self.update_prompt_text,
+            )
         self.client = client or (MockMemoryExtractionClient(config) if config.mock else MemoryExtractionClient(config))
 
     @staticmethod
@@ -285,15 +225,28 @@ class MemoryExtractionRunner:
         final_rows: list[dict[str, Any]] = []
         memory_by_reviewer: dict[str, str] = {}
         last_reviewer = ""
+        last_source_reviewer_segment: str | None = None
         status_counts: dict[str, int] = {}
+        call_status_counts: dict[str, int] = {}
+        parse_status_counts: dict[str, int] = {}
+        case_status_counts: dict[str, int] = {}
 
         for session_index, session_rows in enumerate(sessions, start=1):
             source_session_index = int(session_rows[0].get("__session_index", session_index)) if session_rows else session_index
             reviewer = self._find_reviewer(session_rows)
-            if self.task_type == TaskType.LONG_MEMORY and last_reviewer and reviewer != last_reviewer:
-                memory_by_reviewer.clear()
+            source_reviewer_segment = str(session_rows[0].get("__source_reviewer_segment", "")) if session_rows else ""
+            if self.task_type == TaskType.LONG_MEMORY:
+                reviewer_changed = bool(last_reviewer and reviewer != last_reviewer)
+                source_segment_changed = bool(
+                    source_reviewer_segment
+                    and last_source_reviewer_segment is not None
+                    and source_reviewer_segment != last_source_reviewer_segment
+                )
+                if reviewer_changed or source_segment_changed:
+                    memory_by_reviewer.clear()
             current_memory = memory_by_reviewer.get(reviewer, "")
             last_reviewer = reviewer
+            last_source_reviewer_segment = source_reviewer_segment or last_source_reviewer_segment
 
             for chunk_start in range(0, len(session_rows), chunk_size):
                 if should_stop is not None and should_stop():
@@ -307,10 +260,25 @@ class MemoryExtractionRunner:
                 status = "UNKNOWN"
                 error = ""
                 old_memory = current_memory
+                candidate_document = ""
+                parsed_document = ""
+                parse_result = DocumentParseResult(None, "not_attempted", 0.0)
+                call_status = CallStatus.NOT_ATTEMPTED
+                parse_status = ParseStatus.NOT_ATTEMPTED
+                case_status = CaseStatus.SKIP
+                inheritance_source = InheritanceSource.NONE
+                propagation_status = "not_applicable"
                 mode_label = "create" if not current_memory else "update"
 
                 if not history:
                     status = "SKIPPED_EMPTY"
+                    call_status = CallStatus.SKIPPED
+                    parse_result = DocumentParseResult(
+                        None,
+                        "skipped_empty",
+                        0.0,
+                        ("当前分块没有可提取的对话正文",),
+                    )
                 else:
                     if progress_callback:
                         progress_callback(
@@ -336,31 +304,80 @@ class MemoryExtractionRunner:
                         },
                         {
                             "role": "user",
-                            "content": (
-                                build_long_memory_prompt(current_memory, history)
-                                if self.task_type == TaskType.LONG_MEMORY
-                                else build_user_prompt(current_memory, history)
-                            ),
+                            "content": self.task_profile.build_user_message(current_memory, history),
                         },
                     ]
                     success, result, reasoning, error = self.client.chat_with_retry(messages)
                     llm_result = result or ""
                     llm_reasoning = reasoning or ""
                     if success:
-                        parsed = extract_memory_document(llm_result, self.document_name)
+                        call_status = CallStatus.SUCCESS
+                        parse_result = parse_memory_document(llm_result, self.document_name)
+                        parsed = parse_result.document
                         if parsed is None:
-                            status = "PARSE_FAILED"
-                            error = error or f"无法从模型输出中解析 {self.document_name}"
+                            raw_fallback = (
+                                normalize_memory_document_body(llm_result, self.document_name)
+                                if self.task_profile.parser_fallback_policy == "raw_output_requires_review"
+                                else ""
+                            )
+                            if raw_fallback:
+                                status = "SUCCESS_UNSTRUCTURED"
+                                candidate_document = raw_fallback
+                                parse_status = ParseStatus.RAW_FALLBACK
+                                case_status = CaseStatus.REVIEW_REQUIRED
+                                inheritance_source = InheritanceSource.RAW_OUTPUT
+                                propagation_status = "blocked_low_confidence"
+                                parse_result = DocumentParseResult(
+                                    raw_fallback,
+                                    f"raw_fallback:{parse_result.method}",
+                                    0.25,
+                                    parse_result.warnings
+                                    + (
+                                        "未可靠识别正文边界：该输出保留为待复核候选，但不会继承到后续分块；"
+                                        "后续继续使用最近一次可靠正文",
+                                    ),
+                                )
+                            else:
+                                status = "OUTPUT_EMPTY"
+                                parse_status = ParseStatus.EMPTY
+                                error = error or f"模型未返回可用于评测的 {self.document_name} 内容"
                         else:
                             status = "SUCCESS"
-                            if self.task_type != TaskType.LONG_MEMORY or parsed:
+                            parsed_document = parsed
+                            parse_status = ParseStatus.STRUCTURED if parsed else ParseStatus.EMPTY
+                            case_status = CaseStatus.READY
+                            if self.task_profile.preserve_previous_on_empty and not parsed:
+                                candidate_document = current_memory
+                                inheritance_source = InheritanceSource.PREVIOUS_DOCUMENT
+                                propagation_status = "kept_previous_document"
+                                parse_result = DocumentParseResult(
+                                    parsed,
+                                    parse_result.method,
+                                    parse_result.confidence,
+                                    parse_result.warnings + ("正文为空，按长期记忆无变化处理",),
+                                )
+                            else:
+                                candidate_document = parsed
+                                inheritance_source = InheritanceSource.PARSED_DOCUMENT
                                 current_memory = parsed
                                 memory_by_reviewer[reviewer] = current_memory
+                                propagation_status = "accepted"
                     else:
-                        status = "API_FAILED"
-                        error = error or llm_result
+                        stop_after_retry = bool(should_stop is not None and should_stop())
+                        status = "STOPPED" if stop_after_retry else "API_FAILED"
+                        call_status = CallStatus.STOPPED if stop_after_retry else CallStatus.FAILED
+                        error = error or ("记忆提取收到终止请求" if stop_after_retry else llm_result)
+                        parse_result = DocumentParseResult(
+                            None,
+                            "stopped" if stop_after_retry else "api_failed",
+                            0.0,
+                            (error[:500],) if error else (),
+                        )
 
                 status_counts[status] = status_counts.get(status, 0) + 1
+                call_status_counts[call_status.value] = call_status_counts.get(call_status.value, 0) + 1
+                parse_status_counts[parse_status.value] = parse_status_counts.get(parse_status.value, 0) + 1
+                case_status_counts[case_status.value] = case_status_counts.get(case_status.value, 0) + 1
                 completed_chunks += 1
 
                 chunk_output_rows: list[dict[str, Any]] = []
@@ -372,20 +389,33 @@ class MemoryExtractionRunner:
                         "chunk_id": chunk_id,
                         "评测人": reviewer,
                         "status": status if is_last else "",
+                        "task_profile_id": self.task_profile.profile_id if is_last else "",
+                        "call_status": call_status.value if is_last else "",
+                        "parse_status": parse_status.value if is_last else "",
+                        "case_status": case_status.value if is_last else "",
                         "error": error if is_last else "",
                         "reasoning": llm_reasoning if is_last else "",
+                        "old_effective_document": old_memory if is_last else "",
+                        "raw_output": llm_result if is_last else "",
+                        "parsed_document": parsed_document if is_last else "",
+                        "effective_document": candidate_document if is_last else "",
+                        "inheritance_source": inheritance_source.value if is_last else "",
+                        "propagation_status": propagation_status if is_last else "",
+                        "parse_method": parse_result.method if is_last else "",
+                        "parse_confidence": parse_result.confidence if is_last else "",
+                        "parse_warnings": "；".join(parse_result.warnings) if is_last else "",
                     }
                     if self.task_type == TaskType.LONG_MEMORY:
                         common_output.update({
                             "当前使用的模板": mode_label if is_last else "",
                             "旧MEMORY.md": old_memory if is_last else "",
-                            "MEMORY.md": current_memory if is_last else "",
+                            "MEMORY.md": candidate_document if is_last else "",
                             "模型原始返回": llm_result if is_last else "",
                         })
                     else:
                         common_output.update({
                             "result": llm_result if is_last else "",
-                            "user.md": current_memory if is_last else "",
+                            "user.md": candidate_document if is_last else "",
                         })
                     output_row.update(common_output)
                     chunk_output_rows.append(output_row)
@@ -409,6 +439,9 @@ class MemoryExtractionRunner:
             "completed_chunks": completed_chunks,
             "api_calls": api_call_count,
             "status_counts": status_counts,
+            "call_status_counts": call_status_counts,
+            "parse_status_counts": parse_status_counts,
+            "case_status_counts": case_status_counts,
             "sessions": len(sessions),
             "stopped": bool(should_stop is not None and should_stop()),
         }
@@ -477,6 +510,11 @@ class MemoryExtractionRunner:
                 priority=current_priority(),
             )
 
+        if hasattr(self.client, "rate_limit_wait_callback"):
+            self.client.rate_limit_wait_callback = wait_for_rate_slot
+        if hasattr(self.client, "should_stop_callback"):
+            self.client.should_stop_callback = should_stop
+
         global_sessions = split_sessions(df)
         for session_index, session_rows in enumerate(global_sessions, start=1):
             for row in session_rows:
@@ -490,6 +528,9 @@ class MemoryExtractionRunner:
         api_call_count = 0
         session_count = len(global_sessions)
         status_counts: dict[str, int] = {}
+        call_status_counts: dict[str, int] = {}
+        parse_status_counts: dict[str, int] = {}
+        case_status_counts: dict[str, int] = {}
         progress_lock = Lock()
 
         def merge_result(result: dict[str, Any]) -> None:
@@ -499,6 +540,13 @@ class MemoryExtractionRunner:
             api_call_count += int(result.get("api_calls", 0) or 0)
             for key, value in (result.get("status_counts") or {}).items():
                 status_counts[key] = status_counts.get(key, 0) + int(value)
+            for target, source_key in (
+                (call_status_counts, "call_status_counts"),
+                (parse_status_counts, "parse_status_counts"),
+                (case_status_counts, "case_status_counts"),
+            ):
+                for key, value in (result.get(source_key) or {}).items():
+                    target[key] = target.get(key, 0) + int(value)
 
         def make_parallel_progress_callback(reviewer: str) -> Callable[[int, int, str], None] | None:
             if not progress_callback or not emit_parallel_chunk_progress:
@@ -530,7 +578,11 @@ class MemoryExtractionRunner:
             merge_result(result)
         else:
             if self.task_type == TaskType.LONG_MEMORY:
-                reviewer_segments = df["评测人"].ne(df["评测人"].shift()).cumsum()
+                reviewer_segments = (
+                    df["__source_reviewer_segment"]
+                    if "__source_reviewer_segment" in df.columns
+                    else df["评测人"].ne(df["评测人"].shift()).cumsum()
+                )
                 groups = [
                     (f"{str(group.iloc[0]['评测人'] or '未知')}（区段 {segment_id}）", group.copy())
                     for segment_id, group in df.groupby(reviewer_segments, sort=False)
@@ -597,6 +649,7 @@ class MemoryExtractionRunner:
         for row in final_rows:
             row.pop("__source_order", None)
             row.pop("__session_index", None)
+            row.pop("__source_reviewer_segment", None)
         excel_buffer = BytesIO()
         pd.DataFrame(final_rows).to_excel(excel_buffer, index=False)
         atomic_write_bytes(output_path, excel_buffer.getvalue())
@@ -609,8 +662,12 @@ class MemoryExtractionRunner:
             "chunks": total_chunks,
             "api_calls": api_call_count,
             "status_counts": status_counts,
+            "call_status_counts": call_status_counts,
+            "parse_status_counts": parse_status_counts,
+            "case_status_counts": case_status_counts,
             "concurrency": concurrency,
             "task_type": self.task_type.value,
+            "task_profile_id": self.task_profile.profile_id,
             "document_name": self.document_name,
             "stopped": bool(should_stop is not None and should_stop()),
         }

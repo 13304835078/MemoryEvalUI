@@ -27,8 +27,27 @@ def parse_progress_fraction(value: Any) -> float | None:
 def round_progress_fraction(round_record: dict[str, Any]) -> float:
     if not round_record:
         return 0.0
-    if round_record.get("status") in {"completed", "completed_no_change"}:
+    if round_record.get("status") in {
+        "completed", "completed_no_change", "accepted", "validation_rejected",
+        "invalid_evaluation", "paused_no_safe_patch", "paused_no_candidate",
+    }:
         return 1.0
+    if round_record.get("validation_gate"):
+        return 0.98
+    if round_record.get("validation_candidate"):
+        return 0.9
+    if round_record.get("candidate_prompt_draft"):
+        return 0.65
+    if round_record.get("discovery"):
+        return 0.45
+    partition_progress = round_record.get("partition_progress") if isinstance(round_record.get("partition_progress"), dict) else {}
+    if partition_progress:
+        latest = list(partition_progress.values())[-1]
+        done = float(latest.get("done") or 0)
+        total = float(latest.get("total") or 0)
+        local = done / total if total > 0 else 0.0
+        base = 0.05 if latest.get("stage") == "extraction" else 0.25
+        return clamp_fraction(base + 0.2 * local)
     if round_record.get("candidate_prompt_saved"):
         return 0.98
     if round_record.get("advisor_path"):
@@ -61,6 +80,20 @@ def describe_round_step(round_record: dict[str, Any]) -> str:
         return "无需修改提示词"
     if round_record.get("status") == "completed":
         return "本轮完成"
+    if round_record.get("status") == "accepted":
+        return "候选已通过 Validation"
+    if round_record.get("status") == "validation_rejected":
+        return "候选未通过 Validation"
+    if round_record.get("status") == "invalid_evaluation":
+        return "运行失败导致评测不完整"
+    if round_record.get("validation_gate"):
+        return "Validation 门槛判定完成"
+    if round_record.get("validation_candidate"):
+        return "Validation 候选评测完成"
+    if round_record.get("candidate_prompt_draft"):
+        return "候选草稿已生成，等待 Validation"
+    if round_record.get("discovery"):
+        return "Discovery 完成，准备生成候选"
     if round_record.get("candidate_prompt_saved"):
         return "保存候选提取提示词"
     if round_record.get("advisor_path"):
@@ -91,8 +124,21 @@ def compute_closed_loop_progress(state: dict[str, Any]) -> dict[str, Any]:
     rounds = state.get("rounds") if isinstance(state.get("rounds"), list) else []
     total_rounds = max(configured_rounds, len(rounds), 1)
 
-    if state.get("status") in {"completed", "completed_no_change"}:
-        current_step = "无需修改提示词，闭环结束" if state.get("status") == "completed_no_change" else "全部完成"
+    terminal_statuses = {
+        "completed", "completed_no_change", "max_rounds_reached", "validation_rejected",
+        "invalid_evaluation", "paused_no_safe_patch", "paused_no_candidate",
+        "paused_advisor_failed", "stopped", "failed",
+    }
+    if state.get("status") in terminal_statuses:
+        status = state.get("status")
+        current_step = {
+            "completed_no_change": "无需修改提示词，闭环结束",
+            "max_rounds_reached": "达到设定轮数，Locked Test 已完成",
+            "validation_rejected": "候选未通过 Validation，当前版本保持不变",
+            "invalid_evaluation": "存在运行失败，结果不完整",
+            "stopped": "任务已终止",
+            "failed": "任务失败",
+        }.get(status, "全部完成")
         return {
             "overall_fraction": 1.0,
             "current_round_fraction": 1.0,

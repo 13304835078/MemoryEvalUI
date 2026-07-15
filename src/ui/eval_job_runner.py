@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.eval.eval_runner import EvalRunner
+from src.eval.result_status import result_is_score_eligible
 from src.schema import Case, EvalConfig, EvalResult, TaskType, append_result_to_jsonl, results_to_jsonl
 from src.ui.data_service import (
     RESULTS_DIR,
@@ -41,7 +42,8 @@ from src.ui.state_io import atomic_write_json
 
 EVAL_JOBS_DIR = RESULTS_DIR.parent / "eval_jobs"
 RESUME_SKIP_ALL = "跳过所有已有结果"
-RESUME_SKIP_NON_FATAL = "只跳过非严重失败结果"
+RESUME_SKIP_NON_FATAL = "只跳过评分成功结果（重跑运行失败）"
+LEGACY_RESUME_SKIP_NON_FATAL = "只跳过非严重失败结果"
 RESUME_RERUN_ALL = "全部重跑"
 RESUME_STRATEGIES = [RESUME_SKIP_ALL, RESUME_SKIP_NON_FATAL, RESUME_RERUN_ALL]
 
@@ -176,8 +178,12 @@ def _write_progress(
     fatal_count: int,
     message: str,
     started_at: str,
+    results: list[EvalResult] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> None:
+    current_results = list(results or [])
+    scored_count = sum(1 for item in current_results if result_is_score_eligible(item))
+    judge_failure_count = len(current_results) - scored_count
     state = {
         "job_id": config.job_id,
         "status": status,
@@ -188,6 +194,9 @@ def _write_progress(
         "skipped": int(skipped),
         "evaluated": int(evaluated),
         "fatal_count": int(fatal_count),
+        "scored_count": scored_count,
+        "judge_failure_count": judge_failure_count,
+        "score_coverage": round(scored_count / len(current_results), 4) if current_results else 0.0,
         "message": message,
         "output_path": config.output_path,
         "config": _safe_config(config),
@@ -220,6 +229,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
         skipped=0,
         evaluated=0,
         fatal_count=sum(1 for result in existing_results if result.fatal_error),
+        results=existing_results,
         message="评测任务启动",
         started_at=started_at,
     )
@@ -247,16 +257,19 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
         def should_skip_result(existing_result: EvalResult | None) -> bool:
             if config.resume_strategy == RESUME_SKIP_ALL:
                 return existing_result is not None
-            if config.resume_strategy == RESUME_SKIP_NON_FATAL:
-                return existing_result is not None and not existing_result.fatal_error
+            if config.resume_strategy in {RESUME_SKIP_NON_FATAL, LEGACY_RESUME_SKIP_NON_FATAL}:
+                return existing_result is not None and result_is_score_eligible(existing_result)
             return False
 
         for index, case in enumerate(cases):
+            fingerprint_builder = getattr(runner, "evaluation_fingerprint", None)
+            expected_fingerprint = fingerprint_builder(case) if callable(fingerprint_builder) else ""
             current_key = case_resume_key(
                 case,
                 judge_model_key,
-                config.judge_prompt_version,
-                config.extraction_prompt_hash,
+                getattr(runner, "resolved_judge_prompt_version", config.judge_prompt_version),
+                getattr(runner, "extraction_prompt_hash", config.extraction_prompt_hash),
+                expected_fingerprint,
             )
             existing_result = existing_by_key.get(current_key)
             if should_skip_result(existing_result):
@@ -268,6 +281,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                     skipped=skipped_count,
                     evaluated=evaluated_count,
                     fatal_count=sum(1 for item in results_by_key.values() if item.fatal_error),
+                    results=list(results_by_key.values()),
                     message=f"跳过已有结果：{index + 1}/{total}，样本：{case.case_id}",
                     started_at=started_at,
                 )
@@ -344,6 +358,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                 skipped=skipped_count,
                 evaluated=evaluated_count,
                 fatal_count=sum(1 for item in results_by_key.values() if item.fatal_error),
+                results=list(results_by_key.values()),
                 message=f"开始评测：待评测 {len(tasks)} 条，跳过 {skipped_count} 条，并发数 {current_concurrency()}",
                 started_at=started_at,
                 extra={
@@ -407,6 +422,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                         skipped=skipped_count,
                         evaluated=evaluated_count,
                         fatal_count=fatal_count,
+                        results=list(results_by_key.values()),
                         message=f"已保存：整体 {done}/{total}，新增 {evaluated_count}/{len(tasks)}，当前样本：{case.case_id}",
                         started_at=started_at,
                         extra={
@@ -440,6 +456,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
                 skipped=skipped_count,
                 evaluated=evaluated_count,
                 fatal_count=sum(1 for item in results if item.fatal_error),
+                results=results,
                 message=f"评测已终止：已完成 {done}/{total}，新增 {evaluated_count} 条，跳过 {skipped_count} 条；可用结果文件断点续跑。",
                 started_at=started_at,
                 extra={"finished_at": utc_now()},
@@ -456,6 +473,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
             skipped=skipped_count,
             evaluated=evaluated_count,
             fatal_count=sum(1 for item in results if item.fatal_error),
+            results=results,
             message=f"评测完成：新增 {evaluated_count} 条，跳过 {skipped_count} 条，结果文件共 {len(results)} 条",
             started_at=started_at,
             extra={"finished_at": utc_now()},
@@ -471,6 +489,7 @@ def run_eval_job(config: EvalJobConfig, cases: list[Case], existing_results: lis
             skipped=int(state.get("skipped", skipped_count) or 0),
             evaluated=int(state.get("evaluated", evaluated_count) or 0),
             fatal_count=int(state.get("fatal_count", sum(1 for item in results_by_key.values() if item.fatal_error)) or 0),
+            results=list(results_by_key.values()),
             message=f"评测失败：{type(exc).__name__}: {exc}",
             started_at=started_at,
             extra={

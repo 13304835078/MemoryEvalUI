@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import requests
 
@@ -37,6 +38,8 @@ class MemoryExtractionConfig:
     top_k: int | None = None
     concurrency: int = 1
     priority: int = 5
+    prompt_cache_id: str = ""
+    prompt_cache_location: str = "none"
     mock: bool = False
 
     @classmethod
@@ -69,6 +72,8 @@ class MemoryExtractionConfig:
             top_p=getattr(config, "judge_top_p", None),
             top_k=getattr(config, "judge_top_k", None),
             concurrency=min(100, max(1, int(getattr(config, "judge_concurrency", 1) or 1))),
+            prompt_cache_id=str(getattr(config, "judge_prompt_cache_id", "") or ""),
+            prompt_cache_location=str(getattr(config, "judge_prompt_cache_location", "none") or "none"),
             mock=bool(getattr(config, "mock", False)),
         )
 
@@ -110,6 +115,8 @@ def extract_answer_from_response(response_data: dict) -> tuple[str | None, str]:
 class MemoryExtractionClient:
     def __init__(self, config: MemoryExtractionConfig):
         self.config = config
+        self.rate_limit_wait_callback: Callable[[], None] | None = None
+        self.should_stop_callback: Callable[[], bool] | None = None
         self.chat_client = LLMChatClient(
             config.api_base,
             config.api_token,
@@ -129,6 +136,8 @@ class MemoryExtractionClient:
                 enable_thinking=bool(self.config.enable_thinking),
                 send_enable_thinking=bool(self.config.send_enable_thinking),
                 skip_special_tokens=bool(self.config.skip_special_tokens),
+                prompt_cache_id=self.config.prompt_cache_id,
+                prompt_cache_location=self.config.prompt_cache_location,
             ),
         )
 
@@ -160,8 +169,15 @@ class MemoryExtractionClient:
                 last_error = f"{type(exc).__name__}: {exc}"
 
             logger.warning("记忆提取 API 调用失败，第 %s/%s 次：%s", attempt, attempts, last_error)
-            if attempt < attempts and self.config.retry_sleep > 0:
-                time.sleep(retry_wait_seconds(last_error, attempt, float(self.config.retry_sleep)))
+            if attempt < attempts:
+                if self.should_stop_callback is not None and self.should_stop_callback():
+                    return False, "STOP REQUESTED", "", "STOP_REQUESTED"
+                if self.config.retry_sleep > 0:
+                    time.sleep(retry_wait_seconds(last_error, attempt, float(self.config.retry_sleep)))
+                if self.rate_limit_wait_callback is not None:
+                    self.rate_limit_wait_callback()
+                if self.should_stop_callback is not None and self.should_stop_callback():
+                    return False, "STOP REQUESTED", "", "STOP_REQUESTED"
 
         return False, f"API CALL FAILED: {last_error}", "", last_error
 

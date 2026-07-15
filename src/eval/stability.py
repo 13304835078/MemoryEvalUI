@@ -7,6 +7,8 @@ from typing import Callable
 
 from ..schema import EvalResult
 from .metrics import DIM_LABELS, TAG_LABELS
+from .result_status import STATUS_LABELS, result_evaluation_status, result_is_score_eligible
+from .rule_refs import normalize_reference_set
 
 
 ResultKey = tuple[str, ...]
@@ -105,12 +107,23 @@ def _diagnostic_signatures(diagnostics: list[dict]) -> list[str]:
         signatures.append("|".join([
             _normalize_text(item.get("dimension")),
             _normalize_text(item.get("severity")),
-            ";".join(item.get("rule_refs") or []),
-            ";".join(item.get("evidence_refs") or []),
-            ";".join(item.get("output_refs") or []),
-            _normalize_text(item.get("reason")),
+            ";".join(sorted(normalize_reference_set(item.get("rule_refs") or []))),
+            ";".join(sorted(normalize_reference_set(item.get("evidence_refs") or []))),
+            ";".join(sorted(normalize_reference_set(item.get("output_refs") or []))),
         ]))
     return signatures
+
+
+def _set_prf(current: list[str], baseline: list[str]) -> tuple[float, float, float]:
+    predicted = set(current)
+    expected = set(baseline)
+    if not predicted and not expected:
+        return 1.0, 1.0, 1.0
+    overlap = len(predicted & expected)
+    precision = overlap / len(predicted) if predicted else 0.0
+    recall = overlap / len(expected) if expected else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return precision, recall, f1
 
 
 def compare_eval_stability(
@@ -123,9 +136,24 @@ def compare_eval_stability(
     current_by_key = _latest_by_key(current_results, key_func)
     baseline_by_key = _latest_by_key(baseline_results, key_func)
 
-    common_keys = sorted(set(current_by_key) & set(baseline_by_key))
+    matched_keys = sorted(set(current_by_key) & set(baseline_by_key))
     current_only = sorted(set(current_by_key) - set(baseline_by_key))
     baseline_only = sorted(set(baseline_by_key) - set(current_by_key))
+
+    execution_failure_keys = [
+        key for key in matched_keys
+        if not result_is_score_eligible(current_by_key[key])
+        or not result_is_score_eligible(baseline_by_key[key])
+    ]
+    config_mismatch_keys = [
+        key for key in matched_keys
+        if key not in execution_failure_keys
+        and current_by_key[key].scoring_config_hash
+        and baseline_by_key[key].scoring_config_hash
+        and current_by_key[key].scoring_config_hash != baseline_by_key[key].scoring_config_hash
+    ]
+    excluded_keys = set(execution_failure_keys) | set(config_mismatch_keys)
+    common_keys = [key for key in matched_keys if key not in excluded_keys]
 
     paired_current = [current_by_key[key] for key in common_keys]
     paired_baseline = [baseline_by_key[key] for key in common_keys]
@@ -136,6 +164,9 @@ def compare_eval_stability(
     tag_exact = 0
     tag_jaccards: list[float] = []
     diag_abs_deltas: list[float] = []
+    diagnostic_precisions: list[float] = []
+    diagnostic_recalls: list[float] = []
+    diagnostic_f1s: list[float] = []
     ref_jaccards: dict[str, list[float]] = {"rule_refs": [], "evidence_refs": [], "output_refs": []}
     added_tags = Counter()
     removed_tags = Counter()
@@ -168,14 +199,22 @@ def compare_eval_stability(
 
         diag_delta = len(current.diagnostics or []) - len(baseline.diagnostics or [])
         diag_abs_deltas.append(abs(diag_delta))
-        diagnostic_jaccard = _set_similarity(
-            _diagnostic_signatures(current.diagnostics or []),
-            _diagnostic_signatures(baseline.diagnostics or []),
+        current_diagnostics = _diagnostic_signatures(current.diagnostics or [])
+        baseline_diagnostics = _diagnostic_signatures(baseline.diagnostics or [])
+        diagnostic_jaccard = _set_similarity(current_diagnostics, baseline_diagnostics)
+        diagnostic_precision, diagnostic_recall, diagnostic_f1 = _set_prf(
+            current_diagnostics, baseline_diagnostics
         )
+        diagnostic_precisions.append(diagnostic_precision)
+        diagnostic_recalls.append(diagnostic_recall)
+        diagnostic_f1s.append(diagnostic_f1)
 
         for ref_field in ref_jaccards:
             ref_jaccards[ref_field].append(
-                _set_similarity(getattr(current, ref_field) or [], getattr(baseline, ref_field) or [])
+                _set_similarity(
+                    list(normalize_reference_set(getattr(current, ref_field) or [])),
+                    list(normalize_reference_set(getattr(baseline, ref_field) or [])),
+                )
             )
 
         changed_dims = 0
@@ -214,8 +253,6 @@ def compare_eval_stability(
             instability_types.append("证据引用变化")
         if output_refs_changed:
             instability_types.append("输出引用变化")
-        if comment_changed:
-            instability_types.append("评语变化")
         if not instability_types:
             instability_types.append("完全一致")
         instability_type_counter.update(t for t in instability_types if t != "完全一致")
@@ -226,7 +263,6 @@ def compare_eval_stability(
             + int(tag_changed) * 60
             + int(diagnostic_changed) * 40
             + int(rule_refs_changed or evidence_refs_changed or output_refs_changed) * 20
-            + int(comment_changed) * 10
         )
 
         diff_rows.append({
@@ -255,6 +291,9 @@ def compare_eval_stability(
             "对照诊断数": len(baseline.diagnostics or []),
             "诊断数差值": diag_delta,
             "诊断Jaccard": round(diagnostic_jaccard, 4),
+            "诊断精确率": round(diagnostic_precision, 4),
+            "诊断召回率": round(diagnostic_recall, 4),
+            "诊断F1": round(diagnostic_f1, 4),
             "规则引用Jaccard": round(ref_jaccards["rule_refs"][-1], 4),
             "证据引用Jaccard": round(ref_jaccards["evidence_refs"][-1], 4),
             "输出引用Jaccard": round(ref_jaccards["output_refs"][-1], 4),
@@ -266,7 +305,10 @@ def compare_eval_stability(
     summary = {
         "current_total": len(current_results),
         "baseline_total": len(baseline_results),
+        "matched_count": len(matched_keys),
         "common_count": common_count,
+        "execution_failure_pair_count": len(execution_failure_keys),
+        "config_mismatch_pair_count": len(config_mismatch_keys),
         "current_only_count": len(current_only),
         "baseline_only_count": len(baseline_only),
         "current_avg_score": round(_mean([float(r.score_total or 0.0) for r in paired_current]), 4),
@@ -277,6 +319,9 @@ def compare_eval_stability(
         "tag_exact_rate": round(tag_exact / common_count, 4) if common_count else 0.0,
         "avg_tag_jaccard": round(_mean(tag_jaccards), 4),
         "avg_diagnostics_count_abs_delta": round(_mean(diag_abs_deltas), 4),
+        "avg_diagnostic_precision": round(_mean(diagnostic_precisions), 4),
+        "avg_diagnostic_recall": round(_mean(diagnostic_recalls), 4),
+        "avg_diagnostic_f1": round(_mean(diagnostic_f1s), 4),
         "avg_rule_refs_jaccard": round(_mean(ref_jaccards["rule_refs"]), 4),
         "avg_evidence_refs_jaccard": round(_mean(ref_jaccards["evidence_refs"]), 4),
         "avg_output_refs_jaccard": round(_mean(ref_jaccards["output_refs"]), 4),
@@ -335,6 +380,30 @@ def compare_eval_stability(
     for row in diff_rows:
         row.pop("_sort_priority", None)
 
+    execution_failure_rows = []
+    for key in execution_failure_keys:
+        current = current_by_key[key]
+        baseline = baseline_by_key[key]
+        execution_failure_rows.append({
+            "匹配键": " | ".join(key),
+            "case_id": current.case_id,
+            "当前状态": STATUS_LABELS.get(result_evaluation_status(current), result_evaluation_status(current)),
+            "对照状态": STATUS_LABELS.get(result_evaluation_status(baseline), result_evaluation_status(baseline)),
+            "说明": "运行失败样本不参与分数稳定性计算，请先重跑失败项。",
+        })
+
+    config_mismatch_rows = []
+    for key in config_mismatch_keys:
+        current = current_by_key[key]
+        baseline = baseline_by_key[key]
+        config_mismatch_rows.append({
+            "匹配键": " | ".join(key),
+            "case_id": current.case_id,
+            "当前评分配置Hash": current.scoring_config_hash,
+            "对照评分配置Hash": baseline.scoring_config_hash,
+            "说明": "Judge 模型、提示词、解码参数或评分协议不同，不直接计入稳定性。",
+        })
+
     return {
         "summary": summary,
         "distribution_rows": distribution_rows,
@@ -342,6 +411,8 @@ def compare_eval_stability(
         "tag_rows": tag_rows,
         "instability_type_rows": instability_type_rows,
         "diff_rows": diff_rows,
+        "execution_failure_rows": execution_failure_rows,
+        "config_mismatch_rows": config_mismatch_rows,
         "current_only_keys": [" | ".join(key) for key in current_only],
         "baseline_only_keys": [" | ".join(key) for key in baseline_only],
     }

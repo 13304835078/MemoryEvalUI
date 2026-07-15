@@ -12,13 +12,32 @@ def _result(case_id: str, *, score: float = 5.0, fatal: bool = False, tags: list
     )
 
 
-def test_classify_no_candidate_as_eval_chain_failed_when_all_results_are_fatal():
+def test_classify_no_candidate_keeps_quality_fatal_as_valid_evidence():
     reason = _classify_no_candidate_reason(
         results=[_result("c1", fatal=True), _result("c2", fatal=True)],
         evidence=[
             {"case_id": "c1", "fatal_error": True, "evidence_mode": "issue_or_low_score"},
             {"case_id": "c2", "fatal_error": True, "evidence_mode": "issue_or_low_score"},
         ],
+        advisor_result={"candidate_prompt_source": "no_valid_incremental_patch"},
+    )
+
+    assert reason["category"] == "no_safe_patch"
+    assert reason["status"] == "paused_no_safe_patch"
+
+
+def test_classify_no_candidate_as_eval_chain_failed_for_judge_runtime_failures():
+    failed = [
+        EvalResult.from_parse_failure(
+            case_id=f"c{index}",
+            task_type="user_md_update",
+            raw="API error: QPS limit exceeded",
+        )
+        for index in (1, 2)
+    ]
+    reason = _classify_no_candidate_reason(
+        results=failed,
+        evidence=[],
         advisor_result={"candidate_prompt_source": "no_valid_incremental_patch"},
     )
 

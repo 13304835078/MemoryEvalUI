@@ -126,7 +126,7 @@ def is_valid_judge_result(
     if not isinstance(data.get("fatal_error"), bool):
         return False, "fatal_error 必须是布尔值"
 
-    for field_name in ("rule_refs", "evidence_refs", "output_refs"):
+    for field_name in ("rule_refs", "evidence_refs", "output_refs", "reasoning_refs"):
         if field_name in data:
             error = validate_string_list(data.get(field_name), field_name)
             if error:
@@ -148,7 +148,9 @@ def is_valid_judge_result(
             return False, f"{prefix}.severity 必须是 low、medium 或 high"
         if not isinstance(item.get("reason"), str) or not item["reason"].strip():
             return False, f"{prefix}.reason 必须是非空字符串"
-        for field_name in ("rule_refs", "evidence_refs", "output_refs"):
+        for field_name in ("rule_refs", "evidence_refs", "output_refs", "reasoning_refs"):
+            if field_name == "reasoning_refs" and field_name not in item:
+                continue
             error = validate_string_list(item.get(field_name), f"{prefix}.{field_name}")
             if error:
                 return False, error

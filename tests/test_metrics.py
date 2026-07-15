@@ -52,3 +52,20 @@ def test_group_by():
 def test_empty_results():
     stats = compute_aggregations([])
     assert stats["total_cases"] == 0
+
+
+def test_runtime_failure_is_not_counted_as_zero_score():
+    success = EvalResult(case_id="ok", task_type="user_md_update", score_total=4.0)
+    failure = EvalResult.from_parse_failure(
+        case_id="failed",
+        task_type="user_md_update",
+        raw="API error: QPS limit exceeded",
+    )
+
+    stats = compute_aggregations([success, failure])
+
+    assert stats["total_cases"] == 2
+    assert stats["scored_cases"] == 1
+    assert stats["judge_failures"] == 1
+    assert stats["avg_score_total"] == 4.0
+    assert stats["run_complete"] is False

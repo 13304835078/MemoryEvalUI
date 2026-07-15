@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from src.eval.judge_client import RealJudgeClient
+from src.eval.result_status import result_is_score_eligible
 from src.schema import EvalResult
 from src.ui.prompt_editor import (
     infer_prompt_version,
@@ -145,6 +146,21 @@ def _load_prompt_by_result(result: EvalResult) -> dict[str, Any]:
 
 
 def validate_result_rule_refs(result: EvalResult, extraction_prompt_text: str | None = None) -> dict[str, Any]:
+    if not result_is_score_eligible(result):
+        return {
+            "checked": False,
+            "status": "runtime_failure",
+            "status_label": "运行失败，未校验",
+            "prompt_source": "",
+            "prompt_hash_match": None,
+            "missing_required": False,
+            "invalid_refs": [],
+            "invalid_ref_details": [],
+            "raw_invalid_refs": [],
+            "raw_invalid_ref_details": [],
+            "valid_refs": [],
+            "total_refs": 0,
+        }
     prompt_source = ""
     prompt_hash_match: bool | None = None
 

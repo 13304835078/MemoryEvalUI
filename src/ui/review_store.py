@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from src.persistence import atomic_write_jsonl, file_lock
 from src.runtime_paths import APP_HOME, DATA_DIR
 
 PROJECT_ROOT = APP_HOME
@@ -24,22 +25,25 @@ def load_reviews(path: str | Path = DEFAULT_REVIEW_PATH) -> dict[str, dict[str, 
     if not path.exists():
         return reviews
 
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    with file_lock(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
 
-            key = review_key(
-                str(item.get("case_id", "")),
-                str(item.get("model_name", "unknown")),
-                str(item.get("prompt_version", "unknown")),
-            )
-            reviews[key] = item
+                key = review_key(
+                    str(item.get("case_id", "")),
+                    str(item.get("model_name", "unknown")),
+                    str(item.get("prompt_version", "unknown")),
+                )
+                reviews[key] = item
 
     return reviews
 
@@ -48,28 +52,27 @@ def save_all_reviews(reviews: dict[str, dict[str, Any]],
                      path: str | Path = DEFAULT_REVIEW_PATH) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w", encoding="utf-8") as f:
-        for item in reviews.values():
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    atomic_write_jsonl(path, reviews.values())
 
 
 def upsert_review(review: dict[str, Any],
                   path: str | Path = DEFAULT_REVIEW_PATH) -> dict[str, dict[str, Any]]:
-    reviews = load_reviews(path)
+    path = Path(path)
+    with file_lock(path):
+        reviews = load_reviews(path)
 
-    review = dict(review)
-    review.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        review = dict(review)
+        review.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
 
-    key = review_key(
-        str(review.get("case_id", "")),
-        str(review.get("model_name", "unknown")),
-        str(review.get("prompt_version", "unknown")),
-    )
+        key = review_key(
+            str(review.get("case_id", "")),
+            str(review.get("model_name", "unknown")),
+            str(review.get("prompt_version", "unknown")),
+        )
 
-    reviews[key] = review
-    save_all_reviews(reviews, path)
-    return reviews
+        reviews[key] = review
+        save_all_reviews(reviews, path)
+        return reviews
 
 
 def reviews_to_dataframe(reviews: dict[str, dict[str, Any]]) -> pd.DataFrame:

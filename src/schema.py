@@ -5,6 +5,11 @@ from datetime import datetime, timezone
 import os
 
 from .persistence import append_jsonl, atomic_write_jsonl, read_jsonl
+from .eval.result_status import (
+    EVAL_STATUS_SUCCESS,
+    classify_failure_status,
+    infer_legacy_result_status,
+)
 
 
 class TaskType(str, Enum):
@@ -218,6 +223,11 @@ class EvalResult:
     comment: str = ""
     error_tags: list[str] = field(default_factory=list)
     fatal_error: bool = False
+    # 运行失败与模型质量错误分离。fatal_error 仅表示 Judge 判定的质量严重错误。
+    evaluation_status: str = EVAL_STATUS_SUCCESS
+    score_eligible: bool = True
+    failure_type: str = ""
+    failure_message: str = ""
     # 被评测对象信息：candidate_output来自哪个模型/prompt
     model_name: str = "unknown"
     prompt_version: str = "unknown"
@@ -226,10 +236,17 @@ class EvalResult:
     judge_prompt_version: str = ""
     extraction_prompt_version: str = ""
     extraction_prompt_hash: str = ""
+    judge_prompt_hash: str = ""
+    scoring_schema_version: str = ""
+    dimension_weights_version: str = ""
+    scoring_config_hash: str = ""
+    case_input_hash: str = ""
+    evaluation_fingerprint: str = ""
     diagnostics: list[dict] = field(default_factory=list)
     rule_refs: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
     output_refs: list[str] = field(default_factory=list)
+    reasoning_refs: list[str] = field(default_factory=list)
     
     raw_response: Optional[str] = None
     timestamp: str = ""
@@ -240,6 +257,11 @@ class EvalResult:
     @classmethod
     def from_dict(cls, data: dict) -> "EvalResult":
         data = dict(data)
+        if "evaluation_status" not in data or "score_eligible" not in data:
+            status, eligible, failure_type = infer_legacy_result_status(data)
+            data.setdefault("evaluation_status", status)
+            data.setdefault("score_eligible", eligible)
+            data.setdefault("failure_type", failure_type)
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     @classmethod
@@ -254,25 +276,43 @@ class EvalResult:
         judge_prompt_version: str = "",
         extraction_prompt_version: str = "",
         extraction_prompt_hash: str = "",
+        judge_prompt_hash: str = "",
+        scoring_schema_version: str = "",
+        dimension_weights_version: str = "",
+        scoring_config_hash: str = "",
+        case_input_hash: str = "",
+        evaluation_fingerprint: str = "",
     ) -> "EvalResult":
+        status, failure_type = classify_failure_status(raw)
         return cls(
             case_id=case_id,
             task_type=task_type,
             score_total=0.0,
             scores={},
             comment="Judge 调用失败或 JSON 解析失败",
-            error_tags=["format_error"],
-            fatal_error=True,
+            error_tags=[],
+            fatal_error=False,
+            evaluation_status=status,
+            score_eligible=False,
+            failure_type=failure_type,
+            failure_message=raw,
             model_name=model_name,
             prompt_version=prompt_version,
             judge_model=judge_model,
             judge_prompt_version=judge_prompt_version,
             extraction_prompt_version=extraction_prompt_version,
             extraction_prompt_hash=extraction_prompt_hash,
+            judge_prompt_hash=judge_prompt_hash,
+            scoring_schema_version=scoring_schema_version,
+            dimension_weights_version=dimension_weights_version,
+            scoring_config_hash=scoring_config_hash,
+            case_input_hash=case_input_hash,
+            evaluation_fingerprint=evaluation_fingerprint,
             diagnostics=[],
             rule_refs=[],
             evidence_refs=[],
             output_refs=[],
+            reasoning_refs=[],
             raw_response=raw,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
@@ -287,7 +327,7 @@ def append_result_to_jsonl(result: EvalResult, path: str) -> None:
 
 
 def results_from_jsonl(path: str) -> list[EvalResult]:
-    results_by_key: dict[tuple[str, str, str, str, str, str], EvalResult] = {}
+    results_by_key: dict[tuple[str, str, str, str, str, str, str], EvalResult] = {}
     for row in read_jsonl(path):
         result = EvalResult.from_dict(row)
         key = (
@@ -297,6 +337,7 @@ def results_from_jsonl(path: str) -> list[EvalResult]:
             result.judge_model or "",
             result.judge_prompt_version or "",
             result.extraction_prompt_hash or "",
+            result.evaluation_fingerprint or "",
         )
         results_by_key[key] = result
     return list(results_by_key.values())

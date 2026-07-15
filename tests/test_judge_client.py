@@ -310,7 +310,8 @@ def test_real_judge_build_payload_uses_core_options_only():
     assert payload["stream"] is False
     assert "stream_options" not in payload
     assert "stop" not in payload
-    assert "promptCacheId" not in payload
+    assert payload["promptCacheId"] == "task_1"
+    assert payload["extra_body"]["promptCacheId"] == "task_1"
     assert "call_from" not in payload["extra_body"]
     assert "session_id" not in payload["extra_body"]
     assert "interaction_id" not in payload["extra_body"]
@@ -318,6 +319,12 @@ def test_real_judge_build_payload_uses_core_options_only():
     assert payload["extra_body"]["skip_special_tokens"] is False
     assert "moderation_options" not in payload["extra_body"]
     assert "custom" not in payload["extra_body"]
+
+
+def test_real_judge_build_payload_preserves_zero_top_p():
+    client = RealJudgeClient(EvalConfig(judge_top_p=0.0))
+
+    assert client._build_payload("system", "user")["top_p"] == 0.0
 
 
 def test_real_judge_build_headers_uses_bearer_only():
@@ -401,6 +408,31 @@ def test_real_judge_rate_limit_retry_uses_global_wait_callback(monkeypatch):
     assert waits == ["waited"]
     assert sleeps and sleeps[0] >= 11.0
     assert raw is not None
+
+
+def test_real_judge_parse_retry_also_reserves_global_rate_slot(monkeypatch):
+    ok_result = {
+        "score_total": 5.0,
+        "scores": {key: 5 for key in JUDGE_RESULT_SCHEMA["dimension_keys"]},
+        "comment": "ok",
+        "error_tags": [],
+        "fatal_error": False,
+    }
+    responses = [
+        _FakeJsonResponse({"choices": [{"message": {"content": "not-json"}}]}),
+        _FakeJsonResponse({"choices": [{"message": {"content": json.dumps(ok_result)}}]}),
+    ]
+    waits = []
+
+    monkeypatch.setattr("src.llm_api.requests.Session", lambda: _FakeSession(responses))
+    monkeypatch.setattr("src.eval.judge_client.time.sleep", lambda _seconds: None)
+    client = RealJudgeClient(EvalConfig(judge_max_retries=2))
+    client.rate_limit_wait_callback = lambda: waits.append("waited")
+
+    result, _raw = client.judge("system", "user")
+
+    assert result is not None
+    assert waits == ["waited"]
 
 
 class _FakeStreamResponse:

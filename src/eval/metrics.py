@@ -1,6 +1,7 @@
 import json
 from collections import Counter
 from ..schema import EvalResult
+from .result_status import STATUS_LABELS, result_evaluation_status, result_is_score_eligible
 
 DIM_LABELS = {
     "correctness": "正确性",
@@ -28,30 +29,52 @@ TAG_LABELS = {
 
 def compute_aggregations(results: list[EvalResult]) -> dict:
     if not results:
-        return {"total_cases": 0}
+        return {
+            "total_cases": 0,
+            "scored_cases": 0,
+            "judge_failures": 0,
+            "score_coverage": 0.0,
+            "run_complete": False,
+            "fatal_errors": 0,
+            "fatal_rate": 0.0,
+            "avg_score_total": 0.0,
+            "avg_dimension_scores": {},
+            "error_tags": [],
+            "evaluation_statuses": [],
+        }
 
     total = len(results)
-    fatal_count = sum(1 for r in results if r.fatal_error)
-    avg_total = round(sum(r.score_total for r in results) / total, 2)
+    scored_results = [r for r in results if result_is_score_eligible(r)]
+    scored_count = len(scored_results)
+    judge_failures = total - scored_count
+    fatal_count = sum(1 for r in scored_results if r.fatal_error)
+    avg_total = round(sum(r.score_total for r in scored_results) / scored_count, 2) if scored_count else 0.0
 
     dim_scores: dict[str, list[float]] = {}
-    for r in results:
+    for r in scored_results:
         for dim, score in r.scores.items():
             dim_scores.setdefault(dim, []).append(score)
     dim_avgs = {dim: round(sum(vals) / len(vals), 2) for dim, vals in dim_scores.items()}
 
     tag_counter = Counter()
-    for r in results:
+    for r in scored_results:
         for tag in r.error_tags:
             tag_counter[tag] += 1
 
+    status_counter = Counter(result_evaluation_status(r) for r in results)
+
     return {
         "total_cases": total,
+        "scored_cases": scored_count,
+        "judge_failures": judge_failures,
+        "score_coverage": round(scored_count / total, 3) if total else 0.0,
+        "run_complete": judge_failures == 0,
         "fatal_errors": fatal_count,
-        "fatal_rate": round(fatal_count / total, 3) if total > 0 else 0.0,
+        "fatal_rate": round(fatal_count / scored_count, 3) if scored_count else 0.0,
         "avg_score_total": avg_total,
         "avg_dimension_scores": dim_avgs,
         "error_tags": tag_counter.most_common(),
+        "evaluation_statuses": status_counter.most_common(),
     }
 
 
@@ -121,6 +144,9 @@ def summarize_by_field(results: list[EvalResult], field: str) -> list[dict]:
         rows.append({
             field: key,
             "total_cases": stats.get("total_cases", 0),
+            "scored_cases": stats.get("scored_cases", 0),
+            "judge_failures": stats.get("judge_failures", 0),
+            "score_coverage": stats.get("score_coverage", 0),
             "avg_score_total": stats.get("avg_score_total", 0),
             "fatal_errors": stats.get("fatal_errors", 0),
             "fatal_rate": stats.get("fatal_rate", 0),
@@ -136,17 +162,30 @@ def flatten_results(results: list[EvalResult]) -> list[dict]:
             "model_name": r.model_name,
             "prompt_version": r.prompt_version,
             "score_total": r.score_total,
+            "score_display": f"{r.score_total:.2f}" if result_is_score_eligible(r) else "未评分",
             "fatal_error": r.fatal_error,
+            "evaluation_status": result_evaluation_status(r),
+            "evaluation_status_label": STATUS_LABELS.get(result_evaluation_status(r), result_evaluation_status(r)),
+            "score_eligible": result_is_score_eligible(r),
+            "failure_type": r.failure_type,
+            "failure_message": r.failure_message,
             "comment": r.comment,
             "error_tags": ",".join(r.error_tags),
             "judge_model": r.judge_model,
             "judge_prompt_version": r.judge_prompt_version,
             "extraction_prompt_version": r.extraction_prompt_version,
             "extraction_prompt_hash": r.extraction_prompt_hash,
+            "judge_prompt_hash": r.judge_prompt_hash,
+            "scoring_schema_version": r.scoring_schema_version,
+            "dimension_weights_version": r.dimension_weights_version,
+            "scoring_config_hash": r.scoring_config_hash,
+            "case_input_hash": r.case_input_hash,
+            "evaluation_fingerprint": r.evaluation_fingerprint,
             "diagnostics_count": len(r.diagnostics or []),
             "rule_refs": "; ".join(r.rule_refs or []),
             "evidence_refs": "; ".join(r.evidence_refs or []),
             "output_refs": "; ".join(r.output_refs or []),
+            "reasoning_refs": "; ".join(r.reasoning_refs or []),
             "diagnostics": json.dumps(r.diagnostics or [], ensure_ascii=False),
             "timestamp": r.timestamp,
         }

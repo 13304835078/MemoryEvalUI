@@ -51,6 +51,12 @@ def test_build_eval_config_interface_options():
     assert cfg.judge_call_from == "memory_eval"
 
 
+def test_build_eval_config_preserves_zero_top_p():
+    cfg = build_eval_config({"judge_top_p": 0.0}, mock=True)
+
+    assert cfg.judge_top_p == 0.0
+
+
 def test_load_config_marks_corrupt_file_and_uses_defaults(tmp_path):
     path = tmp_path / "local_config.json"
     path.write_text("{bad json", encoding="utf-8")

@@ -48,6 +48,27 @@ def test_llm_api_build_chat_payload_core_options():
     assert payload["extra_body"] == {"skip_special_tokens": False, "enable_thinking": False}
 
 
+def test_llm_api_build_chat_payload_supports_documented_prompt_cache_locations():
+    payload = build_chat_payload(
+        [{"role": "user", "content": "hi"}],
+        ChatPayloadOptions(
+            model="m",
+            max_tokens=100,
+            prompt_cache_id="task_001",
+            prompt_cache_location="both",
+        ),
+    )
+
+    assert payload["promptCacheId"] == "task_001"
+    assert payload["extra_body"]["promptCacheId"] == "task_001"
+
+    with pytest.raises(ValueError, match="只能包含"):
+        build_chat_payload(
+            [{"role": "user", "content": "hi"}],
+            ChatPayloadOptions(model="m", max_tokens=10, prompt_cache_id="中文", prompt_cache_location="extra"),
+        )
+
+
 def test_llm_api_error_and_retry_wait_are_shared():
     is_err, message = is_api_error({"error": {"message": "QPS limit exceeded, limit:0.10"}})
 

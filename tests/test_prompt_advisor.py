@@ -130,6 +130,24 @@ def test_collect_absolute_eval_evidence_can_include_all_as_weak_context():
     assert experimental[0]["evidence_mode"] == "weak_context_from_result"
 
 
+def test_collect_absolute_eval_evidence_excludes_runtime_failures_and_adds_positive_boundary():
+    failure = EvalResult.from_parse_failure(
+        case_id="runtime", task_type="user_md_update", raw="API error: timeout"
+    )
+    issue = EvalResult(
+        case_id="issue", task_type="user_md_update", score_total=4.0,
+        error_tags=["missing_key_info"],
+    )
+    positive = EvalResult(case_id="positive", task_type="user_md_update", score_total=5.0)
+
+    evidence = collect_absolute_eval_evidence(
+        [failure, issue, positive], max_items=3, positive_boundary_limit=1
+    )
+
+    assert {item["case_id"] for item in evidence} == {"issue", "positive"}
+    assert next(item for item in evidence if item["case_id"] == "positive")["evidence_mode"] == "positive_boundary"
+
+
 def test_build_advisor_user_message_marks_extraction_loop_constraints():
     evidence = [{"case_id": "c1", "evidence_mode": "weak_context_from_result"}]
 
@@ -344,8 +362,9 @@ def test_prompt_advisor_caps_extraction_advisor_tokens_and_payload(monkeypatch):
     }
     captured = {}
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         captured["payload"] = json.loads(data.decode("utf-8"))
+        captured["stream"] = stream
         return _FakeAdvisorResponse({
             "choices": [{"message": {"content": json.dumps(advisor_result, ensure_ascii=False)}}]
         })
@@ -363,6 +382,7 @@ def test_prompt_advisor_caps_extraction_advisor_tokens_and_payload(monkeypatch):
 
     user_payload = json.loads(captured["payload"]["messages"][1]["content"])
     assert result["can_suggest"] is True
+    assert captured["stream"] is True
     assert captured["payload"]["max_tokens"] == 1200
     assert user_payload["stage"] == "1_intent_localization"
     assert user_payload["prompt_global_outline"]
@@ -432,7 +452,7 @@ def test_prompt_advisor_two_stage_groups_cases_by_section(monkeypatch):
     ]
     sent_messages = []
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         payload = json.loads(data.decode("utf-8"))
         sent_messages.append(json.loads(payload["messages"][1]["content"]))
         return responses.pop(0)
@@ -507,7 +527,7 @@ def test_prompt_advisor_skips_case_specific_or_overlong_patch(monkeypatch):
         _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
     ]
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         return responses.pop(0)
 
     monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
@@ -574,7 +594,7 @@ def test_prompt_advisor_skips_append_that_duplicates_whole_prompt(monkeypatch):
         _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
     ]
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         return responses.pop(0)
 
     monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
@@ -630,7 +650,7 @@ def test_prompt_advisor_skips_unknown_patch_op_instead_of_appending(monkeypatch)
         _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
     ]
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         return responses.pop(0)
 
     monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
@@ -687,7 +707,7 @@ def test_prompt_advisor_accepts_delete_within_section(monkeypatch):
         _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
     ]
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         return responses.pop(0)
 
     monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
@@ -765,7 +785,7 @@ def test_prompt_advisor_prunes_duplicate_inserted_lines_in_replace(monkeypatch):
         _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
     ]
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         return responses.pop(0)
 
     monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
@@ -836,7 +856,7 @@ def test_prompt_advisor_limits_cumulative_append_growth(monkeypatch):
         _FakeAdvisorResponse({"choices": [{"message": {"content": json.dumps(stage2, ensure_ascii=False)}}]}),
     ]
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         return responses.pop(0)
 
     monkeypatch.setattr("src.ui.prompt_advisor.requests.post", fake_post)
@@ -885,7 +905,7 @@ def test_prompt_advisor_retries_idle_timeout_with_compacted_payload(monkeypatch)
     payload_lengths = []
     sleeps = []
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         payload_lengths.append(len(data))
         return responses.pop(0)
 
@@ -937,7 +957,7 @@ def test_extraction_advisor_batches_stage1_evidence(monkeypatch):
         "validation_plan": [],
     }
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         payload = json.loads(data.decode("utf-8"))
         sent_payloads.append(payload)
         return _FakeAdvisorResponse({
@@ -977,7 +997,7 @@ def test_stage2_uses_complete_target_blocks_instead_of_whole_sections(monkeypatc
     extraction_prompt = "## 长章节\n" + "\n\n".join(paragraphs) + "\n\n## 邻接章节\n- 邻接规则。\n"
     sent_messages = []
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         payload = json.loads(data.decode("utf-8"))
         message = json.loads(payload["messages"][1]["content"])
         sent_messages.append(message)
@@ -1044,7 +1064,7 @@ def test_extraction_stage_retry_reduces_same_batch_payload(monkeypatch):
     ]
     payloads = []
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         payloads.append(json.loads(data.decode("utf-8")))
         return responses.pop(0)
 
@@ -1075,7 +1095,7 @@ def test_extraction_stage_retry_reduces_same_batch_payload(monkeypatch):
 def test_matching_rule_refs_skip_model_localization_call(monkeypatch):
     sent_messages = []
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         payload = json.loads(data.decode("utf-8"))
         message = json.loads(payload["messages"][1]["content"])
         sent_messages.append(message)
@@ -1121,7 +1141,7 @@ def test_extraction_advisor_accepts_streaming_json(monkeypatch):
     }
     captured = {}
 
-    def fake_post(_url, headers, data, timeout):
+    def fake_post(_url, headers, data, timeout, stream=False):
         captured["payload"] = json.loads(data.decode("utf-8"))
         return _FakeAdvisorStreamResponse(json.dumps(stage2_result, ensure_ascii=False))
 
