@@ -1,0 +1,97 @@
+name: Build Release Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing draft release tag
+        required: true
+        type: string
+      source_ref:
+        description: Commit, branch, or tag to package
+        required: true
+        default: main
+        type: string
+      publish_release:
+        description: Publish the draft after both assets upload successfully
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build and verify executable package
+        shell: pwsh
+        env:
+          MEMORY_EVAL_VERSION: ${{ inputs.release_tag }}
+        run: |
+          $python = (Get-Command python).Source
+          .\scripts\build_release.ps1 -Python $python
+
+      - name: Create source fast-check package
+        shell: pwsh
+        run: |
+          $archive = "dist\MemoryEvalUI-source-fastcheck.zip"
+          if (Test-Path -LiteralPath $archive) {
+            Remove-Item -LiteralPath $archive -Force
+          }
+          git archive --format=zip --output=$archive HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "git archive failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Preserve packages as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MemoryEvalUI-${{ inputs.release_tag }}
+          path: |
+            dist/MemoryEvalUI.zip
+            dist/MemoryEvalUI-source-fastcheck.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload packages to draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.release_tag }}" `
+            "dist\MemoryEvalUI.zip" `
+            "dist\MemoryEvalUI-source-fastcheck.zip" `
+            --repo "${{ github.repository }}" `
+            --clobber
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ inputs.release_tag }}" `
+            --repo "${{ github.repository }}" `
+            --draft=false
