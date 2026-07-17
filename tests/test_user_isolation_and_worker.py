@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.runtime_paths import DATA_DIR, activate_workspace
+from src.runtime_paths import DATA_DIR, active_workspace_id, activate_workspace
 from src.ui import task_worker, user_identity
 from src.ui.config_store import CONFIG_PATH
 from src.ui.data_service import RESULTS_DIR
@@ -63,6 +63,32 @@ def test_current_identity_restores_streamlit_session(monkeypatch):
         "测试用户",
         "TE**01",
     )
+
+
+def test_require_page_identity_reactivates_workspace(monkeypatch):
+    monkeypatch.setattr(
+        user_identity,
+        "st",
+        SimpleNamespace(
+            session_state={
+                user_identity.IDENTITY_SESSION_KEY: {
+                    "workspace_id": "user_fragment_test",
+                    "display_name": "Test User",
+                    "masked_work_id": "TE**02",
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(user_identity, "ensure_writable_layout", lambda: None)
+
+    try:
+        activate_workspace("")
+        identity = user_identity.require_page_identity()
+
+        assert identity.workspace_id == "user_fragment_test"
+        assert active_workspace_id() == "user_fragment_test"
+    finally:
+        activate_workspace("")
 
 
 def test_worker_request_restores_secret_from_environment(tmp_path: Path, monkeypatch):

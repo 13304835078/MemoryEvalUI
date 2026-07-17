@@ -18,6 +18,7 @@ from src.ui.prompt_advisor_job_runner import (
     read_prompt_advisor_job_state,
     request_prompt_advisor_stop,
 )
+from src.ui.user_identity import require_page_identity
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ def collect_task_summaries(*, per_type: int = 3) -> list[dict[str, Any]]:
 
 @st.fragment(run_every="10s")
 def _render_task_indicator_fragment() -> None:
+    require_page_identity()
     rows = collect_task_summaries()
     running = [item for item in rows if item["status"] == "running"]
     recent = [item for item in rows if item["status"] != "running"][:3]

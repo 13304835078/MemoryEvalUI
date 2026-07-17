@@ -381,6 +381,7 @@ def render_prompt_advisor_job_state(job_id: str) -> None:
 
 @st.fragment(run_every="10s")
 def render_prompt_advisor_job_state_auto(job_id: str) -> None:
+    require_page_identity()
     render_prompt_advisor_job_state(job_id)
 
 

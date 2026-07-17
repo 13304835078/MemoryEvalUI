@@ -602,6 +602,7 @@ def render_state(run_id: str) -> None:
 
 @st.fragment(run_every="10s")
 def render_state_auto(run_id: str) -> None:
+    require_page_identity()
     render_state(run_id)
 
 

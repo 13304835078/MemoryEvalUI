@@ -177,3 +177,27 @@ def test_sidebar_task_indicator_invokes_fragment_inside_sidebar(monkeypatch) -> 
     task_indicator.render_sidebar_task_indicator()
 
     assert events == ["enter", "fragment", "exit"]
+
+
+def test_background_auto_refresh_fragments_restore_workspace() -> None:
+    project_root = Path(__file__).parents[1]
+    page_fragments = {
+        "3_*.py": "render_eval_job_state_auto",
+        "6_*.py": "render_task_table_auto",
+        "7_*.py": "render_prompt_advisor_job_state_auto",
+        "8_*.py": "render_judge_ab_job_state_auto",
+        "9_*.py": "render_state_auto",
+        "10_*.py": "render_memory_extraction_job_state_auto",
+    }
+
+    sources = [
+        (next((project_root / "pages").glob(pattern)), function_name)
+        for pattern, function_name in page_fragments.items()
+    ]
+    sources.append((project_root / "src" / "ui" / "task_indicator.py", "_render_task_indicator_fragment"))
+
+    for path, function_name in sources:
+        source = path.read_text(encoding="utf-8")
+        function_start = source.index(f"def {function_name}")
+        function_body = source[function_start:source.find("\n\n", function_start)]
+        assert "require_page_identity()" in function_body, path.name

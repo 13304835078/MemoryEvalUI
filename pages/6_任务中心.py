@@ -308,6 +308,7 @@ auto_refresh = st.checkbox("每10秒自动刷新任务列表", value=False)
 
 @st.fragment(run_every="10s")
 def render_task_table_auto() -> None:
+    require_page_identity()
     render_task_table()
 
 

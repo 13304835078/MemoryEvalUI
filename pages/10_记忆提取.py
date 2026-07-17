@@ -411,6 +411,7 @@ def render_memory_extraction_job_state(job_id: str) -> None:
 
 @st.fragment(run_every="10s")
 def render_memory_extraction_job_state_auto(job_id: str) -> None:
+    require_page_identity()
     render_memory_extraction_job_state(job_id)
 
 
