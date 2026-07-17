@@ -68,12 +68,12 @@ def collect_task_summaries(*, per_type: int = 3) -> list[dict[str, Any]]:
 
 
 @st.fragment(run_every="10s")
-def render_sidebar_task_indicator() -> None:
+def _render_task_indicator_fragment() -> None:
     rows = collect_task_summaries()
     running = [item for item in rows if item["status"] == "running"]
     recent = [item for item in rows if item["status"] != "running"][:3]
     label = f"后台任务 · {len(running)} 个运行中" if running else "后台任务"
-    with st.sidebar.expander(label, expanded=bool(running)):
+    with st.expander(label, expanded=bool(running)):
         if not running and not recent:
             st.caption("暂无后台任务。")
         for item in running:
@@ -91,3 +91,10 @@ def render_sidebar_task_indicator() -> None:
             for item in recent:
                 st.caption(f"{item['type']} · {item['status']} · {item['job_id']}")
         st.page_link("pages/6_任务中心.py", label="打开任务中心", icon=":material/task_alt:", width="stretch")
+
+
+def render_sidebar_task_indicator() -> None:
+    # A fragment may only create widgets under the container where it is invoked.
+    # Enter the sidebar first instead of targeting st.sidebar from inside it.
+    with st.sidebar:
+        _render_task_indicator_fragment()

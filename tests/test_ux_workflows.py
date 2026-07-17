@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from src.schema import Case, EvalConfig, EvalResult, TaskType
 from src.ui.error_diagnostics import classify_failure_text
@@ -16,6 +17,7 @@ from src.ui.preflight import (
 from src.ui.prompt_diff import analyze_prompt_diff
 from src.ui.result_triage import result_matches_filter, result_navigation_key, triage_result_rows
 from src.ui.run_presets import apply_run_preset, load_custom_presets, save_custom_preset
+from src.ui import task_indicator
 
 
 def _case(candidate: str = "- 用户喜欢咖啡") -> Case:
@@ -152,3 +154,26 @@ def test_evaluation_data_page_does_not_embed_memory_extraction_runner() -> None:
     assert "MemoryExtractionRunner" not in page_source
     assert "运行 USER.md 记忆提取" not in page_source
     assert 'st.switch_page("pages/10_记忆提取.py")' in page_source
+
+
+def test_sidebar_task_indicator_invokes_fragment_inside_sidebar(monkeypatch) -> None:
+    events: list[str] = []
+
+    class SidebarContext:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("exit")
+
+    monkeypatch.setattr(task_indicator, "st", SimpleNamespace(sidebar=SidebarContext()))
+    monkeypatch.setattr(
+        task_indicator,
+        "_render_task_indicator_fragment",
+        lambda: events.append("fragment"),
+    )
+
+    task_indicator.render_sidebar_task_indicator()
+
+    assert events == ["enter", "fragment", "exit"]
