@@ -10,7 +10,14 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $Root
 
 function Remove-WorkspaceCaches {
-    Get-ChildItem -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($RelativePath in @("src", "pages", "scripts", "tests")) {
+        $SearchRoot = Join-Path $Root $RelativePath
+        if (Test-Path -LiteralPath $SearchRoot) {
+            Get-ChildItem -LiteralPath $SearchRoot -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Remove-Item -Recurse -Force (Join-Path $Root "__pycache__") -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force ".pytest_cache" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force ".tmp" -ErrorAction SilentlyContinue
 }
