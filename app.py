@@ -102,6 +102,7 @@ def render_home() -> None:
         st.markdown("### 优化实验")
         st.page_link("pages/7_提示词改进建议.py", label="提示词改进建议", icon=":material/edit_note:")
         st.page_link("pages/8_裁判提示词AB对比.py", label="裁判提示词 A/B 对比", icon=":material/compare_arrows:")
+        st.page_link("pages/11_提取提示词AB对比.py", label="提取提示词 A/B 对比", icon=":material/difference:")
         st.page_link("pages/9_闭环实验.py", label="闭环实验", icon=":material/autorenew:")
 
     with st.expander("首次使用与运行说明", expanded=False):
@@ -137,6 +138,7 @@ navigation = st.navigation(
         "优化实验": [
             st.Page("pages/7_提示词改进建议.py", title="提示词改进", icon=":material/edit_note:"),
             st.Page("pages/8_裁判提示词AB对比.py", title="裁判 A/B", icon=":material/compare_arrows:"),
+            st.Page("pages/11_提取提示词AB对比.py", title="提取 A/B", icon=":material/difference:"),
             st.Page("pages/9_闭环实验.py", title="闭环实验", icon=":material/autorenew:"),
         ],
         "运行管理": [

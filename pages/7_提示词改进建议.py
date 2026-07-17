@@ -420,10 +420,22 @@ with tab_absolute:
         "注意：没有人工复核时，这些建议是待人工确认的诊断，不应直接当成正确修复。"
     )
 
-    result_source = st.radio("结果来源", ["历史结果文件", "上传结果文件"], horizontal=True, key="abs_result_source")
+    external_result_path = str(st.session_state.get("prompt_advisor_external_result_path") or "")
+    external_result_label = str(st.session_state.get("prompt_advisor_external_result_label") or "提取提示词 A/B 结果")
+    source_options = ["历史结果文件", "上传结果文件"]
+    if external_result_path and Path(external_result_path).is_file():
+        source_options.insert(0, "提取 A/B 传入结果")
+    result_source = st.radio("结果来源", source_options, horizontal=True, key="abs_result_source")
     absolute_results = []
     absolute_source_name = ""
-    if result_source == "历史结果文件":
+    if result_source == "提取 A/B 传入结果":
+        try:
+            absolute_results = load_results(external_result_path)
+            absolute_source_name = external_result_label
+            st.success(f"已从提取提示词 A/B 实验载入 {len(absolute_results)} 条结果。")
+        except Exception as exc:
+            st.error(f"读取 A/B 评测结果失败：{exc}")
+    elif result_source == "历史结果文件":
         result_files = list_result_files()
         if result_files:
             labels = [Path(f).name for f in result_files]

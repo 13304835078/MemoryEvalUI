@@ -27,6 +27,8 @@ __pycache__/
 htmlcov/
 .venv/
 venv/
+output/
+tmp/
 
 # editor / OS
 .idea/

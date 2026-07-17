@@ -7,6 +7,11 @@ import streamlit as st
 
 from src.loop.closed_loop import CLOSED_LOOP_DIR, read_loop_state, request_stop as request_loop_stop
 from src.ui.eval_job_runner import list_eval_job_ids, read_eval_job_state, request_eval_stop
+from src.ui.extraction_prompt_ab_job_runner import (
+    list_extraction_prompt_ab_job_ids,
+    read_extraction_prompt_ab_job_state,
+    request_extraction_prompt_ab_stop,
+)
 from src.ui.judge_ab_job_runner import list_judge_ab_job_ids, read_judge_ab_job_state, request_judge_ab_stop
 from src.ui.memory_extraction_job_runner import (
     list_memory_extraction_job_ids,
@@ -43,6 +48,12 @@ TASK_SOURCES = (
     TaskSource("闭环实验", _loop_ids, read_loop_state, request_loop_stop),
     TaskSource("提示词建议", list_prompt_advisor_job_ids, read_prompt_advisor_job_state, request_prompt_advisor_stop),
     TaskSource("裁判 A/B", list_judge_ab_job_ids, read_judge_ab_job_state, request_judge_ab_stop),
+    TaskSource(
+        "提取 A/B",
+        list_extraction_prompt_ab_job_ids,
+        read_extraction_prompt_ab_job_state,
+        request_extraction_prompt_ab_stop,
+    ),
 )
 
 

@@ -112,6 +112,7 @@ $WritableDirs = @(
     "data\cases"
     "data\closed_loop"
     "data\eval_jobs"
+    "data\extraction_prompt_ab_jobs"
     "data\extractions\jobs"
     "data\judge_ab_jobs"
     "data\prompt_advisor_jobs"

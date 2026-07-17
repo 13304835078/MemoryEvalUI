@@ -5,7 +5,13 @@ from pathlib import Path
 
 from src.loop import closed_loop
 from src.ui.background_tasks import read_json_state
-from src.ui import eval_job_runner, judge_ab_job_runner, memory_extraction_job_runner, prompt_advisor_job_runner
+from src.ui import (
+    eval_job_runner,
+    extraction_prompt_ab_job_runner,
+    judge_ab_job_runner,
+    memory_extraction_job_runner,
+    prompt_advisor_job_runner,
+)
 
 
 def _stale_time() -> str:
@@ -139,6 +145,53 @@ def test_memory_extraction_job_is_running_marks_stale_job_interrupted(tmp_path, 
     assert updated["finished_at"]
 
 
+def test_memory_extraction_job_auto_generates_cases_after_extraction(tmp_path, monkeypatch):
+    jobs_dir = tmp_path / "jobs"
+    output_path = tmp_path / "result.xlsx"
+    saved_filenames: list[str] = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def process_excel(self, *args, **kwargs):
+            kwargs["progress_callback"](1, 1, "done")
+            return {"chunks": 1, "stopped": False}
+
+    monkeypatch.setattr(memory_extraction_job_runner, "MEMORY_EXTRACTION_JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(memory_extraction_job_runner, "estimate_total_chunks", lambda config: (1, 1))
+    monkeypatch.setattr(memory_extraction_job_runner, "MemoryExtractionRunner", FakeRunner)
+    monkeypatch.setattr(
+        memory_extraction_job_runner,
+        "prepare_cases_from_run_output",
+        lambda *args, **kwargs: ([], [], {"generated_cases": 0}),
+    )
+    monkeypatch.setattr(
+        memory_extraction_job_runner,
+        "save_cases",
+        lambda cases, filename: saved_filenames.append(filename) or str(tmp_path / filename),
+    )
+
+    config = memory_extraction_job_runner.MemoryExtractionJobConfig(
+        job_id="memory-auto-cases",
+        input_path=str(tmp_path / "input.xlsx"),
+        output_path=str(output_path),
+        prompt_text="prompt",
+        prompt_version="v1",
+        auto_make_cases=True,
+        case_model_name="model",
+        case_prompt_version="prompt-v1",
+    )
+
+    memory_extraction_job_runner.run_memory_extraction_job(config)
+
+    state = memory_extraction_job_runner.read_memory_extraction_job_state(config.job_id)
+    assert state["status"] == "completed"
+    assert state["cases_path"].endswith(saved_filenames[0])
+    assert saved_filenames[0].startswith("model_prompt-v1_user_md_cases_")
+    assert saved_filenames[0].endswith(".jsonl")
+
+
 def test_prompt_advisor_job_is_running_marks_stale_job_interrupted(tmp_path, monkeypatch):
     monkeypatch.setattr(prompt_advisor_job_runner, "PROMPT_ADVISOR_JOBS_DIR", tmp_path)
     path = tmp_path / "advisor-1" / "state.json"
@@ -197,6 +250,33 @@ def test_judge_ab_job_is_running_marks_stale_job_interrupted(tmp_path, monkeypat
     assert updated["stage"] == "已中断"
     assert updated["done"] == 1
     assert updated["total"] == 4
+    assert updated["finished_at"]
+
+
+def test_extraction_prompt_ab_job_marks_stale_job_interrupted(tmp_path, monkeypatch):
+    monkeypatch.setattr(extraction_prompt_ab_job_runner, "EXTRACTION_PROMPT_AB_JOBS_DIR", tmp_path)
+    path = tmp_path / "extract-ab-1" / "state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({
+            "status": "running",
+            "heartbeat_at": _stale_time(),
+            "done": 400,
+            "total": 1000,
+            "config": {
+                "extraction_config": {"timeout": 1, "max_attempts": 1, "retry_sleep": 1},
+                "eval_config": {"judge_timeout": 1, "judge_max_attempts": 1, "judge_qps_backoff": 1},
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    assert extraction_prompt_ab_job_runner.extraction_prompt_ab_job_is_running("extract-ab-1") is False
+
+    updated = extraction_prompt_ab_job_runner.read_extraction_prompt_ab_job_state("extract-ab-1")
+    assert updated["status"] == "interrupted"
+    assert updated["done"] == 400
+    assert updated["total"] == 1000
     assert updated["finished_at"]
 
 

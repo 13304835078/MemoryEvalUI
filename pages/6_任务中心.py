@@ -31,6 +31,15 @@ from src.ui.eval_job_runner import (
     request_eval_stop,
     update_eval_job_controls,
 )
+from src.ui.extraction_prompt_ab_job_runner import (
+    extraction_prompt_ab_job_is_stale,
+    list_extraction_prompt_ab_job_ids,
+    mark_extraction_prompt_ab_job_interrupted,
+    read_extraction_prompt_ab_job_controls,
+    read_extraction_prompt_ab_job_state,
+    request_extraction_prompt_ab_stop,
+    update_extraction_prompt_ab_job_controls,
+)
 from src.ui.judge_ab_job_runner import (
     judge_ab_job_is_stale,
     list_judge_ab_job_ids,
@@ -67,7 +76,7 @@ render_page_header(
     "集中查看后台任务状态、调整可变参数与提交终止请求。",
     category="运行管理",
 )
-st.caption("切换页面不会中断后台任务；关闭应用进程会中断正在运行的线程。")
+st.caption("后台任务由独立进程执行，切换页面或普通页面重载不会中断；关闭整套服务或结束后台进程会中断任务。")
 
 
 def _list_loop_ids() -> list[str]:
@@ -94,6 +103,13 @@ def _read_state(task_type: str, job_id: str) -> dict[str, Any]:
     if task_type == "A/B 对比":
         state = read_judge_ab_job_state(job_id)
         return mark_judge_ab_job_interrupted(job_id) if judge_ab_job_is_stale(state) else state
+    if task_type == "提取提示词 A/B":
+        state = read_extraction_prompt_ab_job_state(job_id)
+        return (
+            mark_extraction_prompt_ab_job_interrupted(job_id)
+            if extraction_prompt_ab_job_is_stale(state)
+            else state
+        )
     return {}
 
 
@@ -113,6 +129,9 @@ def _request_stop(task_type: str, job_id: str) -> bool:
     if task_type == "A/B 对比":
         request_judge_ab_stop(job_id)
         return True
+    if task_type == "提取提示词 A/B":
+        request_extraction_prompt_ab_stop(job_id)
+        return True
     return False
 
 
@@ -127,6 +146,8 @@ def _read_controls(task_type: str, job_id: str) -> dict[str, Any]:
         return read_prompt_advisor_job_controls(job_id)
     if task_type == "A/B 对比":
         return read_judge_ab_job_controls(job_id)
+    if task_type == "提取提示词 A/B":
+        return read_extraction_prompt_ab_job_controls(job_id)
     return {}
 
 
@@ -145,6 +166,9 @@ def _update_controls(task_type: str, job_id: str, updates: dict[str, Any]) -> bo
         return True
     if task_type == "A/B 对比":
         update_judge_ab_job_controls(job_id, updates)
+        return True
+    if task_type == "提取提示词 A/B":
+        update_extraction_prompt_ab_job_controls(job_id, updates)
         return True
     return False
 
@@ -224,6 +248,50 @@ def _render_runtime_controls(task_type: str, job_id: str, state: dict[str, Any])
                         value=_as_float(controls.get("judge_request_interval"), eval_config.get("judge_request_interval") or 0.0, min_value=0.0, max_value=300.0),
                         step=0.5,
                     ))
+            elif task_type == "提取提示词 A/B":
+                comparison_config = (
+                    config.get("comparison_config")
+                    if isinstance(config.get("comparison_config"), dict)
+                    else {}
+                )
+                with c2:
+                    updates["extraction_concurrency"] = int(st.number_input(
+                        "后续提取并发",
+                        min_value=1,
+                        max_value=100,
+                        value=_as_int(controls.get("extraction_concurrency"), extraction_config.get("concurrency") or 1, min_value=1, max_value=100),
+                        step=1,
+                    ))
+                with c3:
+                    updates["judge_concurrency"] = int(st.number_input(
+                        "后续评测并发",
+                        min_value=1,
+                        max_value=100,
+                        value=_as_int(controls.get("judge_concurrency"), eval_config.get("judge_concurrency") or 1, min_value=1, max_value=100),
+                        step=1,
+                    ))
+                c2, c3 = st.columns(2)
+                with c2:
+                    updates["judge_request_interval"] = float(st.number_input(
+                        "后续评测请求间隔（秒）",
+                        min_value=0.0,
+                        max_value=300.0,
+                        value=_as_float(controls.get("judge_request_interval"), eval_config.get("judge_request_interval") or 0.0, min_value=0.0, max_value=300.0),
+                        step=0.5,
+                    ))
+                with c3:
+                    updates["comparison_request_interval"] = float(st.number_input(
+                        "最终对比请求间隔（秒）",
+                        min_value=0.0,
+                        max_value=300.0,
+                        value=_as_float(
+                            controls.get("comparison_request_interval"),
+                            comparison_config.get("judge_request_interval") or 0.0,
+                            min_value=0.0,
+                            max_value=300.0,
+                        ),
+                        step=0.5,
+                    ))
             elif task_type in {"执行评测", "A/B 对比"}:
                 with c2:
                     updates["judge_concurrency"] = int(st.number_input(
@@ -267,6 +335,7 @@ def _job_rows() -> list[dict[str, Any]]:
         ("闭环实验", _list_loop_ids()),
         ("提示词建议", list_prompt_advisor_job_ids()),
         ("A/B 对比", list_judge_ab_job_ids()),
+        ("提取提示词 A/B", list_extraction_prompt_ab_job_ids()),
     ]
     rows = []
     for task_type, job_ids in sources:
@@ -295,9 +364,9 @@ def _job_rows() -> list[dict[str, Any]]:
 with st.expander("使用说明", expanded=False):
     st.markdown(
         """
-- 这里展示所有后台任务：执行评测、记忆提取、闭环实验、提示词建议、裁判提示词 A/B 对比。
+- 这里展示所有后台任务：执行评测、记忆提取、闭环实验、提示词建议、裁判提示词 A/B 对比、提取提示词 A/B 对比。
 - 状态来自本地 `data/` 下的任务状态文件，因此切换页面不会清空进度。
-- 任务仍依赖当前应用进程；关闭 exe 或 Streamlit 进程后，运行中的线程会停止，之后会被标记为中断。
+- 后台任务使用独立进程；关闭整套服务、重启虚拟机或手动结束后台进程后，未完成任务会在超时后标记为中断。
 - 多个任务可以同时运行；同一 API/Token 的请求会共用全局请求启动间隔，降低叠加超 QPS 的概率。
         """.strip()
     )

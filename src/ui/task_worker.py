@@ -208,6 +208,32 @@ def _run_request(payload: dict[str, Any]) -> None:
         run_judge_ab_job(JudgeAbJobConfig(**config_data), cases)
         return
 
+    if kind == "extraction_prompt_ab":
+        from src.extraction.client import MemoryExtractionConfig
+        from src.loop.validation_gate import ValidationGateConfig
+        from src.ui.extraction_prompt_ab_job_runner import (
+            ExtractionPromptAbJobConfig,
+            run_extraction_prompt_ab_job,
+        )
+
+        config_data["extraction_config"] = MemoryExtractionConfig(
+            **dict(config_data.get("extraction_config") or {})
+        )
+        config_data["eval_config"] = _eval_config(dict(config_data.get("eval_config") or {}))
+        if config_data.get("comparison_config"):
+            config_data["comparison_config"] = _eval_config(
+                dict(config_data.get("comparison_config") or {})
+            )
+        else:
+            config_data["comparison_config"] = EvalConfig(
+                **asdict(config_data["eval_config"])
+            )
+        config_data["validation_config"] = ValidationGateConfig(
+            **dict(config_data.get("validation_config") or {})
+        )
+        run_extraction_prompt_ab_job(ExtractionPromptAbJobConfig(**config_data))
+        return
+
     if kind == "closed_loop":
         from src.loop.closed_loop import ClosedLoopConfig, run_closed_loop
 
