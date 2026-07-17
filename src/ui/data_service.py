@@ -293,6 +293,19 @@ def eval_result_resume_key(result: EvalResult) -> tuple[str, str, str, str, str,
     )
 
 
+def eval_result_row_key(row: Any) -> tuple[str, str, str, str, str, str, str]:
+    """Build the same identity key from a dataframe row used by result pages."""
+    return resume_result_key(
+        str(row.get("case_id", "")),
+        str(row.get("model_name", "unknown") or "unknown"),
+        str(row.get("prompt_version", "unknown") or "unknown"),
+        str(row.get("judge_model", "") or ""),
+        str(row.get("judge_prompt_version", "") or ""),
+        str(row.get("extraction_prompt_hash", "") or ""),
+        str(row.get("evaluation_fingerprint", "") or ""),
+    )
+
+
 def append_result(path: str | Path, result: EvalResult) -> None:
     append_result_to_jsonl(result, str(path))
 

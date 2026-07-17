@@ -1,5 +1,6 @@
+from src.loop import closed_loop
 from src.loop.closed_loop import _classify_no_candidate_reason
-from src.schema import EvalResult
+from src.schema import EvalConfig, EvalResult
 
 
 def _result(case_id: str, *, score: float = 5.0, fatal: bool = False, tags: list[str] | None = None) -> EvalResult:
@@ -70,3 +71,40 @@ def test_classify_no_candidate_as_no_safe_patch_when_valid_issues_exist():
 
     assert reason["category"] == "no_safe_patch"
     assert reason["status"] == "paused_no_safe_patch"
+
+
+def test_exploratory_closed_loop_preserves_original_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(closed_loop, "CLOSED_LOOP_DIR", tmp_path / "exploratory")
+    config = closed_loop.ClosedLoopConfig(
+        run_id="empty_exploratory_prompt",
+        input_excel_path="unused.xlsx",
+        extraction_prompt_text="",
+        eval_config=EvalConfig(mock=True),
+    )
+
+    closed_loop.run_closed_loop(config)
+
+    state = closed_loop.read_loop_state(config.run_id)
+    assert state["status"] == "failed"
+    assert state["error"].startswith("ValueError:")
+    assert "NameError" not in state["error"]
+    assert "ValueError" in state["traceback"]
+
+
+def test_trusted_closed_loop_preserves_original_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(closed_loop, "CLOSED_LOOP_DIR", tmp_path / "trusted")
+    config = closed_loop.ClosedLoopConfig(
+        run_id="empty_trusted_prompt",
+        input_excel_path="unused.xlsx",
+        protocol_version="v2_holdout",
+        extraction_prompt_text="",
+        eval_config=EvalConfig(mock=True),
+    )
+
+    closed_loop.run_closed_loop(config)
+
+    state = closed_loop.read_loop_state(config.run_id)
+    assert state["status"] == "failed"
+    assert state["error"].startswith("ValueError:")
+    assert "NameError" not in state["error"]
+    assert "ValueError" in state["traceback"]

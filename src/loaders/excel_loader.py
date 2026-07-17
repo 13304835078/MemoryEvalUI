@@ -25,10 +25,8 @@ class ExcelLoader(BaseLoader):
             df = pd.read_excel(path)
 
         df = df.fillna("")
-        cols_lower = [str(c).strip().lower() for c in df.columns]
-
         column_map = {}
-        for i, col in enumerate(df.columns):
+        for col in df.columns:
             matched = fuzzy_match(str(col), COLUMN_ALIASES)
             if matched:
                 column_map[matched] = col

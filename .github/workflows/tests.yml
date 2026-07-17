@@ -20,7 +20,10 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Check undefined names and import hygiene
+        run: python -m ruff check app.py run.py run_streamlit.py pages scripts src --select E9,F
 
       - name: Run tests
         run: python -m pytest -q

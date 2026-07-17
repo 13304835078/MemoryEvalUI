@@ -15,12 +15,18 @@ require_page_identity()
 
 from src.schema import cases_from_jsonl
 from src.eval.metrics import compute_aggregations, summarize_by_field, TAG_LABELS, DIM_LABELS
-from src.eval.result_status import result_is_score_eligible
+from src.eval.result_status import (
+    EVAL_STATUS_SUCCESS,
+    STATUS_LABELS,
+    result_evaluation_status,
+    result_is_score_eligible,
+)
 from src.eval.run_quality import compute_run_quality
 from src.eval.stability import compare_eval_stability
 from src.ui.data_service import (
     RESULTS_DIR,
     eval_result_resume_key,
+    eval_result_row_key,
     list_case_files,
     list_result_files,
     load_results,
@@ -123,20 +129,8 @@ result_index_by_key = {
 }
 
 
-def _row_result_key(row) -> tuple[str, str, str, str, str, str, str]:
-    return (
-        str(row.get("case_id", "")),
-        str(row.get("model_name", "unknown") or "unknown"),
-        str(row.get("prompt_version", "unknown") or "unknown"),
-        str(row.get("judge_model", "") or ""),
-        str(row.get("judge_prompt_version", "") or ""),
-        str(row.get("extraction_prompt_hash", "") or ""),
-        str(row.get("evaluation_fingerprint", "") or ""),
-    )
-
-
 def _row_rule_report(row) -> dict:
-    return rule_validation_by_key.get(_row_result_key(row), {})
+    return rule_validation_by_key.get(eval_result_row_key(row), {})
 
 
 if not base_df.empty:
@@ -149,7 +143,7 @@ if not base_df.empty:
         lambda report: "; ".join(report.get("raw_invalid_refs", []) or [])
     )
     base_df["_result_index"] = base_df.apply(
-        lambda row: result_index_by_key.get(_row_result_key(row), -1),
+        lambda row: result_index_by_key.get(eval_result_row_key(row), -1),
         axis=1,
     )
 
@@ -199,17 +193,17 @@ with col4:
 
 st.divider()
 
-filtered_keys = set()
-for _, row in df.iterrows():
-    filtered_keys.add((
-        str(row.get("case_id", "")),
-        str(row.get("model_name", "unknown") or "unknown"),
-        str(row.get("prompt_version", "unknown") or "unknown"),
-        str(row.get("judge_model", "") or ""),
-        str(row.get("judge_prompt_version", "") or ""),
-        str(row.get("extraction_prompt_hash", "") or ""),
-    ))
+filtered_keys = {eval_result_row_key(row) for _, row in df.iterrows()}
 filtered_results = [r for r in results if eval_result_resume_key(r) in filtered_keys]
+if df.empty:
+    st.info("当前筛选条件下没有结果，请调整上方筛选项。")
+    st.stop()
+if not filtered_results:
+    st.error(
+        "结果关联异常：筛选表中存在记录，但无法匹配原始评测结果。"
+        "请重新加载结果文件；如果仍然出现，请保留该结果文件用于排查。"
+    )
+    st.stop()
 
 stats = compute_aggregations(filtered_results)
 filtered_case_ids = {result.case_id for result in filtered_results}
@@ -260,10 +254,24 @@ if cases or missed_cases:
 
 runtime_failure_results = [item for item in filtered_results if not result_is_score_eligible(item)]
 if runtime_failure_results:
+    failure_status_counts = {
+        status: count
+        for status, count in stats.get("evaluation_statuses", [])
+        if status != EVAL_STATUS_SUCCESS and count
+    }
+    if failure_status_counts:
+        st.caption(
+            "失败构成："
+            + "；".join(
+                f"{STATUS_LABELS.get(status, status)} {count} 条"
+                for status, count in failure_status_counts.items()
+            )
+        )
     with st.expander(f"查看 Judge 运行失败明细（{len(runtime_failure_results)} 条）", expanded=True):
         st.dataframe(pd.DataFrame([{
             "样本编号": item.case_id,
-            "失败类型": item.failure_type or item.evaluation_status,
+            "评测状态": STATUS_LABELS.get(result_evaluation_status(item), result_evaluation_status(item)),
+            "技术类型": item.failure_type or "-",
             "失败信息": item.failure_message or item.raw_response or item.comment,
         } for item in runtime_failure_results]), width="stretch", hide_index=True)
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field

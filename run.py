@@ -29,7 +29,7 @@ def pick_file(prompt: str, base_dir: str, pattern: str = "*") -> str:
     if files:
         for i, f in enumerate(files, 1):
             print(f"  {i}. {os.path.basename(f)}")
-        print(f"  0. 手动输入路径")
+        print("  0. 手动输入路径")
     else:
         print("  (目录为空)")
 

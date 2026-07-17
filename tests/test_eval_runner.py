@@ -1,7 +1,7 @@
 import sys, os, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.schema import Case, TaskType, EvalConfig, results_from_jsonl, cases_to_jsonl, DialogueTurn
+from src.schema import Case, TaskType, EvalConfig, results_from_jsonl, DialogueTurn
 from src.eval.eval_runner import EvalRunner
 from src.ui.data_service import case_resume_key, eval_result_resume_key
 

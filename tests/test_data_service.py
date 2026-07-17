@@ -1,10 +1,18 @@
 import pandas as pd
 from pathlib import Path
 
-from src.eval.metrics import flatten_results
+from src.eval.metrics import compute_aggregations, flatten_results
 from src.schema import Case, EvalResult, TaskType
 from src.ui import data_service
-from src.ui.data_service import dataframe_to_excel_bytes, find_case_for_result, list_files, load_results_bytes
+from src.ui.data_service import (
+    dataframe_to_excel_bytes,
+    eval_result_resume_key,
+    eval_result_row_key,
+    find_case_for_result,
+    list_files,
+    load_results_bytes,
+    results_to_dataframe,
+)
 
 
 def test_list_files_matches_suffix_case_insensitively(tmp_path):
@@ -57,6 +65,45 @@ def test_exported_csv_and_excel_can_be_loaded_back_as_results():
         assert restored.rule_refs == original.rule_refs
         assert restored.evidence_refs == original.evidence_refs
         assert restored.output_refs == original.output_refs
+
+
+def test_overview_row_keys_preserve_scored_and_failed_results():
+    scored = EvalResult(
+        case_id="scored",
+        task_type=TaskType.USER_MD.value,
+        score_total=4.5,
+        scores={"correctness": 4.5},
+        model_name="model",
+        prompt_version="prompt",
+        judge_model="judge",
+        judge_prompt_version="judge-prompt",
+        extraction_prompt_hash="extract-hash",
+        evaluation_fingerprint="fingerprint-scored",
+    )
+    failed = EvalResult.from_parse_failure(
+        case_id="failed",
+        task_type=TaskType.USER_MD.value,
+        raw="Judge 输出不是可解析 JSON",
+        model_name="model",
+        prompt_version="prompt",
+        judge_model="judge",
+        judge_prompt_version="judge-prompt",
+        extraction_prompt_hash="extract-hash",
+        evaluation_fingerprint="fingerprint-failed",
+    )
+    results = [scored, failed]
+    frame = results_to_dataframe(results)
+    filtered_keys = {eval_result_row_key(row) for _, row in frame.iterrows()}
+    filtered_results = [result for result in results if eval_result_resume_key(result) in filtered_keys]
+
+    stats = compute_aggregations(filtered_results)
+
+    assert filtered_results == results
+    assert stats["total_cases"] == 2
+    assert stats["scored_cases"] == 1
+    assert stats["judge_failures"] == 1
+    assert stats["avg_score_total"] == 4.5
+    assert failed.failure_message == "Judge 输出不是可解析 JSON"
 
 
 def test_find_case_for_result_requires_matching_task_type():

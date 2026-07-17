@@ -11,7 +11,10 @@ import requests
 from src.eval.judge_client import RealJudgeClient
 from src.schema import EvalConfig
 from src.ui.global_rate_limiter import api_rate_scope, wait_for_global_rate_slot
-from src.ui.prompt_advisor_evidence import collect_absolute_eval_evidence, collect_review_evidence
+from src.ui.prompt_advisor_evidence import (
+    collect_absolute_eval_evidence as collect_absolute_eval_evidence,
+    collect_review_evidence as collect_review_evidence,
+)
 from src.ui.prompt_advisor_limits import (
     ADVISOR_MAX_EDITABLE_BLOCKS,
     ADVISOR_PATCH_MAX_CHANGE_RATIO,
@@ -43,8 +46,8 @@ from src.ui.prompt_advisor_prompts import (
 )
 from src.ui.prompt_patch import PromptSection, apply_prompt_patch, prompt_sections_for_model, split_prompt_sections
 from src.ui.prompt_rule_similarity import (
-    _is_similar_rule_key,
-    _normalize_rule_similarity_key,
+    _is_similar_rule_key as _is_similar_rule_key,
+    _normalize_rule_similarity_key as _normalize_rule_similarity_key,
     _normalize_text_key,
     _prompt_rule_units,
     _prune_duplicate_insert_text,

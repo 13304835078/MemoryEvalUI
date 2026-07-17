@@ -467,18 +467,21 @@ def run_trusted_closed_loop(config: "ClosedLoopConfig") -> None:
             core.append_event(state, "Locked Test 已完成；该集合从未提供给提示词建议模型。"),
         ))
     except StopIteration as exc:
+        stop_message = str(exc)
         core.update_state(config.run_id, lambda state: (
             state.update({"status": "stopped", "stage": "已终止", "finished_at": core.utc_now()}),
-            core.append_event(state, str(exc), "warning"),
+            core.append_event(state, stop_message, "warning"),
         ))
     except Exception as exc:
+        error_message = f"{type(exc).__name__}: {exc}"
+        error_traceback = traceback.format_exc()
         core.update_state(config.run_id, lambda state: (
             state.update({
                 "status": "failed",
                 "stage": "失败",
                 "finished_at": core.utc_now(),
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc(),
+                "error": error_message,
+                "traceback": error_traceback,
             }),
-            core.append_event(state, f"可信闭环失败：{type(exc).__name__}: {exc}", "error"),
+            core.append_event(state, f"可信闭环失败：{error_message}", "error"),
         ))

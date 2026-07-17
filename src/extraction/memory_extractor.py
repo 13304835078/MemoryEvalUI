@@ -13,11 +13,11 @@ import yaml
 
 from src.extraction.document_parser import (
     DocumentParseResult,
-    extract_long_memory,
-    extract_memory_document,
-    extract_user_md,
+    extract_long_memory as extract_long_memory,
+    extract_memory_document as extract_memory_document,
+    extract_user_md as extract_user_md,
     normalize_memory_document_body,
-    normalize_user_md_body,
+    normalize_user_md_body as normalize_user_md_body,
     parse_memory_document,
 )
 from src.extraction.contracts import (
@@ -31,7 +31,7 @@ from src.extraction.client import (
     MemoryExtractionClient,
     MemoryExtractionConfig,
     MockMemoryExtractionClient,
-    extract_answer_from_response,
+    extract_answer_from_response as extract_answer_from_response,
 )
 from src.persistence import append_jsonl_rows, atomic_write_bytes, atomic_write_jsonl
 from src.runtime_paths import APP_HOME, DATA_DIR

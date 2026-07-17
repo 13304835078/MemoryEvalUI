@@ -866,20 +866,23 @@ def _run_exploratory_closed_loop(config: ClosedLoopConfig) -> None:
             ))
 
     except StopIteration as exc:
+        stop_message = str(exc)
         update_state(config.run_id, lambda state: (
             state.update({"status": "stopped", "stage": "已终止", "finished_at": utc_now()}),
-            append_event(state, str(exc), "warning"),
+            append_event(state, stop_message, "warning"),
         ))
     except Exception as exc:
+        error_message = f"{type(exc).__name__}: {exc}"
+        error_traceback = traceback.format_exc()
         update_state(config.run_id, lambda state: (
             state.update({
                 "status": "failed",
                 "stage": "失败",
                 "finished_at": utc_now(),
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc(),
+                "error": error_message,
+                "traceback": error_traceback,
             }),
-            append_event(state, f"闭环实验失败：{type(exc).__name__}: {exc}", "error"),
+            append_event(state, f"闭环实验失败：{error_message}", "error"),
         ))
 
 

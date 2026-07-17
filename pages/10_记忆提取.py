@@ -22,7 +22,6 @@ from src.extraction.memory_extractor import (
 from src.schema import TASK_TYPE_LABELS, TaskType, cases_from_jsonl
 from src.ui.config_store import build_eval_config, load_config
 from src.ui.components import render_state_file_notice
-from src.ui.next_actions import NextAction, render_next_actions
 from src.ui.preflight import build_extraction_preflight, render_preflight
 from src.ui.run_presets import render_run_preset_selector
 from src.ui.data_service import (
@@ -33,7 +32,6 @@ from src.ui.prompt_editor import (
     infer_prompt_version,
     list_extraction_prompt_files,
     load_extraction_prompt_templates,
-    load_prompt,
     prompt_text_hash,
 )
 from src.ui.memory_extraction_job_runner import (
