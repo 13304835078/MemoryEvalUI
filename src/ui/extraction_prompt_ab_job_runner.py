@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 
 from src.eval.extraction_pairwise_judge import call_pairwise_judge
+from src.eval.extraction_evaluation_protocol import compile_evaluation_protocol
 from src.eval.extraction_prompt_compare import (
     build_extraction_pairs,
     compare_extraction_prompt_pairs,
@@ -144,6 +145,10 @@ def results_path(job_id: str, label: str) -> Path:
 
 def pairwise_results_path(job_id: str) -> Path:
     return job_dir(job_id) / "pairwise_results.jsonl"
+
+
+def evaluation_protocol_path(job_id: str) -> Path:
+    return job_dir(job_id) / "evaluation_protocol.json"
 
 
 def report_path(job_id: str) -> Path:
@@ -324,6 +329,7 @@ def _write_state(
         "results_a_path": str(results_path(config.job_id, "A")),
         "results_b_path": str(results_path(config.job_id, "B")),
         "pairwise_results_path": str(pairwise_results_path(config.job_id)),
+        "evaluation_protocol_path": str(evaluation_protocol_path(config.job_id)),
     }
     if extra:
         state.update(extra)
@@ -485,6 +491,7 @@ def _run_pairwise_comparisons(
     progress_start: int,
     progress_end: int,
     started_at: str,
+    evaluation_protocol: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     pairs, duplicate_keys = build_extraction_pairs(
         cases_a=cases_a,
@@ -582,13 +589,25 @@ def _run_pairwise_comparisons(
     def compare_one(pair) -> dict[str, Any]:
         if extraction_prompt_ab_stop_requested(config.job_id):
             raise ExtractionPromptAbStopped()
+        case_a = pair.case_a or pair.missed_a
+        case_b = pair.case_b or pair.missed_b
+        if case_a is None or case_b is None:
+            return deterministic_pairwise_result(pair) or {
+                "source_key": pair.source_key,
+                "status": "source_mismatch",
+                "winner": "INSUFFICIENT",
+                "decision_basis": "insufficient",
+                "reason": "A/B 源 chunk 无法完整对齐。",
+                "error": "源数据未对齐",
+            }
         return call_pairwise_judge(
             comparison_config,
-            pair.case_a,
-            pair.case_b,
+            case_a,
+            case_b,
             source_key=pair.source_key,
             judge_prompt_text=config.judge_prompt_text,
             evaluation_rule_prompt=config.evaluation_rule_prompt_text,
+            evaluation_protocol=evaluation_protocol,
             task_type=config.task_type,
             rate_limit_wait_callback=wait_for_rate_slot,
             should_stop=lambda: extraction_prompt_ab_stop_requested(config.job_id),
@@ -644,6 +663,52 @@ def _run_pairwise_comparisons(
     return ordered_results, duplicate_keys
 
 
+def _build_candidate_neutral_protocol(
+    config: ExtractionPromptAbJobConfig,
+    *,
+    prompt_a: str,
+    prompt_b: str,
+    started_at: str,
+) -> dict[str, Any]:
+    comparison_config = config.comparison_config
+    configured_interval = (
+        float(comparison_config.judge_request_interval or 0.0)
+        if not comparison_config.mock
+        else 0.0
+    )
+    rate_scope = api_rate_scope(
+        comparison_config.judge_api_base_url,
+        comparison_config.judge_api_bearer_token,
+    )
+
+    def wait_for_rate_slot() -> None:
+        wait_for_global_rate_slot(
+            rate_scope,
+            configured_interval,
+            disabled=bool(comparison_config.mock),
+            should_stop=lambda: extraction_prompt_ab_stop_requested(config.job_id),
+            priority=_current_priority(config),
+        )
+
+    _write_state(
+        config,
+        stage="整理候选无关评测协议",
+        done=610,
+        message="正在一次性提取 A/B 共同规则、策略冲突、格式差异和提示词设计质量。",
+        started_at=started_at,
+    )
+    protocol = compile_evaluation_protocol(
+        comparison_config,
+        prompt_a=prompt_a,
+        prompt_b=prompt_b,
+        task_type=config.task_type,
+        rate_limit_wait_callback=wait_for_rate_slot,
+        should_stop=lambda: extraction_prompt_ab_stop_requested(config.job_id),
+    )
+    atomic_write_json(evaluation_protocol_path(config.job_id), protocol)
+    return protocol
+
+
 def _write_pairwise_advisor_evidence(
     config: ExtractionPromptAbJobConfig,
     *,
@@ -660,6 +725,8 @@ def _write_pairwise_advisor_evidence(
         lower = label.lower()
         losing_comparison = "B较优" if label == "A" else "A较优"
         for row in rows:
+            if str(row.get("comparison") or "") == "策略差异":
+                continue
             case = cases_by_side[label].get(str(row.get("source_key") or ""))
             if case is None:
                 continue
@@ -725,6 +792,27 @@ def _write_report_excel(report: dict[str, Any], path: Path) -> None:
         if dimension_rows:
             pd.DataFrame(dimension_rows).to_excel(writer, sheet_name="维度对比", index=False)
         pd.DataFrame(report.get("rows") or []).to_excel(writer, sheet_name="逐样本对比", index=False)
+        protocol = report.get("evaluation_protocol") if isinstance(report.get("evaluation_protocol"), dict) else {}
+        if protocol:
+            common_rows = [{"类型": "通用质量规则", "内容": item} for item in protocol.get("universal_rules") or []]
+            common_rows.extend({"类型": "双方共同规则", "内容": item} for item in protocol.get("common_rules") or [])
+            common_rows.extend({"类型": "格式差异", "内容": item} for item in protocol.get("format_differences") or [])
+            pd.DataFrame(common_rows).to_excel(writer, sheet_name="评测协议", index=False)
+            conflicts = protocol.get("policy_conflicts") or []
+            if conflicts:
+                pd.DataFrame(conflicts).to_excel(writer, sheet_name="策略冲突", index=False)
+            prompt_quality_rows = []
+            for label in ("A", "B"):
+                quality = protocol.get(f"prompt_quality_{label.lower()}") or {}
+                prompt_quality_rows.append(
+                    {
+                        "版本": label,
+                        **{key: value for key, value in quality.items() if key not in {"issues", "strengths"}},
+                        "优点": "；".join(quality.get("strengths") or []),
+                        "问题": "；".join(quality.get("issues") or []),
+                    }
+                )
+            pd.DataFrame(prompt_quality_rows).to_excel(writer, sheet_name="提示词设计质量", index=False)
         if model_comparison:
             comparison_sheet = {
                 key: "；".join(value) if isinstance(value, list) else value
@@ -825,15 +913,30 @@ def run_extraction_prompt_ab_job(config: ExtractionPromptAbJobConfig) -> None:
             progress_end=600,
             started_at=started_at,
         )
+        combined_prompt_a = "\n\n".join(
+            filter(None, (config.prompt_a_create_text, config.prompt_a_text))
+        )
+        combined_prompt_b = "\n\n".join(
+            filter(None, (config.prompt_b_create_text, config.prompt_b_text))
+        )
+        evaluation_protocol = _build_candidate_neutral_protocol(
+            config,
+            prompt_a=combined_prompt_a,
+            prompt_b=combined_prompt_b,
+            started_at=started_at,
+        )
+        if extraction_prompt_ab_stop_requested(config.job_id):
+            raise ExtractionPromptAbStopped()
         pairwise_results, duplicate_keys = _run_pairwise_comparisons(
             config,
             cases_a=cases_a,
             cases_b=cases_b,
             missed_a=missed_a,
             missed_b=missed_b,
-            progress_start=600,
+            progress_start=620,
             progress_end=930,
             started_at=started_at,
+            evaluation_protocol=evaluation_protocol,
         )
 
         _write_state(
@@ -842,12 +945,6 @@ def run_extraction_prompt_ab_job(config: ExtractionPromptAbJobConfig) -> None:
             done=950,
             message="正在汇总直接胜负、覆盖率和按评测人聚类的置信区间。",
             started_at=started_at,
-        )
-        combined_prompt_a = "\n\n".join(
-            filter(None, (config.prompt_a_create_text, config.prompt_a_text))
-        )
-        combined_prompt_b = "\n\n".join(
-            filter(None, (config.prompt_b_create_text, config.prompt_b_text))
         )
         report = compare_extraction_prompt_pairs(
             cases_a=cases_a,
@@ -858,6 +955,7 @@ def run_extraction_prompt_ab_job(config: ExtractionPromptAbJobConfig) -> None:
             prompt_a=combined_prompt_a,
             prompt_b=combined_prompt_b,
             validation_config=config.validation_config,
+            evaluation_protocol=evaluation_protocol,
         )
         extraction_model_a = _side_extraction_config(config, "A").model
         extraction_model_b = _side_extraction_config(config, "B").model

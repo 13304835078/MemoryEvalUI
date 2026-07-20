@@ -70,7 +70,8 @@ def test_job_can_compare_two_existing_extraction_files_without_absolute_scoring(
     state = runner.read_extraction_prompt_ab_job_state(config.job_id)
     report = runner.load_extraction_prompt_ab_report(config.job_id)
     assert state["status"] == "completed"
-    assert report["comparison_mode"] == "direct_pairwise_v1"
+    assert report["comparison_mode"] == "candidate_neutral_pairwise_v2"
+    assert report["evaluation_protocol"]["protocol_version"] == "candidate_neutral_common_core_v2"
     assert report["input_modes"] == {"A": "existing", "B": "existing"}
     assert report["model_roles"]["extraction_model_a"] == "extract-model-a"
     assert report["model_roles"]["extraction_model_b"] == "extract-model-b"

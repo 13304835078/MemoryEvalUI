@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.extraction.client import MemoryExtractionConfig
+from src.eval.extraction_evaluation_protocol import PROTOCOL_VERSION, UNIVERSAL_QUALITY_RULES
 from src.loop.validation_gate import ValidationGateConfig
 from src.schema import TaskType
 from src.ui.components import render_state_file_notice
@@ -53,8 +54,6 @@ TASK_LABELS = {
     TaskType.USER_MD.value: "用户画像 USER.md",
     TaskType.LONG_MEMORY.value: "长期记忆 MEMORY.md",
 }
-BASELINE_RULE = "使用 A 作为冻结规则（推荐）"
-INDEPENDENT_RULE = "选择独立规则版本"
 EXTRACT_MODE = "重新提取"
 EXISTING_MODE = "使用已有提取结果"
 
@@ -158,7 +157,7 @@ def _render_model_comparison(report: dict) -> None:
     st.info(str(model_result.get("summary") or "模型未提供综合说明。"))
 
     formal_preference = "B" if report.get("recommendation") == "建议选择 B" else (
-        "A" if report.get("recommendation") == "建议保留 A" else "INSUFFICIENT"
+        "A" if report.get("recommendation") in {"建议保留 A", "建议选择 A"} else "INSUFFICIENT"
     )
     model_preference = str(model_result.get("preferred_version") or "INSUFFICIENT")
     if model_preference in {"A", "B"} and model_preference != formal_preference:
@@ -199,12 +198,15 @@ def _render_report(job_id: str, state: dict) -> None:
     reason = str(report.get("recommendation_reason") or "")
     if recommendation == "建议选择 B":
         st.success(f"**{recommendation}**：{reason}")
-    elif recommendation == "建议保留 A":
+    elif recommendation == "建议选择 A":
         st.warning(f"**{recommendation}**：{reason}")
     else:
         st.info(f"**{recommendation}**：{reason}")
 
-    direct_mode = report.get("comparison_mode") == "direct_pairwise_v1"
+    direct_mode = report.get("comparison_mode") in {
+        "direct_pairwise_v1",
+        "candidate_neutral_pairwise_v2",
+    }
     model_roles = report.get("model_roles") if isinstance(report.get("model_roles"), dict) else {}
     if model_roles:
         if direct_mode:
@@ -276,7 +278,7 @@ def _render_report(job_id: str, state: dict) -> None:
             )
     if direct_mode:
         st.caption(
-            "正文不同的同源 chunk 只调用一次对比模型；单边真实漏抽按覆盖差异处理；"
+            "正文不同的同源 chunk 只调用一次对比模型；共同质量问题才进入胜负，策略差异单列；"
             "提取/API/JSON 失败单独统计，不视为 A 或 B 得 0 分。偏好净值范围为 -1 到 +1。"
         )
         excluded = sum(
@@ -300,6 +302,36 @@ def _render_report(job_id: str, state: dict) -> None:
             width="stretch",
             hide_index=True,
         )
+
+    protocol = report.get("evaluation_protocol") if isinstance(report.get("evaluation_protocol"), dict) else {}
+    if protocol:
+        compatibility_labels = {"high": "高", "medium": "中", "low": "低", "unknown": "未知"}
+        st.markdown("**候选无关评测协议与提示词质量**")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("任务契约兼容度", compatibility_labels.get(str(protocol.get("compatibility") or "unknown"), "未知"))
+        quality_a_prompt = (report.get("prompt_quality") or {}).get("A") or {}
+        quality_b_prompt = (report.get("prompt_quality") or {}).get("B") or {}
+        c2.metric("A 提示词设计质量", str(quality_a_prompt.get("overall") or "未生成"))
+        c3.metric("B 提示词设计质量", str(quality_b_prompt.get("overall") or "未生成"))
+        with st.expander("查看共同规则、策略冲突、格式差异和提示词诊断", expanded=False):
+            st.markdown("**共同规则**")
+            for item in protocol.get("common_rules") or []:
+                st.write(f"- {item}")
+            st.markdown("**策略冲突**")
+            conflicts = protocol.get("policy_conflicts") or []
+            if conflicts:
+                st.dataframe(pd.DataFrame(conflicts), width="stretch", hide_index=True)
+            else:
+                st.caption("未识别到明确策略冲突。")
+            st.markdown("**格式差异**")
+            for item in protocol.get("format_differences") or []:
+                st.write(f"- {item}")
+            for label, quality in (("A", quality_a_prompt), ("B", quality_b_prompt)):
+                st.markdown(f"**{label} 提示词优点与问题**")
+                st.write("优点：" + ("；".join(quality.get("strengths") or []) or "未生成"))
+                st.write("问题：" + ("；".join(quality.get("issues") or []) or "未生成"))
+            if protocol.get("status") == "fallback":
+                st.warning(f"自动协议整理失败，已降级为通用质量规则：{protocol.get('error') or '未知错误'}")
 
     dimension_rows = report.get("dimension_summary") or []
     if dimension_rows:
@@ -339,7 +371,9 @@ def _render_report(job_id: str, state: dict) -> None:
                     "pairwise_status": "对比调用状态",
                     "pairwise_model": "对比模型",
                     "pairwise_confidence": "对比置信度",
+                    "decision_basis": "判定依据类型",
                     "rule_refs": "规则引用",
+                    "policy_differences": "策略差异",
                     "evidence_refs": "证据引用",
                     "issues_a": "A 相对问题",
                     "issues_b": "B 相对问题",
@@ -350,7 +384,7 @@ def _render_report(job_id: str, state: dict) -> None:
             )
             preview_columns = [
                 "评测人", "session", "chunk", "A 提取状态", "B 提取状态",
-                "对比调用状态", "对比置信度", "对比结论", "对比备注",
+                "对比调用状态", "对比置信度", "判定依据类型", "对比结论", "对比备注",
             ]
         else:
             rename_columns.update(
@@ -377,13 +411,13 @@ def _render_report(job_id: str, state: dict) -> None:
     if duplicate_keys:
         st.error(f"发现 {len(duplicate_keys)} 个重复来源键，这些样本未进入配对结论。")
 
-    with st.expander("查看未通过替换门槛的具体原因", expanded=False):
+    with st.expander("查看统计结论与未定版原因", expanded=False):
         reasons = gate.get("reasons") or []
         if reasons:
             for item in reasons:
                 st.write(f"- {item}")
         else:
-            st.write("B 已通过当前门槛。")
+            st.write("未发现运行完整性问题；版本选择结论见上方共同质量与提示词设计质量。")
 
     excel_file = report_excel_path(job_id)
     st.caption(
@@ -504,7 +538,8 @@ with st.expander("使用说明", expanded=False):
 3. A、B 可使用不同提取模型。模型不同时，结论代表“提示词 + 模型”组合差异，不能只归因于提示词。
 4. 系统按评测人、session、chunk 和原始行范围配对；正文相同自动持平，单边真实漏抽按覆盖差异处理。
 5. 正文不同的 chunk 只调用一次直接对比模型，不再对 A、B 分别做绝对评分；运行失败不按 0 分处理。
-6. 冻结规则、配对胜负率和聚类置信区间共同决定版本建议；候选提示词仍需另存并复验。
+6. 系统只额外调用一次模型整理共同规则、策略冲突、格式差异和提示词设计质量，不再使用 A 或 B 作为冻结规则。
+7. 逐 chunk 胜负只由共同质量问题决定；策略差异单列，提示词设计质量在输出效果无显著差异时作为次级依据。
         """.strip()
     )
 
@@ -558,7 +593,7 @@ with c2:
 with c3:
     chunk_size = st.number_input("每个 chunk 行数", min_value=1, max_value=200, value=10, step=1)
 
-st.subheader("2. 选择 A/B 版本与冻结对比规则")
+st.subheader("2. 选择 A/B 版本与候选无关评测")
 task_type = st.selectbox(
     "任务类型",
     list(TASK_LABELS),
@@ -586,13 +621,8 @@ prompt_b_file = st.selectbox(
 prompt_a_create, prompt_a_update, prompt_a_full = _load_templates(prompt_a_file)
 prompt_b_create, prompt_b_update, prompt_b_full = _load_templates(prompt_b_file)
 
-rule_mode = st.radio("冻结评测规则来源", [BASELINE_RULE, INDEPENDENT_RULE], horizontal=True)
-if rule_mode == BASELINE_RULE:
-    rule_file = prompt_a_file
-else:
-    rule_candidates = [item for item in extraction_files if item != prompt_b_file] or extraction_files
-    rule_file = st.selectbox("独立规则提示词版本", rule_candidates)
-rule_create, rule_update, evaluation_rule_text = _load_templates(rule_file)
+evaluation_rule_text = "\n".join(f"- {item}" for item in UNIVERSAL_QUALITY_RULES)
+rule_file = ""
 
 pairwise_defaults = [item for item in judge_files if Path(item).name == "judge_extraction_pairwise_v1.md"]
 default_judge = pairwise_defaults[0] if pairwise_defaults else get_default_prompt_file(task_type)
@@ -605,16 +635,16 @@ judge_prompt_text = load_prompt(judge_prompt_file)
 
 if prompt_a_file == prompt_b_file or prompt_text_hash(prompt_a_full) == prompt_text_hash(prompt_b_full):
     st.warning("A 与 B 内容相同，无法形成有效对比。")
-if rule_mode == BASELINE_RULE:
-    st.caption("当前按 A 的业务规则共同评测 A/B，适合验证 B 是否在不改变既定口径的前提下改善。")
-else:
-    st.caption("当前使用独立规则版本共同评测 A/B，适合团队已有稳定规范的场景。")
+st.info(
+    "任务开始后会自动从 A/B 中整理共同规则和策略冲突。共同规则用于逐条胜负；"
+    "策略与格式差异不直接定胜负，但提示词自身的清晰度、一致性、可执行性和上下文效率会单独评价。"
+)
 
-with st.expander("查看 A、B、冻结规则与对比裁判提示词全文", expanded=False):
-    tab_a, tab_b, tab_rule, tab_judge = st.tabs(["提取 A", "提取 B", "冻结规则", "直接对比裁判"])
+with st.expander("查看 A、B、通用质量规则与对比裁判提示词全文", expanded=False):
+    tab_a, tab_b, tab_rule, tab_judge = st.tabs(["提取 A", "提取 B", "通用质量规则", "直接对比裁判"])
     tab_a.text_area("提取 A 全文", prompt_a_full, height=320, disabled=True)
     tab_b.text_area("提取 B 全文", prompt_b_full, height=320, disabled=True)
-    tab_rule.text_area("冻结规则全文", evaluation_rule_text, height=320, disabled=True)
+    tab_rule.text_area("候选无关通用质量规则", evaluation_rule_text, height=260, disabled=True)
     tab_judge.text_area("直接对比裁判提示词全文", judge_prompt_text, height=320, disabled=True)
 
 st.subheader("3. 运行配置")
@@ -798,7 +828,7 @@ checks = [
         PASS if prompt_text_hash(prompt_a_full) != prompt_text_hash(prompt_b_full) else ERROR,
         "提示词内容不同。" if prompt_text_hash(prompt_a_full) != prompt_text_hash(prompt_b_full) else "A/B 提示词内容相同。",
     ),
-    PreflightCheck("frozen_rule", "冻结评测规则", PASS if evaluation_rule_text.strip() else ERROR, f"版本：{infer_prompt_version(rule_file)}"),
+    PreflightCheck("neutral_protocol", "候选无关评测协议", PASS, f"版本：{PROTOCOL_VERSION}；运行时自动整理共同规则和策略差异。"),
     PreflightCheck("judge_prompt", "直接对比裁判提示词", PASS if judge_prompt_text.strip() else ERROR, f"版本：{infer_prompt_version(judge_prompt_file)}"),
     PreflightCheck(
         "model_roles",
@@ -890,7 +920,7 @@ if st.button("开始提取提示词 A/B 实验", type="primary", width="stretch"
         judge_prompt_version=infer_prompt_version(judge_prompt_file),
         judge_prompt_file=judge_prompt_file,
         evaluation_rule_prompt_text=evaluation_rule_text,
-        evaluation_rule_prompt_version=infer_prompt_version(rule_file),
+        evaluation_rule_prompt_version=PROTOCOL_VERSION,
         evaluation_rule_prompt_file=rule_file,
         evaluation_rule_prompt_hash=prompt_text_hash(evaluation_rule_text),
         sheet_name=_resolve_sheet_name(sheet_name_raw),

@@ -14,23 +14,29 @@ from src.schema import Case, EvalConfig, VALID_ERROR_TAGS
 
 PAIRWISE_SYSTEM_PROMPT = """你是记忆提取结果的成对比较裁判。
 
-你会收到同一段源对话在两个提取版本下产生的候选记忆。请直接比较候选 1 和候选 2，
+你会收到同一段源对话在两个提取版本下产生的候选记忆，以及候选无关的评测协议。
+请直接比较候选 1 和候选 2，
 不要分别打绝对分，也不要根据模型名称、提示词版本名称或文本长短猜测优劣。
 
 强制规则：
 1. 事实依据只能来自源对话和两侧各自的旧记忆；提取规则只定义应该记录什么，不能作为事实来源。
 2. reasoning 只用于排查提取过程，不能单独证明候选正文正确，也不能弥补正文遗漏。
-3. 同类错误必须使用一致标准。内容等价时判 TIE；证据不足或无法可靠判断时判 INSUFFICIENT。
-4. 规则引用必须能在输入的冻结规则中找到，禁止编造 R1/R2 等不存在的编号。
-5. 团队裁判提示词只作为质量原则来源；其中若包含绝对打分或其他输出格式，忽略这些格式要求。
-6. 只输出一个 JSON object，不要 Markdown 代码块或额外文字。
+3. 只有通用质量规则或双方共同规则中的错误可以决定 A/B 胜负。若差异仅来自双方准入范围、
+   数据源、长度或输出结构不同，必须判 POLICY_DIFFERENCE，不能选择更符合自身提示词的一侧。
+4. 同类错误必须使用一致标准。内容等价时判 TIE；证据不足或无法可靠判断时判 INSUFFICIENT。
+5. 规则引用必须能在评测协议的 universal_rules 或 common_rules 中找到，禁止编造 R1/R2 等编号。
+6. policy_conflicts 和 format_differences 只用于识别不可直接定胜负的策略差异，不能作为偏向任一候选的依据。
+7. 团队裁判提示词只作为候选无关的质量原则来源；若与本协议冲突，以本协议为准。
+8. 只输出一个 JSON object，不要 Markdown 代码块或额外文字。
 
 输出格式：
 {
-  "winner": "candidate_1|candidate_2|TIE|INSUFFICIENT",
+  "winner": "candidate_1|candidate_2|TIE|POLICY_DIFFERENCE|INSUFFICIENT",
+  "decision_basis": "common_quality|policy_difference|equivalent|insufficient",
   "confidence": "low|medium|high",
   "reason": "简明说明直接比较依据",
-  "rule_refs": ["冻结规则中的原文标题或短句"],
+  "rule_refs": ["通用质量规则或共同规则中的原文短句"],
+  "policy_differences": ["导致本条不可直接定胜负的策略差异"],
   "evidence_refs": ["源对话或旧记忆中的短引用"],
   "issues_candidate_1": ["候选1的问题"],
   "issues_candidate_2": ["候选2的问题"],
@@ -72,7 +78,8 @@ def build_pairwise_user_message(
     case_a: Case,
     case_b: Case,
     *,
-    evaluation_rule_prompt: str,
+    evaluation_rule_prompt: str = "",
+    evaluation_protocol: dict[str, Any] | None = None,
     task_type: str,
     swap_candidates: bool,
 ) -> str:
@@ -80,7 +87,12 @@ def build_pairwise_user_message(
     source = case_a if case_a.dialogue else case_b
     payload = {
         "task_type": task_type,
-        "frozen_extraction_rules": _truncate(evaluation_rule_prompt, 28_000),
+        "candidate_neutral_evaluation_protocol": evaluation_protocol or {
+            "universal_rules": [_truncate(evaluation_rule_prompt, 28_000)] if evaluation_rule_prompt else [],
+            "common_rules": [],
+            "policy_conflicts": [],
+            "format_differences": [],
+        },
         "source_dialogue": _dialogue(source),
         "candidate_1": {
             "old_memory": _truncate(first.old_memory, 16_000),
@@ -94,7 +106,7 @@ def build_pairwise_user_message(
         },
     }
     return (
-        "请按冻结规则直接比较两个候选。候选编号已做稳定化换位，不代表 A/B 或新旧关系。\n\n"
+        "请按候选无关评测协议直接比较两个候选。候选编号已做稳定化换位，不代表 A/B 或新旧关系。\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
@@ -154,6 +166,8 @@ def normalize_pairwise_result(parsed: dict[str, Any], *, swap_candidates: bool) 
         "CANDIDATE1": "CANDIDATE_1",
         "CANDIDATE2": "CANDIDATE_2",
         "持平": "TIE",
+        "策略差异": "POLICY_DIFFERENCE",
+        "POLICYDIFFERENCE": "POLICY_DIFFERENCE",
         "证据不足": "INSUFFICIENT",
     }
     winner = aliases.get(raw_winner, raw_winner)
@@ -161,7 +175,7 @@ def normalize_pairwise_result(parsed: dict[str, Any], *, swap_candidates: bool) 
         mapped_winner = "B" if swap_candidates else "A"
     elif winner == "CANDIDATE_2":
         mapped_winner = "A" if swap_candidates else "B"
-    elif winner in {"TIE", "INSUFFICIENT"}:
+    elif winner in {"TIE", "POLICY_DIFFERENCE", "INSUFFICIENT"}:
         mapped_winner = winner
     else:
         mapped_winner = "INSUFFICIENT"
@@ -182,11 +196,27 @@ def normalize_pairwise_result(parsed: dict[str, Any], *, swap_candidates: bool) 
             "strengths": _string_list(parsed.get(f"strengths_candidate_{candidate_number}")),
         }
 
+    policy_differences = _string_list(parsed.get("policy_differences"))
+    decision_basis = str(parsed.get("decision_basis") or "").strip().lower()
+    if decision_basis not in {"common_quality", "policy_difference", "equivalent", "insufficient"}:
+        decision_basis = (
+            "policy_difference" if mapped_winner == "POLICY_DIFFERENCE"
+            else "equivalent" if mapped_winner == "TIE"
+            else "insufficient" if mapped_winner == "INSUFFICIENT"
+            else "common_quality"
+        )
+    if policy_differences and not str(parsed.get("decision_basis") or "").strip():
+        decision_basis = "policy_difference"
+    if decision_basis == "policy_difference":
+        mapped_winner = "POLICY_DIFFERENCE"
+
     return {
         "winner": mapped_winner,
+        "decision_basis": decision_basis,
         "confidence": confidence,
         "reason": _truncate(parsed.get("reason"), 1_500),
         "rule_refs": _string_list(parsed.get("rule_refs")),
+        "policy_differences": policy_differences,
         "evidence_refs": _string_list(parsed.get("evidence_refs")),
         "issues_a": by_side["a"]["issues"],
         "issues_b": by_side["b"]["issues"],
@@ -205,6 +235,7 @@ def call_pairwise_judge(
     source_key: str,
     judge_prompt_text: str,
     evaluation_rule_prompt: str,
+    evaluation_protocol: dict[str, Any] | None = None,
     task_type: str,
     rate_limit_wait_callback: Callable[[], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
@@ -216,9 +247,11 @@ def call_pairwise_judge(
             "status": "mock",
             "model": config.judge_model or "mock-pairwise-model",
             "winner": "TIE",
+            "decision_basis": "equivalent",
             "confidence": "low",
             "reason": "[MOCK] 两侧正文不同，本次未调用真实成对比较模型。",
             "rule_refs": [],
+            "policy_differences": [],
             "evidence_refs": [],
             "issues_a": [],
             "issues_b": [],
@@ -236,6 +269,7 @@ def call_pairwise_judge(
         case_a,
         case_b,
         evaluation_rule_prompt=evaluation_rule_prompt,
+        evaluation_protocol=evaluation_protocol,
         task_type=task_type,
         swap_candidates=swap_candidates,
     )
@@ -306,9 +340,11 @@ def call_pairwise_judge(
         "status": "failed",
         "model": config.judge_model,
         "winner": "INSUFFICIENT",
+        "decision_basis": "insufficient",
         "confidence": "low",
         "reason": "对比模型调用或 JSON 解析失败，本条不进入胜负统计。",
         "rule_refs": [],
+        "policy_differences": [],
         "evidence_refs": [],
         "issues_a": [],
         "issues_b": [],

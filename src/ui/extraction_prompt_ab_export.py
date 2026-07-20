@@ -49,7 +49,9 @@ _DIRECT_COMPARISON_COLUMNS = [
     "对比调用状态",
     "对比模型",
     "对比置信度",
+    "判定依据类型",
     "规则引用",
+    "策略差异",
     "证据引用",
     "A相对问题",
     "B相对问题",
@@ -95,7 +97,7 @@ def _column_width(header: str) -> int:
         return 42
     if "提取结果" in header or "reasoning" in header:
         return 68
-    if "评语" in header or "备注" in header or "规则引用" in header or "证据引用" in header or "相对" in header:
+    if "评语" in header or "备注" in header or "规则引用" in header or "策略差异" in header or "证据引用" in header or "相对" in header:
         return 48
     if "维度得分" in header or "错误标签" in header:
         return 34
@@ -149,6 +151,7 @@ def _style_diff_sheet(worksheet) -> None:
         "A规则引用",
         "B规则引用",
         "规则引用",
+        "策略差异",
         "证据引用",
         "A相对问题",
         "B相对问题",
@@ -200,6 +203,7 @@ def _style_diff_sheet(worksheet) -> None:
             "基本持平": same_fill,
             "双方均漏抽": same_fill,
             "不可比较": PatternFill("solid", fgColor="FCE4D6"),
+            "策略差异": PatternFill("solid", fgColor="E4DFEC"),
         }
         for row_index in range(2, worksheet.max_row + 1):
             cell = worksheet.cell(row=row_index, column=comparison_column)
@@ -245,6 +249,7 @@ def write_extraction_prompt_diff_excel(
                 {"项目": "逐Chunk对比", "说明": "每个 session/chunk 一行，便于筛选两版结果。"},
                 {"项目": "reasoning", "说明": "仅当至少一版返回 reasoning 时加入 A/B reasoning 列。"},
                 {"项目": "失败样本", "说明": "API、网络和 Judge 解析失败单独标注，不按 0 分计入。"},
+                {"项目": "策略差异", "说明": "由两版准入范围、数据源或输出结构不同造成，不进入 A/B 胜负统计。"},
             ]
         ).to_excel(writer, sheet_name="说明", index=False)
         if model_comparison:

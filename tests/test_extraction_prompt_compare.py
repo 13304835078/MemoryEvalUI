@@ -274,7 +274,7 @@ def test_direct_pairwise_skips_model_for_identical_outputs() -> None:
     assert result["comparison_kind"] == "identical_output"
 
 
-def test_direct_pairwise_treats_quality_miss_as_coverage_loss() -> None:
+def test_direct_pairwise_leaves_single_quality_miss_for_neutral_judge() -> None:
     case_a = _case("case-a")
     missed_b = _case("missed-b", missed=True)
     missed_b.metadata["call_status"] = "success"
@@ -288,9 +288,7 @@ def test_direct_pairwise_treats_quality_miss_as_coverage_loss() -> None:
 
     result = deterministic_pairwise_result(pairs[0])
 
-    assert result is not None
-    assert result["winner"] == "A"
-    assert result["comparison_kind"] == "coverage"
+    assert result is None
 
 
 def test_direct_pairwise_excludes_extraction_api_failure_from_winner() -> None:
@@ -343,8 +341,69 @@ def test_direct_pairwise_report_uses_wins_without_absolute_scores() -> None:
         validation_config=_lenient_gate(),
     )
 
-    assert report["comparison_mode"] == "direct_pairwise_v1"
+    assert report["comparison_mode"] == "candidate_neutral_pairwise_v2"
     assert report["recommendation"] == "建议选择 B"
     assert report["validation_gate"]["paired_preference_delta"] == 1.0
     assert report["rows"][0]["comparison"] == "B较优"
     assert "score_a" not in report["rows"][0]
+
+
+def test_prompt_design_quality_is_only_a_tiebreaker() -> None:
+    case_a = _case("case-a")
+    case_b = _case("case-b", output="# USER.md\n- equivalent wording")
+    source_key = source_case_key(case_a)
+    report = compare_extraction_prompt_pairs(
+        cases_a=[case_a],
+        cases_b=[case_b],
+        missed_cases_a=[],
+        missed_cases_b=[],
+        pairwise_results=[
+            {
+                "source_key": source_key,
+                "status": "success",
+                "winner": "TIE",
+                "decision_basis": "equivalent",
+                "confidence": "high",
+                "reason": "共同质量相当。",
+            }
+        ],
+        prompt_a="prompt A",
+        prompt_b="prompt B",
+        validation_config=_lenient_gate(),
+        evaluation_protocol={
+            "prompt_quality_a": {"overall": 3.0},
+            "prompt_quality_b": {"overall": 4.0},
+        },
+    )
+
+    assert report["recommendation"] == "建议选择 B"
+    assert "次级依据" in report["recommendation_reason"]
+
+
+def test_policy_difference_is_excluded_from_pairwise_wins() -> None:
+    case_a = _case("case-a")
+    case_b = _case("case-b", output="# USER.md\n- policy-specific value")
+    source_key = source_case_key(case_a)
+    report = compare_extraction_prompt_pairs(
+        cases_a=[case_a],
+        cases_b=[case_b],
+        missed_cases_a=[],
+        missed_cases_b=[],
+        pairwise_results=[
+            {
+                "source_key": source_key,
+                "status": "success",
+                "winner": "POLICY_DIFFERENCE",
+                "decision_basis": "policy_difference",
+                "policy_differences": ["准入范围不同"],
+                "reason": "属于策略差异。",
+            }
+        ],
+        prompt_a="prompt A",
+        prompt_b="prompt B",
+        validation_config=_lenient_gate(),
+    )
+
+    assert report["winner_counts"]["策略差异"] == 1
+    assert report["validation_gate"]["paired_case_count"] == 0
+    assert report["recommendation"] == "暂不定版"

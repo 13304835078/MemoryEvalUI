@@ -225,7 +225,7 @@ def _normalize_result(parsed: dict[str, Any]) -> dict[str, Any]:
 def _mock_result(config: EvalConfig, report: dict[str, Any]) -> dict[str, Any]:
     recommendation = str(report.get("recommendation") or "")
     preferred = "B" if recommendation == "建议选择 B" else (
-        "A" if recommendation == "建议保留 A" else "INSUFFICIENT"
+        "A" if recommendation in {"建议保留 A", "建议选择 A"} else "INSUFFICIENT"
     )
     return {
         "status": "mock",

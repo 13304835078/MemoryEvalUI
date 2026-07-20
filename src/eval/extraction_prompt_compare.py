@@ -184,7 +184,9 @@ def _diff_comparison_fields(comparison: dict[str, Any] | None) -> dict[str, Any]
         "对比调用状态": comparison.get("pairwise_status", ""),
         "对比模型": comparison.get("pairwise_model", ""),
         "对比置信度": comparison.get("pairwise_confidence", ""),
+        "判定依据类型": comparison.get("decision_basis", ""),
         "规则引用": comparison.get("rule_refs", ""),
+        "策略差异": comparison.get("policy_differences", ""),
         "证据引用": comparison.get("evidence_refs", ""),
         "A相对问题": comparison.get("issues_a", ""),
         "B相对问题": comparison.get("issues_b", ""),
@@ -700,44 +702,11 @@ def deterministic_pairwise_result(pair: ExtractionPair) -> dict[str, Any] | None
             "strengths_b": [],
             "error": "提取接口失败",
         }
-    if pair.case_a is not None and kind_b == "quality_miss":
-        return {
-            "source_key": pair.source_key,
-            "status": "deterministic",
-            "model": "rule",
-            "winner": "A",
-            "confidence": "high",
-            "reason": "B 调用成功但未生成可用正文，按漏抽判 A 较优。",
-            "comparison_kind": "coverage",
-            "rule_refs": [],
-            "evidence_refs": [],
-            "issues_a": [],
-            "issues_b": ["调用成功但未生成可用正文"],
-            "error_tags_a": [],
-            "error_tags_b": ["missing_key_info"],
-            "strengths_a": ["生成了可用正文"],
-            "strengths_b": [],
-            "error": "",
-        }
-    if pair.case_b is not None and kind_a == "quality_miss":
-        return {
-            "source_key": pair.source_key,
-            "status": "deterministic",
-            "model": "rule",
-            "winner": "B",
-            "confidence": "high",
-            "reason": "A 调用成功但未生成可用正文，按漏抽判 B 较优。",
-            "comparison_kind": "coverage",
-            "rule_refs": [],
-            "evidence_refs": [],
-            "issues_a": ["调用成功但未生成可用正文"],
-            "issues_b": [],
-            "error_tags_a": ["missing_key_info"],
-            "error_tags_b": [],
-            "strengths_a": [],
-            "strengths_b": ["生成了可用正文"],
-            "error": "",
-        }
+    if (pair.case_a is not None and kind_b == "quality_miss") or (
+        pair.case_b is not None and kind_a == "quality_miss"
+    ):
+        # 单边空输出既可能是真实漏抽，也可能来自双方准入策略不同，不能按覆盖率直接定胜负。
+        return None
     if kind_a == "quality_miss" and kind_b == "quality_miss":
         return {
             "source_key": pair.source_key,
@@ -839,6 +808,7 @@ def compare_extraction_prompt_pairs(
     prompt_a: str,
     prompt_b: str,
     validation_config: ValidationGateConfig | None = None,
+    evaluation_protocol: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Aggregate direct A/B decisions without producing separate absolute scores."""
     gate_config = validation_config or ValidationGateConfig()
@@ -861,6 +831,7 @@ def compare_extraction_prompt_pairs(
         "基本持平": 0,
         "输出相同": 0,
         "双方均漏抽": 0,
+        "策略差异": 0,
         "不可比较": 0,
     }
     rows: list[dict[str, Any]] = []
@@ -895,6 +866,9 @@ def compare_extraction_prompt_pairs(
                 else "双方均漏抽" if kind == "both_missed" else "基本持平"
             )
             outcome = 0.0
+        elif winner == "POLICY_DIFFERENCE":
+            comparison = "策略差异"
+            outcome = None
         else:
             comparison = "不可比较"
             outcome = None
@@ -939,9 +913,11 @@ def compare_extraction_prompt_pairs(
                 "pairwise_status": status,
                 "pairwise_model": result.get("model", ""),
                 "pairwise_confidence": result.get("confidence", ""),
+                "decision_basis": result.get("decision_basis", ""),
                 "comparison": comparison,
                 "comparison_note": result.get("reason", ""),
                 "rule_refs": "；".join(result.get("rule_refs") or []),
+                "policy_differences": "；".join(result.get("policy_differences") or []),
                 "evidence_refs": "；".join(result.get("evidence_refs") or []),
                 "issues_a": "；".join(result.get("issues_a") or []),
                 "issues_b": "；".join(result.get("issues_b") or []),
@@ -994,16 +970,8 @@ def compare_extraction_prompt_pairs(
         reasons.append(f"有 {infrastructure_failures} 个 chunk 因提取运行失败不可比较。")
     if source_mismatches:
         reasons.append(f"有 {source_mismatches} 个 chunk 的 A/B 源数据无法对齐。")
-    if coverage_drop > gate_config.max_extraction_coverage_drop:
-        reasons.append(
-            f"B 提取覆盖率下降 {coverage_drop:.2%}，超过允许值 {gate_config.max_extraction_coverage_drop:.2%}。"
-        )
     if not eligible_count:
         reasons.append("没有可进入胜负统计的同源 chunk。")
-    elif preference_delta + 1e-12 < gate_config.min_score_delta:
-        reasons.append(
-            f"B 的配对偏好净值 {preference_delta:+.4f}，低于门槛 {gate_config.min_score_delta:+.4f}。"
-        )
     if gate_config.require_statistical_confidence:
         if not confidence_ready:
             reasons.append(
@@ -1011,44 +979,71 @@ def compare_extraction_prompt_pairs(
                 f"{gate_config.min_paired_clusters} 个独立评测人/时序簇，当前为 "
                 f"{eligible_count} 个、{len(outcomes_by_cluster)} 个。"
             )
-        elif confidence_lower is None or confidence_lower <= gate_config.min_confidence_lower_bound:
-            lower_text = "不可计算" if confidence_lower is None else f"{confidence_lower:+.4f}"
-            reasons.append(
-                f"配对偏好净值的 {gate_config.confidence_level:.0%} 置信区间下界为 {lower_text}，"
-                f"未高于 {gate_config.min_confidence_lower_bound:+.4f}。"
-            )
-    if regression_rate > gate_config.max_case_regression_rate:
-        reasons.append(
-            f"B 的配对败率 {regression_rate:.2%}，超过允许值 {gate_config.max_case_regression_rate:.2%}。"
-        )
-    if prompt_growth_ratio > gate_config.max_prompt_growth_ratio:
-        reasons.append(
-            f"提示词增长 {prompt_growth_ratio:.2%}，超过允许值 {gate_config.max_prompt_growth_ratio:.2%}。"
-        )
+    protocol = evaluation_protocol if isinstance(evaluation_protocol, dict) else {}
+    prompt_quality_a = protocol.get("prompt_quality_a") if isinstance(protocol.get("prompt_quality_a"), dict) else {}
+    prompt_quality_b = protocol.get("prompt_quality_b") if isinstance(protocol.get("prompt_quality_b"), dict) else {}
+    try:
+        prompt_quality_delta = float(prompt_quality_b.get("overall")) - float(prompt_quality_a.get("overall"))
+    except (TypeError, ValueError):
+        prompt_quality_delta = None
 
-    accepted = not reasons
-    if accepted:
-        recommendation = "建议选择 B"
-        recommendation_reason = "B 在直接配对比较、覆盖率和统计置信度门槛上均通过。"
-    elif duplicate_keys or comparison_failures or infrastructure_failures or source_mismatches or not confidence_ready:
+    operational_incomplete = bool(
+        duplicate_keys or comparison_failures or infrastructure_failures or source_mismatches
+    )
+    statistics_incomplete = bool(gate_config.require_statistical_confidence and not confidence_ready)
+    min_delta = max(1e-9, float(gate_config.min_score_delta))
+    lower_bound = max(0.0, float(gate_config.min_confidence_lower_bound))
+    b_statistically_better = bool(
+        eligible_count
+        and preference_delta >= min_delta
+        and (
+            not gate_config.require_statistical_confidence
+            or (confidence_lower is not None and confidence_lower > lower_bound)
+        )
+    )
+    a_statistically_better = bool(
+        eligible_count
+        and preference_delta <= -min_delta
+        and (
+            not gate_config.require_statistical_confidence
+            or (confidence_upper is not None and confidence_upper < -lower_bound)
+        )
+    )
+
+    if operational_incomplete or statistics_incomplete or not eligible_count:
         recommendation = "暂不定版"
-        recommendation_reason = "比较数据或统计证据尚不完整，需补齐失败样本或扩大样本后再选择。"
-    elif coverage_drop > gate_config.max_extraction_coverage_drop or preference_delta < 0:
-        recommendation = "建议保留 A"
-        recommendation_reason = "B 的覆盖率或直接配对胜负出现实质退化。"
+        recommendation_reason = "比较数据或统计证据尚不完整，失败和策略差异样本均未强行计入胜负。"
+    elif b_statistically_better:
+        recommendation = "建议选择 B"
+        recommendation_reason = "B 在候选无关的共同质量比较中显著更优。"
+    elif a_statistically_better:
+        recommendation = "建议选择 A"
+        recommendation_reason = "A 在候选无关的共同质量比较中显著更优。"
+    elif prompt_quality_delta is not None and abs(prompt_quality_delta) >= 0.5:
+        recommendation = "建议选择 B" if prompt_quality_delta > 0 else "建议选择 A"
+        recommendation_reason = (
+            "两版输出效果未形成显著差异；"
+            f"{'B' if prompt_quality_delta > 0 else 'A'} 的提示词设计质量更高，作为次级依据推荐。"
+        )
     else:
-        recommendation = "证据不足，暂时保留 A"
-        recommendation_reason = "B 尚未达到当前替换门槛。"
+        recommendation = "暂不定版"
+        recommendation_reason = "共同质量效果和提示词设计质量均未形成足以定版的差异。"
+
+    accepted = recommendation == "建议选择 B"
 
     return {
-        "comparison_mode": "direct_pairwise_v1",
+        "comparison_mode": "candidate_neutral_pairwise_v2",
         "recommendation": recommendation,
         "recommendation_reason": recommendation_reason,
         "quality_a": quality_a,
         "quality_b": quality_b,
         "validation_gate": {
             "accepted": accepted,
-            "decision": "accepted" if accepted else "rejected",
+            "decision": (
+                "B_better" if recommendation == "建议选择 B"
+                else "A_better" if recommendation == "建议选择 A"
+                else "inconclusive"
+            ),
             "reasons": reasons,
             "config": asdict(gate_config),
             "paired_case_count": eligible_count,
@@ -1068,12 +1063,17 @@ def compare_extraction_prompt_pairs(
             "extraction_coverage_drop": round(coverage_drop, 4),
             "case_regression_rate": round(regression_rate, 4),
             "prompt_growth_ratio": round(prompt_growth_ratio, 4),
+            "prompt_quality_delta_b_minus_a": (
+                round(prompt_quality_delta, 4) if prompt_quality_delta is not None else None
+            ),
             "comparison_failures": comparison_failures,
             "infrastructure_failures": infrastructure_failures,
             "source_mismatches": source_mismatches,
             "insufficient_comparisons": insufficient_comparisons,
         },
         "winner_counts": winner_counts,
+        "evaluation_protocol": protocol,
+        "prompt_quality": {"A": prompt_quality_a, "B": prompt_quality_b},
         "dimension_summary": [],
         "identical_output_count": winner_counts.get("输出相同", 0),
         "duplicate_source_keys": duplicate_keys,
