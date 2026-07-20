@@ -78,7 +78,9 @@ def test_job_can_compare_two_existing_extraction_files_without_absolute_scoring(
     assert runner.pairwise_results_path(config.job_id).exists()
     assert runner.diff_excel_path(config.job_id).exists()
     diff = pd.read_excel(runner.diff_excel_path(config.job_id), sheet_name="逐Chunk对比")
-    assert "对比调用状态" in diff.columns
+    assert "A相对问题" in diff.columns
+    assert "B相对优点" in diff.columns
+    assert "对比调用状态" not in diff.columns
     assert "A总分" not in diff.columns
     assert "B总分" not in diff.columns
 

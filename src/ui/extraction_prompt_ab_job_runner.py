@@ -109,6 +109,7 @@ class ExtractionPromptAbJobConfig:
     existing_extraction_b_path: str = ""
     extraction_config_a: MemoryExtractionConfig | None = None
     extraction_config_b: MemoryExtractionConfig | None = None
+    diff_excel_optional_sections: list[str] = field(default_factory=list)
 
 
 def job_dir(job_id: str) -> Path:
@@ -844,6 +845,7 @@ def ensure_extraction_prompt_ab_diff_excel(job_id: str) -> Path | None:
                 comparison_rows=report.get("rows") or [],
                 output_path=output,
                 model_comparison=report.get("model_comparison") or None,
+                optional_sections=report.get("diff_excel_optional_sections") or [],
             )
     return output
 
@@ -973,6 +975,7 @@ def run_extraction_prompt_ab_job(config: ExtractionPromptAbJobConfig) -> None:
             if extraction_model_a != extraction_model_b
             else "仅提取提示词对比"
         )
+        report["diff_excel_optional_sections"] = list(config.diff_excel_optional_sections or [])
         _write_pairwise_advisor_evidence(
             config,
             cases_a=cases_a,
@@ -987,6 +990,7 @@ def run_extraction_prompt_ab_job(config: ExtractionPromptAbJobConfig) -> None:
             comparison_rows=report.get("rows") or [],
             output_path=diff_excel_path(config.job_id),
             model_comparison=None,
+            optional_sections=config.diff_excel_optional_sections,
         )
         _write_state(
             config,

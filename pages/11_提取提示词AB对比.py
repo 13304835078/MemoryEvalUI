@@ -56,6 +56,14 @@ TASK_LABELS = {
 }
 EXTRACT_MODE = "重新提取"
 EXISTING_MODE = "使用已有提取结果"
+EXPORT_OPTION_LABELS = {
+    "reasoning": "A/B reasoning",
+    "status": "源数据与提取状态",
+    "history": "历史输入状态",
+    "error_tags": "错误标签",
+    "evidence": "判定依据、规则与证据",
+    "model_call": "对比模型调用信息",
+}
 
 
 def _combined_prompt(create_text: str, update_text: str) -> str:
@@ -426,7 +434,7 @@ def _render_report(job_id: str, state: dict) -> None:
     excel_file = report_excel_path(job_id)
     st.caption(
         "逐行 Diff 保留 session_id、chunk_id、query、answer 和评测人；"
-        "两版提取结果、reasoning 与比较结论只写在每个 chunk 末行，另附一行一个 chunk 的对照表。"
+        "默认仅导出两版提取结果、相对问题/优点、结论和备注；运行前勾选的诊断列会额外加入。"
     )
     diff_file = None
     try:
@@ -436,7 +444,7 @@ def _render_report(job_id: str, state: dict) -> None:
     c1, c2, c3 = st.columns(3)
     if diff_file and diff_file.exists():
         c1.download_button(
-            "下载逐行 Diff Excel",
+            "下载精简对比 Excel",
             data=diff_file.read_bytes(),
             file_name=diff_file.name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -452,7 +460,7 @@ def _render_report(job_id: str, state: dict) -> None:
         )
     if excel_file.exists():
         c2.download_button(
-            "下载评测汇总 Excel",
+            "下载完整诊断 Excel",
             data=excel_file.read_bytes(),
             file_name=excel_file.name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -766,6 +774,17 @@ with st.expander("版本选择门槛", expanded=False):
     min_paired_clusters = c2.number_input("最少独立评测人/时序簇", min_value=1, max_value=1000, value=2, step=1)
     confidence_level = c3.selectbox("置信水平", [0.90, 0.95, 0.99], index=1, format_func=lambda value: f"{value:.0%}")
 
+with st.expander("结果 Excel 可选诊断列", expanded=False):
+    selected_export_labels = st.multiselect(
+        "附加到精简对比 Excel",
+        list(EXPORT_OPTION_LABELS.values()),
+        default=[],
+        help="不选择时只输出定位列、两版提取结果、相对问题/优点、对比结论和备注。",
+    )
+    diff_excel_optional_sections = [
+        key for key, label in EXPORT_OPTION_LABELS.items() if label in selected_export_labels
+    ]
+
 extraction_base_config_a = build_eval_config(
     {**cfg, "judge_model": extraction_model_a.strip()},
     mock=mock,
@@ -942,6 +961,7 @@ if st.button("开始提取提示词 A/B 实验", type="primary", width="stretch"
         side_b_mode=side_b_mode,
         existing_extraction_a_path=existing_a_path,
         existing_extraction_b_path=existing_b_path,
+        diff_excel_optional_sections=diff_excel_optional_sections,
         validation_config=ValidationGateConfig(
             min_score_delta=float(min_score_delta),
             max_extraction_coverage_drop=float(max_coverage_drop),

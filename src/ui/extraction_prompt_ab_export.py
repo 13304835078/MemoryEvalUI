@@ -23,17 +23,13 @@ _BASE_COLUMNS = [
     "B提取结果",
 ]
 _REASONING_COLUMNS = ["A_reasoning", "B_reasoning"]
-_COMMON_COMPARISON_COLUMNS = [
-    "源数据一致性",
-    "A提取状态",
-    "B提取状态",
-    "A历史输入",
-    "B历史输入",
-    "历史基线关系",
+_CORE_COMPARISON_COLUMNS = [
+    "A相对问题",
+    "B相对问题",
+    "A相对优点",
+    "B相对优点",
     "对比结论",
     "对比备注",
-    "A错误标签",
-    "B错误标签",
 ]
 _LEGACY_COMPARISON_COLUMNS = [
     "A Judge状态",
@@ -48,20 +44,14 @@ _LEGACY_COMPARISON_COLUMNS = [
     "A规则引用",
     "B规则引用",
 ]
-_DIRECT_COMPARISON_COLUMNS = [
-    "对比调用状态",
-    "对比模型",
-    "对比置信度",
-    "判定依据类型",
-    "规则引用",
-    "策略差异",
-    "证据引用",
-    "A相对问题",
-    "B相对问题",
-    "A相对优点",
-    "B相对优点",
-    "对比调用错误",
-]
+_OPTIONAL_SECTION_COLUMNS = {
+    "status": ["源数据一致性", "A提取状态", "B提取状态"],
+    "history": ["A历史输入", "B历史输入", "历史基线关系"],
+    "error_tags": ["A错误标签", "B错误标签"],
+    "evidence": ["判定依据类型", "规则引用", "策略差异", "证据引用"],
+    "model_call": ["对比调用状态", "对比模型", "对比置信度", "对比调用错误"],
+    "legacy_scores": _LEGACY_COMPARISON_COLUMNS,
+}
 _EXCEL_CELL_LIMIT = 32_767
 
 
@@ -75,15 +65,23 @@ def _excel_safe(value: Any) -> Any:
     return cleaned[: _EXCEL_CELL_LIMIT - len(suffix)] + suffix
 
 
-def _dataframe(rows: list[dict[str, Any]], *, include_reasoning: bool) -> pd.DataFrame:
+def _dataframe(
+    rows: list[dict[str, Any]],
+    *,
+    include_reasoning: bool,
+    optional_sections: set[str],
+) -> pd.DataFrame:
     direct_mode = any(str(row.get("对比调用状态") or "").strip() for row in rows)
-    mode_columns = _DIRECT_COMPARISON_COLUMNS if direct_mode else _LEGACY_COMPARISON_COLUMNS
-    columns = (
-        _BASE_COLUMNS
-        + (_REASONING_COLUMNS if include_reasoning else [])
-        + _COMMON_COMPARISON_COLUMNS
-        + mode_columns
-    )
+    optional_columns: list[str] = []
+    if "reasoning" in optional_sections and include_reasoning:
+        optional_columns.extend(_REASONING_COLUMNS)
+    for section in ("status", "history", "error_tags", "evidence", "model_call"):
+        if section in optional_sections:
+            optional_columns.extend(_OPTIONAL_SECTION_COLUMNS[section])
+    if not direct_mode and "legacy_scores" in optional_sections:
+        optional_columns.extend(_LEGACY_COMPARISON_COLUMNS)
+    columns = _BASE_COLUMNS + _CORE_COMPARISON_COLUMNS + optional_columns
+    columns = list(dict.fromkeys(columns))
     safe_rows = [
         {column: _excel_safe(row.get(column, "")) for column in columns}
         for row in rows
@@ -223,6 +221,7 @@ def write_extraction_prompt_diff_excel(
     comparison_rows: list[dict[str, Any]],
     output_path: str | Path,
     model_comparison: dict[str, Any] | None = None,
+    optional_sections: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> Path:
     extraction_a_path = Path(extraction_a_path)
     extraction_b_path = Path(extraction_b_path)
@@ -234,15 +233,24 @@ def write_extraction_prompt_diff_excel(
         rows_b,
         comparison_rows,
     )
+    selected_sections = {str(item) for item in (optional_sections or [])}
 
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        _dataframe(row_diff, include_reasoning=include_reasoning).to_excel(
+        _dataframe(
+            row_diff,
+            include_reasoning=include_reasoning,
+            optional_sections=selected_sections,
+        ).to_excel(
             writer,
             sheet_name="逐行Diff",
             index=False,
         )
-        _dataframe(chunk_diff, include_reasoning=include_reasoning).to_excel(
+        _dataframe(
+            chunk_diff,
+            include_reasoning=include_reasoning,
+            optional_sections=selected_sections,
+        ).to_excel(
             writer,
             sheet_name="逐Chunk对比",
             index=False,
@@ -251,7 +259,8 @@ def write_extraction_prompt_diff_excel(
             [
                 {"项目": "逐行Diff", "说明": "保留原始 query/answer 行；chunk 级输出与结论只写在末行。"},
                 {"项目": "逐Chunk对比", "说明": "每个 session/chunk 一行，便于筛选两版结果。"},
-                {"项目": "reasoning", "说明": "仅当至少一版返回 reasoning 时加入 A/B reasoning 列。"},
+                {"项目": "默认列", "说明": "仅保留定位信息、A/B 提取结果、相对问题/优点、对比结论和备注。"},
+                {"项目": "可选诊断列", "说明": "reasoning、运行状态、历史输入、错误标签、规则证据和模型调用信息由运行前配置决定。"},
                 {"项目": "失败样本", "说明": "API、网络和 Judge 解析失败单独标注，不按 0 分计入。"},
                 {"项目": "策略差异", "说明": "由两版准入范围、数据源或输出结构不同造成，不进入 A/B 胜负统计。"},
                 {"项目": "历史基线差异", "说明": "差异在本轮 old_memory 中已经存在且只是继承，不在后续 chunk 重复计入胜负。"},

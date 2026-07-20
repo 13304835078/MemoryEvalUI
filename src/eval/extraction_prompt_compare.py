@@ -290,6 +290,13 @@ def _normalized_output(case: Case | None) -> str:
     return "\n".join(lines).strip()
 
 
+def _normalized_old_memory(case: Case | None) -> str:
+    if case is None:
+        return ""
+    lines = [line.rstrip() for line in str(case.old_memory or "").replace("\r\n", "\n").split("\n")]
+    return "\n".join(lines).strip()
+
+
 def _judge_outputs_disagree(result_a: EvalResult, result_b: EvalResult) -> bool:
     return bool(
         abs(float(result_a.score_total) - float(result_b.score_total)) > 1e-12
@@ -679,6 +686,30 @@ def deterministic_pairwise_result(pair: ExtractionPair) -> dict[str, Any] | None
                 "error_tags_b": [],
                 "strengths_a": [],
                 "strengths_b": [],
+                "error": "",
+            }
+        if (
+            _normalized_output(pair.case_a) == _normalized_old_memory(pair.case_a)
+            and _normalized_output(pair.case_b) == _normalized_old_memory(pair.case_b)
+        ):
+            return {
+                "source_key": pair.source_key,
+                "status": "deterministic",
+                "model": "rule",
+                "winner": "HISTORICAL_DIFFERENCE",
+                "decision_basis": "historical_baseline_difference",
+                "confidence": "high",
+                "reason": "A/B 本轮都原样继承各自历史记忆；正文差异完全来自本轮开始前的历史基线，不重复计错。",
+                "comparison_kind": "historical_baseline_difference",
+                "rule_refs": [],
+                "policy_differences": [],
+                "evidence_refs": [],
+                "issues_a": [],
+                "issues_b": [],
+                "error_tags_a": [],
+                "error_tags_b": [],
+                "strengths_a": ["完整继承历史记忆"],
+                "strengths_b": ["完整继承历史记忆"],
                 "error": "",
             }
         return None

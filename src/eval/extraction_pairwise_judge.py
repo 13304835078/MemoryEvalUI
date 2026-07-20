@@ -20,11 +20,13 @@ PAIRWISE_SYSTEM_PROMPT = """你是记忆提取结果的成对比较裁判。
 不要分别打绝对分，也不要根据模型名称、提示词版本名称或文本长短猜测优劣。
 
 强制规则：
-1. 两侧 old_memory 都是各自本轮更新前的合法历史基线。候选保留其中已有内容时，不要求该内容在本轮对话中再次出现。
+1. 两侧 old_memory 都是各自本轮更新前的合法历史基线。候选保留其中已有内容时，不要求该内容在本轮对话中再次出现；
+   即使某条历史内容本身可能不正确，原样继承也不能算作当前 chunk 的捏造、事实错误或越界。
 2. 只评价“各自 old_memory → 各自 output”的本轮状态变化。新增或改写事实需由本轮源对话支持；
-   当前对话未否定的历史内容不能仅因本轮未提及而判错。
+   当前对话未否定的历史内容不能仅因本轮未提及而判错，并且必须检查候选是否无故丢失应继承的历史内容。
 3. 如果 A/B 的差异在两侧 old_memory 中已经存在，且本轮只是各自原样继承，判 HISTORICAL_DIFFERENCE，
-   不得在后续 chunk 重复计为任一侧错误。若本轮对旧记忆做了新的错误增删改，仍按共同质量问题判断。
+   不得在后续 chunk 重复计为任一侧错误。只有当前对话明确给出纠正信息，且双方共同提取规则明确要求纠错时，
+   未纠错才算本轮问题；若只有一侧提示词支持纠错，则属于策略差异。若本轮主动做了新的错误增删改，仍按共同质量问题判断。
 4. reasoning 只用于排查提取过程，不能单独证明候选正文正确，也不能弥补正文遗漏。
 5. 只有通用质量规则或双方共同规则中的错误可以决定 A/B 胜负。若差异仅来自双方准入范围、
    数据源、长度或输出结构不同，必须判 POLICY_DIFFERENCE，不能选择更符合自身提示词的一侧。
@@ -101,6 +103,7 @@ def _transition_view(old_memory: Any, candidate_output: Any) -> dict[str, Any]:
         "output_line_count": len(new_lines),
         "exactly_retained_line_count": len(retained),
         "exactly_retained_lines": _truncate("\n".join(retained), 6_000),
+        "retained_lines_evaluation_rule": "这些行来自历史基线，禁止因本轮对话未提及或历史本身可能有误而判为本轮捏造。",
         "added_or_rewritten_lines": _truncate("\n".join(added), 6_000),
         "removed_or_rewritten_historical_lines": _truncate("\n".join(removed), 6_000),
         "note": "逐行差异仅辅助定位；语义等价改写仍需结合完整上下文判断。",

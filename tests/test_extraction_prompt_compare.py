@@ -274,6 +274,26 @@ def test_direct_pairwise_skips_model_for_identical_outputs() -> None:
     assert result["comparison_kind"] == "identical_output"
 
 
+def test_direct_pairwise_does_not_rejudge_unchanged_historical_differences() -> None:
+    case_a = _case("case-a", output="# USER.md\n- historical A")
+    case_b = _case("case-b", output="# USER.md\n- historical B")
+    case_a.old_memory = case_a.candidate_output
+    case_b.old_memory = case_b.candidate_output
+    pairs, _ = build_extraction_pairs(
+        cases_a=[case_a],
+        cases_b=[case_b],
+        missed_cases_a=[],
+        missed_cases_b=[],
+    )
+
+    result = deterministic_pairwise_result(pairs[0])
+
+    assert result is not None
+    assert result["winner"] == "HISTORICAL_DIFFERENCE"
+    assert result["issues_a"] == []
+    assert result["issues_b"] == []
+
+
 def test_direct_pairwise_leaves_single_quality_miss_for_neutral_judge() -> None:
     case_a = _case("case-a")
     missed_b = _case("missed-b", missed=True)
