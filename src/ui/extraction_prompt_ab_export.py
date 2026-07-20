@@ -27,6 +27,9 @@ _COMMON_COMPARISON_COLUMNS = [
     "源数据一致性",
     "A提取状态",
     "B提取状态",
+    "A历史输入",
+    "B历史输入",
+    "历史基线关系",
     "对比结论",
     "对比备注",
     "A错误标签",
@@ -204,6 +207,7 @@ def _style_diff_sheet(worksheet) -> None:
             "双方均漏抽": same_fill,
             "不可比较": PatternFill("solid", fgColor="FCE4D6"),
             "策略差异": PatternFill("solid", fgColor="E4DFEC"),
+            "历史基线差异": PatternFill("solid", fgColor="D9EAF7"),
         }
         for row_index in range(2, worksheet.max_row + 1):
             cell = worksheet.cell(row=row_index, column=comparison_column)
@@ -250,6 +254,7 @@ def write_extraction_prompt_diff_excel(
                 {"项目": "reasoning", "说明": "仅当至少一版返回 reasoning 时加入 A/B reasoning 列。"},
                 {"项目": "失败样本", "说明": "API、网络和 Judge 解析失败单独标注，不按 0 分计入。"},
                 {"项目": "策略差异", "说明": "由两版准入范围、数据源或输出结构不同造成，不进入 A/B 胜负统计。"},
+                {"项目": "历史基线差异", "说明": "差异在本轮 old_memory 中已经存在且只是继承，不在后续 chunk 重复计入胜负。"},
             ]
         ).to_excel(writer, sheet_name="说明", index=False)
         if model_comparison:

@@ -725,7 +725,7 @@ def _write_pairwise_advisor_evidence(
         lower = label.lower()
         losing_comparison = "B较优" if label == "A" else "A较优"
         for row in rows:
-            if str(row.get("comparison") or "") == "策略差异":
+            if str(row.get("comparison") or "") in {"策略差异", "历史基线差异"}:
                 continue
             case = cases_by_side[label].get(str(row.get("source_key") or ""))
             if case is None:

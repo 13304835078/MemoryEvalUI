@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import time
+from collections import Counter
 from typing import Any, Callable
 
 import requests
@@ -19,20 +20,24 @@ PAIRWISE_SYSTEM_PROMPT = """你是记忆提取结果的成对比较裁判。
 不要分别打绝对分，也不要根据模型名称、提示词版本名称或文本长短猜测优劣。
 
 强制规则：
-1. 事实依据只能来自源对话和两侧各自的旧记忆；提取规则只定义应该记录什么，不能作为事实来源。
-2. reasoning 只用于排查提取过程，不能单独证明候选正文正确，也不能弥补正文遗漏。
-3. 只有通用质量规则或双方共同规则中的错误可以决定 A/B 胜负。若差异仅来自双方准入范围、
+1. 两侧 old_memory 都是各自本轮更新前的合法历史基线。候选保留其中已有内容时，不要求该内容在本轮对话中再次出现。
+2. 只评价“各自 old_memory → 各自 output”的本轮状态变化。新增或改写事实需由本轮源对话支持；
+   当前对话未否定的历史内容不能仅因本轮未提及而判错。
+3. 如果 A/B 的差异在两侧 old_memory 中已经存在，且本轮只是各自原样继承，判 HISTORICAL_DIFFERENCE，
+   不得在后续 chunk 重复计为任一侧错误。若本轮对旧记忆做了新的错误增删改，仍按共同质量问题判断。
+4. reasoning 只用于排查提取过程，不能单独证明候选正文正确，也不能弥补正文遗漏。
+5. 只有通用质量规则或双方共同规则中的错误可以决定 A/B 胜负。若差异仅来自双方准入范围、
    数据源、长度或输出结构不同，必须判 POLICY_DIFFERENCE，不能选择更符合自身提示词的一侧。
-4. 同类错误必须使用一致标准。内容等价时判 TIE；证据不足或无法可靠判断时判 INSUFFICIENT。
-5. 规则引用必须能在评测协议的 universal_rules 或 common_rules 中找到，禁止编造 R1/R2 等编号。
-6. policy_conflicts 和 format_differences 只用于识别不可直接定胜负的策略差异，不能作为偏向任一候选的依据。
-7. 团队裁判提示词只作为候选无关的质量原则来源；若与本协议冲突，以本协议为准。
-8. 只输出一个 JSON object，不要 Markdown 代码块或额外文字。
+6. 同类错误必须使用一致标准。内容等价时判 TIE；证据不足或无法可靠判断时判 INSUFFICIENT。
+7. 规则引用必须能在评测协议的 universal_rules 或 common_rules 中找到，禁止编造 R1/R2 等编号。
+8. policy_conflicts 和 format_differences 只用于识别不可直接定胜负的策略差异，不能作为偏向任一候选的依据。
+9. 团队裁判提示词只作为候选无关的质量原则来源；若与本协议冲突，以本协议为准。
+10. 只输出一个 JSON object，不要 Markdown 代码块或额外文字。
 
 输出格式：
 {
-  "winner": "candidate_1|candidate_2|TIE|POLICY_DIFFERENCE|INSUFFICIENT",
-  "decision_basis": "common_quality|policy_difference|equivalent|insufficient",
+  "winner": "candidate_1|candidate_2|TIE|POLICY_DIFFERENCE|HISTORICAL_DIFFERENCE|INSUFFICIENT",
+  "decision_basis": "common_quality|policy_difference|historical_baseline_difference|equivalent|insufficient",
   "confidence": "low|medium|high",
   "reason": "简明说明直接比较依据",
   "rule_refs": ["通用质量规则或共同规则中的原文短句"],
@@ -55,6 +60,16 @@ def _truncate(value: Any, limit: int) -> str:
     return text[: max(0, limit - 12)] + "\n[已截断]"
 
 
+def _truncate_document(value: Any, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    marker = "\n[中间内容因上下文预算已截断]\n"
+    available = max(0, limit - len(marker))
+    head = int(available * 0.55)
+    return text[:head] + marker + text[-(available - head):]
+
+
 def _dialogue(case: Case) -> list[dict[str, str]]:
     return [
         {"role": str(turn.role or ""), "content": _truncate(turn.content, 4_000)}
@@ -66,6 +81,30 @@ def _dialogue(case: Case) -> list[dict[str, str]]:
 def _reasoning(case: Case) -> str:
     metadata = case.metadata if isinstance(case.metadata, dict) else {}
     return _truncate(metadata.get("reasoning"), 6_000)
+
+
+def _transition_view(old_memory: Any, candidate_output: Any) -> dict[str, Any]:
+    old_lines = [line.strip() for line in str(old_memory or "").splitlines() if line.strip()]
+    new_lines = [line.strip() for line in str(candidate_output or "").splitlines() if line.strip()]
+    old_counts = Counter(old_lines)
+    new_counts = Counter(new_lines)
+    retained: list[str] = []
+    added: list[str] = []
+    removed: list[str] = []
+    for line, count in new_counts.items():
+        retained.extend([line] * min(count, old_counts.get(line, 0)))
+        added.extend([line] * max(0, count - old_counts.get(line, 0)))
+    for line, count in old_counts.items():
+        removed.extend([line] * max(0, count - new_counts.get(line, 0)))
+    return {
+        "historical_line_count": len(old_lines),
+        "output_line_count": len(new_lines),
+        "exactly_retained_line_count": len(retained),
+        "exactly_retained_lines": _truncate("\n".join(retained), 6_000),
+        "added_or_rewritten_lines": _truncate("\n".join(added), 6_000),
+        "removed_or_rewritten_historical_lines": _truncate("\n".join(removed), 6_000),
+        "note": "逐行差异仅辅助定位；语义等价改写仍需结合完整上下文判断。",
+    }
 
 
 def stable_swap_for_source(source_key: str) -> bool:
@@ -87,6 +126,7 @@ def build_pairwise_user_message(
     source = case_a if case_a.dialogue else case_b
     payload = {
         "task_type": task_type,
+        "evaluation_scope": "只评价本轮状态变化；old_memory 是合法历史基线，历史基线已有差异不重复计错。",
         "candidate_neutral_evaluation_protocol": evaluation_protocol or {
             "universal_rules": [_truncate(evaluation_rule_prompt, 28_000)] if evaluation_rule_prompt else [],
             "common_rules": [],
@@ -95,13 +135,15 @@ def build_pairwise_user_message(
         },
         "source_dialogue": _dialogue(source),
         "candidate_1": {
-            "old_memory": _truncate(first.old_memory, 16_000),
-            "output": _truncate(first.candidate_output, 20_000),
+            "old_memory_historical_baseline": _truncate_document(first.old_memory, 20_000),
+            "output_after_current_dialogue": _truncate_document(first.candidate_output, 24_000),
+            "transition_view": _transition_view(first.old_memory, first.candidate_output),
             "reasoning_auxiliary_only": _reasoning(first),
         },
         "candidate_2": {
-            "old_memory": _truncate(second.old_memory, 16_000),
-            "output": _truncate(second.candidate_output, 20_000),
+            "old_memory_historical_baseline": _truncate_document(second.old_memory, 20_000),
+            "output_after_current_dialogue": _truncate_document(second.candidate_output, 24_000),
+            "transition_view": _transition_view(second.old_memory, second.candidate_output),
             "reasoning_auxiliary_only": _reasoning(second),
         },
     }
@@ -168,6 +210,8 @@ def normalize_pairwise_result(parsed: dict[str, Any], *, swap_candidates: bool) 
         "持平": "TIE",
         "策略差异": "POLICY_DIFFERENCE",
         "POLICYDIFFERENCE": "POLICY_DIFFERENCE",
+        "历史基线差异": "HISTORICAL_DIFFERENCE",
+        "HISTORICALDIFFERENCE": "HISTORICAL_DIFFERENCE",
         "证据不足": "INSUFFICIENT",
     }
     winner = aliases.get(raw_winner, raw_winner)
@@ -175,7 +219,7 @@ def normalize_pairwise_result(parsed: dict[str, Any], *, swap_candidates: bool) 
         mapped_winner = "B" if swap_candidates else "A"
     elif winner == "CANDIDATE_2":
         mapped_winner = "A" if swap_candidates else "B"
-    elif winner in {"TIE", "POLICY_DIFFERENCE", "INSUFFICIENT"}:
+    elif winner in {"TIE", "POLICY_DIFFERENCE", "HISTORICAL_DIFFERENCE", "INSUFFICIENT"}:
         mapped_winner = winner
     else:
         mapped_winner = "INSUFFICIENT"
@@ -198,9 +242,10 @@ def normalize_pairwise_result(parsed: dict[str, Any], *, swap_candidates: bool) 
 
     policy_differences = _string_list(parsed.get("policy_differences"))
     decision_basis = str(parsed.get("decision_basis") or "").strip().lower()
-    if decision_basis not in {"common_quality", "policy_difference", "equivalent", "insufficient"}:
+    if decision_basis not in {"common_quality", "policy_difference", "historical_baseline_difference", "equivalent", "insufficient"}:
         decision_basis = (
             "policy_difference" if mapped_winner == "POLICY_DIFFERENCE"
+            else "historical_baseline_difference" if mapped_winner == "HISTORICAL_DIFFERENCE"
             else "equivalent" if mapped_winner == "TIE"
             else "insufficient" if mapped_winner == "INSUFFICIENT"
             else "common_quality"
@@ -209,6 +254,8 @@ def normalize_pairwise_result(parsed: dict[str, Any], *, swap_candidates: bool) 
         decision_basis = "policy_difference"
     if decision_basis == "policy_difference":
         mapped_winner = "POLICY_DIFFERENCE"
+    elif decision_basis == "historical_baseline_difference":
+        mapped_winner = "HISTORICAL_DIFFERENCE"
 
     return {
         "winner": mapped_winner,

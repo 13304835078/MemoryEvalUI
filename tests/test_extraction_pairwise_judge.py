@@ -51,6 +51,8 @@ def test_pairwise_message_marks_reasoning_as_auxiliary() -> None:
 
     assert payload["candidate_1"]["reasoning_auxiliary_only"] == "A reasoning"
     assert payload["candidate_2"]["reasoning_auxiliary_only"] == "B reasoning"
+    assert payload["candidate_1"]["old_memory_historical_baseline"] == "# old"
+    assert payload["candidate_1"]["transition_view"]["exactly_retained_line_count"] == 0
     assert payload["candidate_neutral_evaluation_protocol"]["universal_rules"] == ["只记录长期稳定事实"]
 
 
@@ -66,6 +68,20 @@ def test_policy_difference_cannot_be_mapped_to_a_or_b() -> None:
 
     assert result["winner"] == "POLICY_DIFFERENCE"
     assert result["policy_differences"] == ["双方准入范围不同"]
+
+
+def test_historical_baseline_difference_cannot_be_counted_as_a_win() -> None:
+    result = normalize_pairwise_result(
+        {
+            "winner": "candidate_1",
+            "decision_basis": "historical_baseline_difference",
+            "reason": "差异在旧记忆中已经存在。",
+        },
+        swap_candidates=False,
+    )
+
+    assert result["winner"] == "HISTORICAL_DIFFERENCE"
+    assert result["decision_basis"] == "historical_baseline_difference"
 
 
 def test_stable_swap_is_deterministic() -> None:

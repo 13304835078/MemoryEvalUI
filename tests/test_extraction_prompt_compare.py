@@ -407,3 +407,35 @@ def test_policy_difference_is_excluded_from_pairwise_wins() -> None:
     assert report["winner_counts"]["策略差异"] == 1
     assert report["validation_gate"]["paired_case_count"] == 0
     assert report["recommendation"] == "暂不定版"
+
+
+def test_historical_baseline_difference_is_excluded_and_history_is_visible() -> None:
+    case_a = _case("case-a")
+    case_b = _case("case-b", output="# USER.md\n- inherited B value")
+    case_a.old_memory = "# USER.md\n- inherited A value"
+    case_b.old_memory = "# USER.md\n- inherited B value"
+    source_key = source_case_key(case_a)
+    report = compare_extraction_prompt_pairs(
+        cases_a=[case_a],
+        cases_b=[case_b],
+        missed_cases_a=[],
+        missed_cases_b=[],
+        pairwise_results=[
+            {
+                "source_key": source_key,
+                "status": "success",
+                "winner": "HISTORICAL_DIFFERENCE",
+                "decision_basis": "historical_baseline_difference",
+                "reason": "差异来自历史基线。",
+            }
+        ],
+        prompt_a="prompt A",
+        prompt_b="prompt B",
+        validation_config=_lenient_gate(),
+    )
+
+    assert report["winner_counts"]["历史基线差异"] == 1
+    assert report["validation_gate"]["paired_case_count"] == 0
+    assert report["rows"][0]["history_input_a"] == "已输入"
+    assert report["rows"][0]["history_input_b"] == "已输入"
+    assert report["rows"][0]["history_baseline_relation"] == "不同"

@@ -166,6 +166,9 @@ def _diff_comparison_fields(comparison: dict[str, Any] | None) -> dict[str, Any]
     return {
         "A提取状态": comparison.get("extraction_a", ""),
         "B提取状态": comparison.get("extraction_b", ""),
+        "A历史输入": comparison.get("history_input_a", ""),
+        "B历史输入": comparison.get("history_input_b", ""),
+        "历史基线关系": comparison.get("history_baseline_relation", ""),
         "A Judge状态": comparison.get("judge_status_a", ""),
         "B Judge状态": comparison.get("judge_status_b", ""),
         "A总分": comparison.get("score_a"),
@@ -832,6 +835,7 @@ def compare_extraction_prompt_pairs(
         "输出相同": 0,
         "双方均漏抽": 0,
         "策略差异": 0,
+        "历史基线差异": 0,
         "不可比较": 0,
     }
     rows: list[dict[str, Any]] = []
@@ -869,6 +873,9 @@ def compare_extraction_prompt_pairs(
         elif winner == "POLICY_DIFFERENCE":
             comparison = "策略差异"
             outcome = None
+        elif winner == "HISTORICAL_DIFFERENCE":
+            comparison = "历史基线差异"
+            outcome = None
         else:
             comparison = "不可比较"
             outcome = None
@@ -886,6 +893,13 @@ def compare_extraction_prompt_pairs(
 
         source = pair.case_a or pair.case_b or pair.missed_a or pair.missed_b
         metadata = source.metadata if source and isinstance(source.metadata, dict) else {}
+        old_a = str((pair.case_a or pair.missed_a).old_memory or "") if (pair.case_a or pair.missed_a) else ""
+        old_b = str((pair.case_b or pair.missed_b).old_memory or "") if (pair.case_b or pair.missed_b) else ""
+        history_relation = (
+            "双方均为空" if not old_a and not old_b
+            else "相同" if old_a == old_b
+            else "不同"
+        )
         if outcome is not None and status in {"success", "mock", "deterministic"}:
             reviewer = str(metadata.get("reviewer") or "").strip()
             session = str(metadata.get("source_session_id") or getattr(source, "session_id", "") or "")
@@ -910,6 +924,9 @@ def compare_extraction_prompt_pairs(
                 "case_id_b": pair.case_b.case_id if pair.case_b else "",
                 "extraction_a": "可比较" if pair.case_a else "漏抽/不可用",
                 "extraction_b": "可比较" if pair.case_b else "漏抽/不可用",
+                "history_input_a": "已输入" if old_a else "空历史",
+                "history_input_b": "已输入" if old_b else "空历史",
+                "history_baseline_relation": history_relation,
                 "pairwise_status": status,
                 "pairwise_model": result.get("model", ""),
                 "pairwise_confidence": result.get("confidence", ""),
@@ -926,8 +943,8 @@ def compare_extraction_prompt_pairs(
                 "strengths_a": "；".join(result.get("strengths_a") or []),
                 "strengths_b": "；".join(result.get("strengths_b") or []),
                 "comparison_error": result.get("error", ""),
-                "old_memory_a": pair.case_a.old_memory if pair.case_a else "",
-                "old_memory_b": pair.case_b.old_memory if pair.case_b else "",
+                "old_memory_a": old_a,
+                "old_memory_b": old_b,
                 "candidate_output_a": pair.case_a.candidate_output if pair.case_a else "",
                 "candidate_output_b": pair.case_b.candidate_output if pair.case_b else "",
             }

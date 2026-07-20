@@ -278,7 +278,7 @@ def _render_report(job_id: str, state: dict) -> None:
             )
     if direct_mode:
         st.caption(
-            "正文不同的同源 chunk 只调用一次对比模型；共同质量问题才进入胜负，策略差异单列；"
+            "正文不同的同源 chunk 只调用一次对比模型；共同质量问题才进入胜负，策略差异与历史基线差异单列；"
             "提取/API/JSON 失败单独统计，不视为 A 或 B 得 0 分。偏好净值范围为 -1 到 +1。"
         )
         excluded = sum(
@@ -356,6 +356,9 @@ def _render_report(job_id: str, state: dict) -> None:
             "chunk_index": "chunk",
             "extraction_a": "A 提取状态",
             "extraction_b": "B 提取状态",
+            "history_input_a": "A 历史输入",
+            "history_input_b": "B 历史输入",
+            "history_baseline_relation": "历史基线关系",
             "comparison": "对比结论",
             "comparison_note": "对比备注",
             "error_tags_a": "A 错误标签",
@@ -384,6 +387,7 @@ def _render_report(job_id: str, state: dict) -> None:
             )
             preview_columns = [
                 "评测人", "session", "chunk", "A 提取状态", "B 提取状态",
+                "A 历史输入", "B 历史输入", "历史基线关系",
                 "对比调用状态", "对比置信度", "判定依据类型", "对比结论", "对比备注",
             ]
         else:
@@ -539,7 +543,7 @@ with st.expander("使用说明", expanded=False):
 4. 系统按评测人、session、chunk 和原始行范围配对；正文相同自动持平，单边真实漏抽按覆盖差异处理。
 5. 正文不同的 chunk 只调用一次直接对比模型，不再对 A、B 分别做绝对评分；运行失败不按 0 分处理。
 6. 系统只额外调用一次模型整理共同规则、策略冲突、格式差异和提示词设计质量，不再使用 A 或 B 作为冻结规则。
-7. 逐 chunk 胜负只由共同质量问题决定；策略差异单列，提示词设计质量在输出效果无显著差异时作为次级依据。
+7. 逐 chunk 胜负只由本轮共同质量问题决定；策略差异和已存在的历史基线差异单列，避免同一问题跨 chunk 重复计错。
         """.strip()
     )
 
