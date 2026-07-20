@@ -1,6 +1,9 @@
 from src.eval.extraction_prompt_compare import (
     build_extraction_prompt_diff,
+    build_extraction_pairs,
+    compare_extraction_prompt_pairs,
     compare_extraction_prompt_runs,
+    deterministic_pairwise_result,
     source_case_key,
 )
 from src.loop.validation_gate import ValidationGateConfig
@@ -251,3 +254,97 @@ def test_build_diff_omits_reasoning_columns_when_both_versions_have_none() -> No
     assert include_reasoning is False
     assert "A_reasoning" not in row_diff[0]
     assert "B_reasoning" not in chunk_diff[0]
+
+
+def test_direct_pairwise_skips_model_for_identical_outputs() -> None:
+    case_a = _case("case-a")
+    case_b = _case("case-b")
+    pairs, duplicates = build_extraction_pairs(
+        cases_a=[case_a],
+        cases_b=[case_b],
+        missed_cases_a=[],
+        missed_cases_b=[],
+    )
+
+    result = deterministic_pairwise_result(pairs[0])
+
+    assert duplicates == []
+    assert result is not None
+    assert result["winner"] == "TIE"
+    assert result["comparison_kind"] == "identical_output"
+
+
+def test_direct_pairwise_treats_quality_miss_as_coverage_loss() -> None:
+    case_a = _case("case-a")
+    missed_b = _case("missed-b", missed=True)
+    missed_b.metadata["call_status"] = "success"
+    missed_b.metadata["parse_status"] = "empty"
+    pairs, _ = build_extraction_pairs(
+        cases_a=[case_a],
+        cases_b=[],
+        missed_cases_a=[],
+        missed_cases_b=[missed_b],
+    )
+
+    result = deterministic_pairwise_result(pairs[0])
+
+    assert result is not None
+    assert result["winner"] == "A"
+    assert result["comparison_kind"] == "coverage"
+
+
+def test_direct_pairwise_excludes_extraction_api_failure_from_winner() -> None:
+    case_a = _case("case-a")
+    missed_b = _case("missed-b", missed=True)
+    missed_b.metadata["call_status"] = "failed"
+    pairs, _ = build_extraction_pairs(
+        cases_a=[case_a],
+        cases_b=[],
+        missed_cases_a=[],
+        missed_cases_b=[missed_b],
+    )
+
+    result = deterministic_pairwise_result(pairs[0])
+
+    assert result is not None
+    assert result["winner"] == "INSUFFICIENT"
+    assert result["status"] == "infrastructure_failure"
+
+
+def test_direct_pairwise_report_uses_wins_without_absolute_scores() -> None:
+    case_a = _case("case-a")
+    case_b = _case("case-b", output="# USER.md\n- improved value")
+    source_key = source_case_key(case_a)
+    report = compare_extraction_prompt_pairs(
+        cases_a=[case_a],
+        cases_b=[case_b],
+        missed_cases_a=[],
+        missed_cases_b=[],
+        pairwise_results=[
+            {
+                "source_key": source_key,
+                "status": "success",
+                "model": "pairwise-model",
+                "winner": "B",
+                "confidence": "high",
+                "reason": "B 更完整。",
+                "rule_refs": ["覆盖规则"],
+                "evidence_refs": ["用户事实"],
+                "issues_a": ["遗漏"],
+                "issues_b": [],
+                "error_tags_a": ["missing_key_info"],
+                "error_tags_b": [],
+                "strengths_a": [],
+                "strengths_b": ["完整"],
+            }
+        ],
+        prompt_a="prompt A",
+        prompt_b="prompt B",
+        validation_config=_lenient_gate(),
+    )
+
+    assert report["comparison_mode"] == "direct_pairwise_v1"
+    assert report["recommendation"] == "建议选择 B"
+    assert report["validation_gate"]["paired_preference_delta"] == 1.0
+    assert report["rows"][0]["comparison"] == "B较优"
+    assert "score_a" not in report["rows"][0]

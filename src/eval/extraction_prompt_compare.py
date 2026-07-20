@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import hashlib
+import random
+from dataclasses import asdict, dataclass, replace
 from statistics import mean
 from typing import Any
 
@@ -21,6 +23,15 @@ _OUTPUT_COLUMNS = (
     "MEMORY.md",
     "parsed_document",
 )
+
+
+@dataclass(frozen=True)
+class ExtractionPair:
+    source_key: str
+    case_a: Case | None = None
+    case_b: Case | None = None
+    missed_a: Case | None = None
+    missed_b: Case | None = None
 
 
 def source_case_key(case: Case) -> str:
@@ -170,6 +181,16 @@ def _diff_comparison_fields(comparison: dict[str, Any] | None) -> dict[str, Any]
         "B评语": comparison.get("comment_b", ""),
         "A规则引用": comparison.get("rule_refs_a", ""),
         "B规则引用": comparison.get("rule_refs_b", ""),
+        "对比调用状态": comparison.get("pairwise_status", ""),
+        "对比模型": comparison.get("pairwise_model", ""),
+        "对比置信度": comparison.get("pairwise_confidence", ""),
+        "规则引用": comparison.get("rule_refs", ""),
+        "证据引用": comparison.get("evidence_refs", ""),
+        "A相对问题": comparison.get("issues_a", ""),
+        "B相对问题": comparison.get("issues_b", ""),
+        "A相对优点": comparison.get("strengths_a", ""),
+        "B相对优点": comparison.get("strengths_b", ""),
+        "对比调用错误": comparison.get("comparison_error", ""),
     }
 
 
@@ -580,5 +601,481 @@ def compare_extraction_prompt_runs(
         "judge_disagreement_on_identical_output_count": len(judge_disagreement_keys),
         "judge_disagreement_on_identical_output_keys": judge_disagreement_keys,
         "duplicate_source_keys": sorted(duplicate_keys),
+        "rows": rows,
+    }
+
+
+def build_extraction_pairs(
+    *,
+    cases_a: list[Case],
+    cases_b: list[Case],
+    missed_cases_a: list[Case],
+    missed_cases_b: list[Case],
+) -> tuple[list[ExtractionPair], list[str]]:
+    """Align two extraction outputs without relying on prompt-specific case IDs."""
+    cases_a_by_key, duplicates_a = _unique_case_map(cases_a)
+    cases_b_by_key, duplicates_b = _unique_case_map(cases_b)
+    missed_a_by_key, missed_duplicates_a = _unique_case_map(missed_cases_a)
+    missed_b_by_key, missed_duplicates_b = _unique_case_map(missed_cases_b)
+    duplicate_keys = sorted(
+        set(duplicates_a + duplicates_b + missed_duplicates_a + missed_duplicates_b)
+    )
+    all_keys = sorted(
+        (
+            set(cases_a_by_key)
+            | set(cases_b_by_key)
+            | set(missed_a_by_key)
+            | set(missed_b_by_key)
+        )
+        - set(duplicate_keys)
+    )
+    return [
+        ExtractionPair(
+            source_key=key,
+            case_a=cases_a_by_key.get(key),
+            case_b=cases_b_by_key.get(key),
+            missed_a=missed_a_by_key.get(key),
+            missed_b=missed_b_by_key.get(key),
+        )
+        for key in all_keys
+    ], duplicate_keys
+
+
+def _missed_kind(case: Case | None) -> str:
+    if case is None:
+        return "missing"
+    metadata = case.metadata if isinstance(case.metadata, dict) else {}
+    call_status = str(metadata.get("call_status") or "").strip().lower()
+    parse_status = str(metadata.get("parse_status") or "").strip().lower()
+    if call_status in {"failed", "stopped"}:
+        return "infrastructure_failure"
+    if call_status == "success" and parse_status in {"empty", "unknown", "not_attempted", ""}:
+        return "quality_miss"
+    return "excluded_or_unknown"
+
+
+def deterministic_pairwise_result(pair: ExtractionPair) -> dict[str, Any] | None:
+    """Resolve comparisons that do not need an LLM call."""
+    if pair.case_a is not None and pair.case_b is not None:
+        if _normalized_output(pair.case_a) == _normalized_output(pair.case_b):
+            return {
+                "source_key": pair.source_key,
+                "status": "deterministic",
+                "model": "rule",
+                "winner": "TIE",
+                "confidence": "high",
+                "reason": "A/B 提取正文相同，无需调用对比模型。",
+                "comparison_kind": "identical_output",
+                "rule_refs": [],
+                "evidence_refs": [],
+                "issues_a": [],
+                "issues_b": [],
+                "error_tags_a": [],
+                "error_tags_b": [],
+                "strengths_a": [],
+                "strengths_b": [],
+                "error": "",
+            }
+        return None
+
+    kind_a = _missed_kind(pair.missed_a) if pair.case_a is None else "ready"
+    kind_b = _missed_kind(pair.missed_b) if pair.case_b is None else "ready"
+    if "infrastructure_failure" in {kind_a, kind_b}:
+        failed_sides = [label for label, kind in (("A", kind_a), ("B", kind_b)) if kind == "infrastructure_failure"]
+        return {
+            "source_key": pair.source_key,
+            "status": "infrastructure_failure",
+            "model": "rule",
+            "winner": "INSUFFICIENT",
+            "confidence": "low",
+            "reason": f"{'、'.join(failed_sides)} 侧提取接口失败，本条不计入版本胜负。",
+            "comparison_kind": "runtime_failure",
+            "rule_refs": [],
+            "evidence_refs": [],
+            "issues_a": [],
+            "issues_b": [],
+            "error_tags_a": [],
+            "error_tags_b": [],
+            "strengths_a": [],
+            "strengths_b": [],
+            "error": "提取接口失败",
+        }
+    if pair.case_a is not None and kind_b == "quality_miss":
+        return {
+            "source_key": pair.source_key,
+            "status": "deterministic",
+            "model": "rule",
+            "winner": "A",
+            "confidence": "high",
+            "reason": "B 调用成功但未生成可用正文，按漏抽判 A 较优。",
+            "comparison_kind": "coverage",
+            "rule_refs": [],
+            "evidence_refs": [],
+            "issues_a": [],
+            "issues_b": ["调用成功但未生成可用正文"],
+            "error_tags_a": [],
+            "error_tags_b": ["missing_key_info"],
+            "strengths_a": ["生成了可用正文"],
+            "strengths_b": [],
+            "error": "",
+        }
+    if pair.case_b is not None and kind_a == "quality_miss":
+        return {
+            "source_key": pair.source_key,
+            "status": "deterministic",
+            "model": "rule",
+            "winner": "B",
+            "confidence": "high",
+            "reason": "A 调用成功但未生成可用正文，按漏抽判 B 较优。",
+            "comparison_kind": "coverage",
+            "rule_refs": [],
+            "evidence_refs": [],
+            "issues_a": ["调用成功但未生成可用正文"],
+            "issues_b": [],
+            "error_tags_a": ["missing_key_info"],
+            "error_tags_b": [],
+            "strengths_a": [],
+            "strengths_b": ["生成了可用正文"],
+            "error": "",
+        }
+    if kind_a == "quality_miss" and kind_b == "quality_miss":
+        return {
+            "source_key": pair.source_key,
+            "status": "deterministic",
+            "model": "rule",
+            "winner": "TIE",
+            "confidence": "high",
+            "reason": "A/B 均调用成功但未生成可用正文，按共同漏抽处理。",
+            "comparison_kind": "both_missed",
+            "rule_refs": [],
+            "evidence_refs": [],
+            "issues_a": ["调用成功但未生成可用正文"],
+            "issues_b": ["调用成功但未生成可用正文"],
+            "error_tags_a": ["missing_key_info"],
+            "error_tags_b": ["missing_key_info"],
+            "strengths_a": [],
+            "strengths_b": [],
+            "error": "",
+        }
+    return {
+        "source_key": pair.source_key,
+        "status": "source_mismatch",
+        "model": "rule",
+        "winner": "INSUFFICIENT",
+        "confidence": "low",
+        "reason": "A/B 源 chunk 无法完整对齐，本条不进入胜负统计。",
+        "comparison_kind": "source_mismatch",
+        "rule_refs": [],
+        "evidence_refs": [],
+        "issues_a": [],
+        "issues_b": [],
+        "error_tags_a": [],
+        "error_tags_b": [],
+        "strengths_a": [],
+        "strengths_b": [],
+        "error": "源数据未对齐",
+    }
+
+
+def _percentile(sorted_values: list[float], probability: float) -> float | None:
+    if not sorted_values:
+        return None
+    probability = min(1.0, max(0.0, probability))
+    position = probability * (len(sorted_values) - 1)
+    lower = int(position)
+    upper = min(len(sorted_values) - 1, lower + 1)
+    fraction = position - lower
+    return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
+
+
+def _pairwise_cluster_interval(
+    outcomes_by_cluster: dict[str, list[float]],
+    *,
+    confidence_level: float,
+    samples: int,
+    seed_material: str,
+) -> tuple[float | None, float | None, float | None]:
+    cluster_means = [mean(values) for _key, values in sorted(outcomes_by_cluster.items()) if values]
+    if not cluster_means:
+        return None, None, None
+    point = mean(cluster_means)
+    if samples <= 0:
+        return point, None, None
+    seed = int(hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:16], 16)
+    rng = random.Random(seed)
+    simulated = sorted(
+        mean(rng.choice(cluster_means) for _ in cluster_means)
+        for _ in range(max(100, int(samples)))
+    )
+    alpha = 1.0 - min(0.999, max(0.5, float(confidence_level)))
+    return point, _percentile(simulated, alpha / 2.0), _percentile(simulated, 1.0 - alpha / 2.0)
+
+
+def _direct_quality(cases: list[Case], missed_cases: list[Case]) -> dict[str, Any]:
+    quality = compute_run_quality([], cases=cases, missed_cases=missed_cases)
+    return {
+        key: quality[key]
+        for key in (
+            "ready_cases",
+            "extraction_quality_failures",
+            "extraction_infrastructure_failures",
+            "excluded_or_unknown_chunks",
+            "extraction_coverage",
+            "infrastructure_success_rate",
+            "unresolved_execution_failures",
+            "run_complete",
+            "status",
+        )
+    }
+
+
+def compare_extraction_prompt_pairs(
+    *,
+    cases_a: list[Case],
+    cases_b: list[Case],
+    missed_cases_a: list[Case],
+    missed_cases_b: list[Case],
+    pairwise_results: list[dict[str, Any]],
+    prompt_a: str,
+    prompt_b: str,
+    validation_config: ValidationGateConfig | None = None,
+) -> dict[str, Any]:
+    """Aggregate direct A/B decisions without producing separate absolute scores."""
+    gate_config = validation_config or ValidationGateConfig()
+    pairs, duplicate_keys = build_extraction_pairs(
+        cases_a=cases_a,
+        cases_b=cases_b,
+        missed_cases_a=missed_cases_a,
+        missed_cases_b=missed_cases_b,
+    )
+    result_by_key = {
+        str(item.get("source_key") or ""): item
+        for item in pairwise_results
+        if str(item.get("source_key") or "")
+    }
+    quality_a = _direct_quality(cases_a, missed_cases_a)
+    quality_b = _direct_quality(cases_b, missed_cases_b)
+    winner_counts = {
+        "A较优": 0,
+        "B较优": 0,
+        "基本持平": 0,
+        "输出相同": 0,
+        "双方均漏抽": 0,
+        "不可比较": 0,
+    }
+    rows: list[dict[str, Any]] = []
+    outcomes_by_cluster: dict[str, list[float]] = {}
+    outcome_keys: list[str] = []
+    comparison_failures = 0
+    infrastructure_failures = 0
+    source_mismatches = 0
+    insufficient_comparisons = 0
+
+    for pair in pairs:
+        result = result_by_key.get(pair.source_key) or deterministic_pairwise_result(pair) or {
+            "source_key": pair.source_key,
+            "status": "failed",
+            "winner": "INSUFFICIENT",
+            "confidence": "low",
+            "reason": "缺少成对比较结果。",
+            "error": "缺少成对比较结果",
+        }
+        winner = str(result.get("winner") or "INSUFFICIENT").upper()
+        kind = str(result.get("comparison_kind") or "model")
+        if winner == "A":
+            comparison = "A较优"
+            outcome = -1.0
+        elif winner == "B":
+            comparison = "B较优"
+            outcome = 1.0
+        elif winner == "TIE":
+            comparison = (
+                "输出相同"
+                if kind == "identical_output"
+                else "双方均漏抽" if kind == "both_missed" else "基本持平"
+            )
+            outcome = 0.0
+        else:
+            comparison = "不可比较"
+            outcome = None
+        winner_counts[comparison] = winner_counts.get(comparison, 0) + 1
+
+        status = str(result.get("status") or "failed")
+        if status == "failed":
+            comparison_failures += 1
+        if status == "infrastructure_failure":
+            infrastructure_failures += 1
+        if status == "source_mismatch":
+            source_mismatches += 1
+        if winner == "INSUFFICIENT" and status in {"success", "mock"}:
+            insufficient_comparisons += 1
+
+        source = pair.case_a or pair.case_b or pair.missed_a or pair.missed_b
+        metadata = source.metadata if source and isinstance(source.metadata, dict) else {}
+        if outcome is not None and status in {"success", "mock", "deterministic"}:
+            reviewer = str(metadata.get("reviewer") or "").strip()
+            session = str(metadata.get("source_session_id") or getattr(source, "session_id", "") or "")
+            cluster = f"reviewer:{reviewer}" if reviewer else f"session:{session}"
+            outcomes_by_cluster.setdefault(cluster, []).append(outcome)
+            outcome_keys.append(pair.source_key)
+
+        rows.append(
+            {
+                "source_key": pair.source_key,
+                "reviewer": metadata.get("reviewer", ""),
+                "session_id": metadata.get("source_session_id", getattr(source, "session_id", "")),
+                "chunk_index": metadata.get("chunk_index_in_session", ""),
+                "chunk_id": (
+                    int(metadata.get("chunk_index_in_session")) + 1
+                    if str(metadata.get("chunk_index_in_session", "")).lstrip("-").isdigit()
+                    else metadata.get("chunk_index_in_session", "")
+                ),
+                "row_start": metadata.get("row_start", ""),
+                "row_end": metadata.get("row_end", ""),
+                "case_id_a": pair.case_a.case_id if pair.case_a else "",
+                "case_id_b": pair.case_b.case_id if pair.case_b else "",
+                "extraction_a": "可比较" if pair.case_a else "漏抽/不可用",
+                "extraction_b": "可比较" if pair.case_b else "漏抽/不可用",
+                "pairwise_status": status,
+                "pairwise_model": result.get("model", ""),
+                "pairwise_confidence": result.get("confidence", ""),
+                "comparison": comparison,
+                "comparison_note": result.get("reason", ""),
+                "rule_refs": "；".join(result.get("rule_refs") or []),
+                "evidence_refs": "；".join(result.get("evidence_refs") or []),
+                "issues_a": "；".join(result.get("issues_a") or []),
+                "issues_b": "；".join(result.get("issues_b") or []),
+                "error_tags_a": _tag_text(result.get("error_tags_a") or []),
+                "error_tags_b": _tag_text(result.get("error_tags_b") or []),
+                "strengths_a": "；".join(result.get("strengths_a") or []),
+                "strengths_b": "；".join(result.get("strengths_b") or []),
+                "comparison_error": result.get("error", ""),
+                "old_memory_a": pair.case_a.old_memory if pair.case_a else "",
+                "old_memory_b": pair.case_b.old_memory if pair.case_b else "",
+                "candidate_output_a": pair.case_a.candidate_output if pair.case_a else "",
+                "candidate_output_b": pair.case_b.candidate_output if pair.case_b else "",
+            }
+        )
+
+    eligible_count = sum(len(values) for values in outcomes_by_cluster.values())
+    b_wins = winner_counts.get("B较优", 0)
+    a_wins = winner_counts.get("A较优", 0)
+    ties = (
+        winner_counts.get("基本持平", 0)
+        + winner_counts.get("输出相同", 0)
+        + winner_counts.get("双方均漏抽", 0)
+    )
+    cluster_point, confidence_lower, confidence_upper = _pairwise_cluster_interval(
+        outcomes_by_cluster,
+        confidence_level=gate_config.confidence_level,
+        samples=gate_config.bootstrap_samples,
+        seed_material="|".join(sorted(outcome_keys)),
+    )
+    preference_delta = (
+        sum(sum(values) for values in outcomes_by_cluster.values()) / eligible_count
+        if eligible_count
+        else 0.0
+    )
+    regression_rate = a_wins / eligible_count if eligible_count else 0.0
+    coverage_drop = float(quality_a["extraction_coverage"]) - float(quality_b["extraction_coverage"])
+    prompt_growth_ratio = (len(prompt_b) - len(prompt_a)) / max(1, len(prompt_a))
+    confidence_ready = (
+        eligible_count >= int(gate_config.min_paired_cases)
+        and len(outcomes_by_cluster) >= int(gate_config.min_paired_clusters)
+    )
+    reasons: list[str] = []
+    if duplicate_keys:
+        reasons.append("来源键存在重复，重复 chunk 已排除。")
+    if quality_a["unresolved_execution_failures"] or quality_b["unresolved_execution_failures"]:
+        reasons.append("存在提取接口失败，失败 chunk 未按质量问题计入胜负。")
+    if comparison_failures:
+        reasons.append(f"有 {comparison_failures} 个差异 chunk 对比调用或 JSON 解析失败。")
+    if infrastructure_failures:
+        reasons.append(f"有 {infrastructure_failures} 个 chunk 因提取运行失败不可比较。")
+    if source_mismatches:
+        reasons.append(f"有 {source_mismatches} 个 chunk 的 A/B 源数据无法对齐。")
+    if coverage_drop > gate_config.max_extraction_coverage_drop:
+        reasons.append(
+            f"B 提取覆盖率下降 {coverage_drop:.2%}，超过允许值 {gate_config.max_extraction_coverage_drop:.2%}。"
+        )
+    if not eligible_count:
+        reasons.append("没有可进入胜负统计的同源 chunk。")
+    elif preference_delta + 1e-12 < gate_config.min_score_delta:
+        reasons.append(
+            f"B 的配对偏好净值 {preference_delta:+.4f}，低于门槛 {gate_config.min_score_delta:+.4f}。"
+        )
+    if gate_config.require_statistical_confidence:
+        if not confidence_ready:
+            reasons.append(
+                f"统计证据不足：需要至少 {gate_config.min_paired_cases} 个可比较 chunk、"
+                f"{gate_config.min_paired_clusters} 个独立评测人/时序簇，当前为 "
+                f"{eligible_count} 个、{len(outcomes_by_cluster)} 个。"
+            )
+        elif confidence_lower is None or confidence_lower <= gate_config.min_confidence_lower_bound:
+            lower_text = "不可计算" if confidence_lower is None else f"{confidence_lower:+.4f}"
+            reasons.append(
+                f"配对偏好净值的 {gate_config.confidence_level:.0%} 置信区间下界为 {lower_text}，"
+                f"未高于 {gate_config.min_confidence_lower_bound:+.4f}。"
+            )
+    if regression_rate > gate_config.max_case_regression_rate:
+        reasons.append(
+            f"B 的配对败率 {regression_rate:.2%}，超过允许值 {gate_config.max_case_regression_rate:.2%}。"
+        )
+    if prompt_growth_ratio > gate_config.max_prompt_growth_ratio:
+        reasons.append(
+            f"提示词增长 {prompt_growth_ratio:.2%}，超过允许值 {gate_config.max_prompt_growth_ratio:.2%}。"
+        )
+
+    accepted = not reasons
+    if accepted:
+        recommendation = "建议选择 B"
+        recommendation_reason = "B 在直接配对比较、覆盖率和统计置信度门槛上均通过。"
+    elif duplicate_keys or comparison_failures or infrastructure_failures or source_mismatches or not confidence_ready:
+        recommendation = "暂不定版"
+        recommendation_reason = "比较数据或统计证据尚不完整，需补齐失败样本或扩大样本后再选择。"
+    elif coverage_drop > gate_config.max_extraction_coverage_drop or preference_delta < 0:
+        recommendation = "建议保留 A"
+        recommendation_reason = "B 的覆盖率或直接配对胜负出现实质退化。"
+    else:
+        recommendation = "证据不足，暂时保留 A"
+        recommendation_reason = "B 尚未达到当前替换门槛。"
+
+    return {
+        "comparison_mode": "direct_pairwise_v1",
+        "recommendation": recommendation,
+        "recommendation_reason": recommendation_reason,
+        "quality_a": quality_a,
+        "quality_b": quality_b,
+        "validation_gate": {
+            "accepted": accepted,
+            "decision": "accepted" if accepted else "rejected",
+            "reasons": reasons,
+            "config": asdict(gate_config),
+            "paired_case_count": eligible_count,
+            "paired_cluster_count": len(outcomes_by_cluster),
+            "paired_preference_delta": round(preference_delta, 4),
+            "paired_score_delta": round(preference_delta, 4),
+            "b_win_rate": round(b_wins / eligible_count, 4) if eligible_count else 0.0,
+            "a_win_rate": round(a_wins / eligible_count, 4) if eligible_count else 0.0,
+            "tie_rate": round(ties / eligible_count, 4) if eligible_count else 0.0,
+            "confidence_ready": confidence_ready,
+            "confidence_level": gate_config.confidence_level,
+            "cluster_mean_delta": round(cluster_point, 4) if cluster_point is not None else None,
+            "confidence_interval": {
+                "lower": round(confidence_lower, 4) if confidence_lower is not None else None,
+                "upper": round(confidence_upper, 4) if confidence_upper is not None else None,
+            },
+            "extraction_coverage_drop": round(coverage_drop, 4),
+            "case_regression_rate": round(regression_rate, 4),
+            "prompt_growth_ratio": round(prompt_growth_ratio, 4),
+            "comparison_failures": comparison_failures,
+            "infrastructure_failures": infrastructure_failures,
+            "source_mismatches": source_mismatches,
+            "insufficient_comparisons": insufficient_comparisons,
+        },
+        "winner_counts": winner_counts,
+        "dimension_summary": [],
+        "identical_output_count": winner_counts.get("输出相同", 0),
+        "duplicate_source_keys": duplicate_keys,
         "rows": rows,
     }

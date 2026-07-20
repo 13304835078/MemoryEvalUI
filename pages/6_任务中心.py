@@ -197,6 +197,8 @@ def _render_runtime_controls(task_type: str, job_id: str, state: dict[str, Any])
     config = state.get("config") if isinstance(state.get("config"), dict) else {}
     eval_config = config.get("eval_config") if isinstance(config.get("eval_config"), dict) else {}
     extraction_config = config.get("extraction_config") if isinstance(config.get("extraction_config"), dict) else {}
+    if task_type == "提取提示词 A/B" and isinstance(config.get("extraction_config_a"), dict):
+        extraction_config = config.get("extraction_config_a")
 
     with st.expander("运行中可调整参数", expanded=False):
         st.caption(
@@ -264,28 +266,20 @@ def _render_runtime_controls(task_type: str, job_id: str, state: dict[str, Any])
                     ))
                 with c3:
                     updates["judge_concurrency"] = int(st.number_input(
-                        "后续评测并发",
+                        "后续直接对比并发",
                         min_value=1,
                         max_value=100,
-                        value=_as_int(controls.get("judge_concurrency"), eval_config.get("judge_concurrency") or 1, min_value=1, max_value=100),
+                        value=_as_int(controls.get("judge_concurrency"), comparison_config.get("judge_concurrency") or 1, min_value=1, max_value=100),
                         step=1,
                     ))
-                c2, c3 = st.columns(2)
+                c2, _ = st.columns(2)
                 with c2:
                     updates["judge_request_interval"] = float(st.number_input(
-                        "后续评测请求间隔（秒）",
-                        min_value=0.0,
-                        max_value=300.0,
-                        value=_as_float(controls.get("judge_request_interval"), eval_config.get("judge_request_interval") or 0.0, min_value=0.0, max_value=300.0),
-                        step=0.5,
-                    ))
-                with c3:
-                    updates["comparison_request_interval"] = float(st.number_input(
-                        "最终对比请求间隔（秒）",
+                        "后续直接对比请求间隔（秒）",
                         min_value=0.0,
                         max_value=300.0,
                         value=_as_float(
-                            controls.get("comparison_request_interval"),
+                            controls.get("judge_request_interval"),
                             comparison_config.get("judge_request_interval") or 0.0,
                             min_value=0.0,
                             max_value=300.0,

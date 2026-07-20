@@ -219,6 +219,11 @@ def _run_request(payload: dict[str, Any]) -> None:
         config_data["extraction_config"] = MemoryExtractionConfig(
             **dict(config_data.get("extraction_config") or {})
         )
+        for side_key in ("extraction_config_a", "extraction_config_b"):
+            if config_data.get(side_key):
+                config_data[side_key] = MemoryExtractionConfig(
+                    **dict(config_data.get(side_key) or {})
+                )
         config_data["eval_config"] = _eval_config(dict(config_data.get("eval_config") or {}))
         if config_data.get("comparison_config"):
             config_data["comparison_config"] = _eval_config(

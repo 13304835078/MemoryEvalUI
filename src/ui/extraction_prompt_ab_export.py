@@ -23,10 +23,16 @@ _BASE_COLUMNS = [
     "B提取结果",
 ]
 _REASONING_COLUMNS = ["A_reasoning", "B_reasoning"]
-_COMPARISON_COLUMNS = [
+_COMMON_COMPARISON_COLUMNS = [
     "源数据一致性",
     "A提取状态",
     "B提取状态",
+    "对比结论",
+    "对比备注",
+    "A错误标签",
+    "B错误标签",
+]
+_LEGACY_COMPARISON_COLUMNS = [
     "A Judge状态",
     "B Judge状态",
     "A总分",
@@ -34,14 +40,22 @@ _COMPARISON_COLUMNS = [
     "B-A",
     "A维度得分",
     "B维度得分",
-    "对比结论",
-    "对比备注",
-    "A错误标签",
-    "B错误标签",
     "A评语",
     "B评语",
     "A规则引用",
     "B规则引用",
+]
+_DIRECT_COMPARISON_COLUMNS = [
+    "对比调用状态",
+    "对比模型",
+    "对比置信度",
+    "规则引用",
+    "证据引用",
+    "A相对问题",
+    "B相对问题",
+    "A相对优点",
+    "B相对优点",
+    "对比调用错误",
 ]
 _EXCEL_CELL_LIMIT = 32_767
 
@@ -57,7 +71,14 @@ def _excel_safe(value: Any) -> Any:
 
 
 def _dataframe(rows: list[dict[str, Any]], *, include_reasoning: bool) -> pd.DataFrame:
-    columns = _BASE_COLUMNS + (_REASONING_COLUMNS if include_reasoning else []) + _COMPARISON_COLUMNS
+    direct_mode = any(str(row.get("对比调用状态") or "").strip() for row in rows)
+    mode_columns = _DIRECT_COMPARISON_COLUMNS if direct_mode else _LEGACY_COMPARISON_COLUMNS
+    columns = (
+        _BASE_COLUMNS
+        + (_REASONING_COLUMNS if include_reasoning else [])
+        + _COMMON_COMPARISON_COLUMNS
+        + mode_columns
+    )
     safe_rows = [
         {column: _excel_safe(row.get(column, "")) for column in columns}
         for row in rows
@@ -74,7 +95,7 @@ def _column_width(header: str) -> int:
         return 42
     if "提取结果" in header or "reasoning" in header:
         return 68
-    if "评语" in header or "备注" in header or "规则引用" in header:
+    if "评语" in header or "备注" in header or "规则引用" in header or "证据引用" in header or "相对" in header:
         return 48
     if "维度得分" in header or "错误标签" in header:
         return 34
@@ -127,6 +148,13 @@ def _style_diff_sheet(worksheet) -> None:
         "B评语",
         "A规则引用",
         "B规则引用",
+        "规则引用",
+        "证据引用",
+        "A相对问题",
+        "B相对问题",
+        "A相对优点",
+        "B相对优点",
+        "对比调用错误",
     }
     for header in wrapped_headers:
         column = header_by_name.get(header)
@@ -170,6 +198,7 @@ def _style_diff_sheet(worksheet) -> None:
             "B较优": PatternFill("solid", fgColor="E2F0D9"),
             "输出相同": same_fill,
             "基本持平": same_fill,
+            "双方均漏抽": same_fill,
             "不可比较": PatternFill("solid", fgColor="FCE4D6"),
         }
         for row_index in range(2, worksheet.max_row + 1):

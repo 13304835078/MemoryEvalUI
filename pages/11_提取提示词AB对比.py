@@ -55,6 +55,8 @@ TASK_LABELS = {
 }
 BASELINE_RULE = "使用 A 作为冻结规则（推荐）"
 INDEPENDENT_RULE = "选择独立规则版本"
+EXTRACT_MODE = "重新提取"
+EXISTING_MODE = "使用已有提取结果"
 
 
 def _combined_prompt(create_text: str, update_text: str) -> str:
@@ -202,39 +204,60 @@ def _render_report(job_id: str, state: dict) -> None:
     else:
         st.info(f"**{recommendation}**：{reason}")
 
+    direct_mode = report.get("comparison_mode") == "direct_pairwise_v1"
     model_roles = report.get("model_roles") if isinstance(report.get("model_roles"), dict) else {}
     if model_roles:
-        st.caption(
-            f"提取模型：{model_roles.get('extraction_model') or '-'} ｜ "
-            f"绝对评测模型：{model_roles.get('evaluation_model') or '-'} ｜ "
-            f"对比总结模型：{model_roles.get('comparison_model') or '未启用'}"
-        )
+        if direct_mode:
+            st.caption(
+                f"A 提取模型：{model_roles.get('extraction_model_a') or '-'} ｜ "
+                f"B 提取模型：{model_roles.get('extraction_model_b') or '-'} ｜ "
+                f"直接对比模型：{model_roles.get('direct_comparison_model') or '-'}"
+            )
+            if report.get("comparison_scope") == "提取提示词与提取模型联合对比":
+                st.info("A/B 使用了不同提取模型，因此结论反映“提示词 + 模型”组合差异，不能只归因于提示词。")
+        else:
+            st.caption(
+                f"提取模型：{model_roles.get('extraction_model') or '-'} ｜ "
+                f"绝对评测模型：{model_roles.get('evaluation_model') or '-'} ｜ "
+                f"对比总结模型：{model_roles.get('comparison_model') or '未启用'}"
+            )
 
     quality_a = report.get("quality_a") or {}
     quality_b = report.get("quality_b") or {}
     c1, c2, c3 = st.columns(3)
-    c1.metric(
-        "条件平均分",
-        f"A {float(quality_a.get('conditional_avg_score') or 0):.3f}",
-        delta=f"B-A {float(quality_b.get('conditional_avg_score') or 0) - float(quality_a.get('conditional_avg_score') or 0):+.3f}",
-    )
-    c2.metric(
-        "端到端分数",
-        f"A {float(quality_a.get('end_to_end_score') or 0):.3f}",
-        delta=f"B-A {float(quality_b.get('end_to_end_score') or 0) - float(quality_a.get('end_to_end_score') or 0):+.3f}",
-    )
-    c3.metric(
-        "提取覆盖率",
-        f"A {float(quality_a.get('extraction_coverage') or 0):.1%}",
-        delta=f"B-A {float(quality_b.get('extraction_coverage') or 0) - float(quality_a.get('extraction_coverage') or 0):+.1%}",
-    )
+    if direct_mode:
+        c1.metric("A 提取覆盖率", f"{float(quality_a.get('extraction_coverage') or 0):.1%}")
+        c2.metric("B 提取覆盖率", f"{float(quality_b.get('extraction_coverage') or 0):.1%}")
+        c3.metric(
+            "覆盖率 B-A",
+            f"{float(quality_b.get('extraction_coverage') or 0) - float(quality_a.get('extraction_coverage') or 0):+.1%}",
+        )
+    else:
+        c1.metric(
+            "条件平均分",
+            f"A {float(quality_a.get('conditional_avg_score') or 0):.3f}",
+            delta=f"B-A {float(quality_b.get('conditional_avg_score') or 0) - float(quality_a.get('conditional_avg_score') or 0):+.3f}",
+        )
+        c2.metric(
+            "端到端分数",
+            f"A {float(quality_a.get('end_to_end_score') or 0):.3f}",
+            delta=f"B-A {float(quality_b.get('end_to_end_score') or 0) - float(quality_a.get('end_to_end_score') or 0):+.3f}",
+        )
+        c3.metric(
+            "提取覆盖率",
+            f"A {float(quality_a.get('extraction_coverage') or 0):.1%}",
+            delta=f"B-A {float(quality_b.get('extraction_coverage') or 0) - float(quality_a.get('extraction_coverage') or 0):+.1%}",
+        )
 
     gate = report.get("validation_gate") or {}
     confidence = gate.get("confidence_interval") or {}
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("成功配对", int(gate.get("paired_case_count") or 0))
     c2.metric("独立评测人/时序簇", int(gate.get("paired_cluster_count") or 0))
-    c3.metric("配对平均差 B-A", f"{float(gate.get('paired_score_delta') or 0):+.3f}")
+    c3.metric(
+        "配对偏好净值" if direct_mode else "配对平均差 B-A",
+        f"{float((gate.get('paired_preference_delta') or 0) if direct_mode else (gate.get('paired_score_delta') or 0)):+.3f}",
+    )
     lower = confidence.get("lower")
     upper = confidence.get("upper")
     c4.metric(
@@ -242,14 +265,32 @@ def _render_report(job_id: str, state: dict) -> None:
         "证据不足" if lower is None or upper is None else f"[{float(lower):+.3f}, {float(upper):+.3f}]",
     )
     identical_count = int(report.get("identical_output_count") or 0)
-    judge_disagreement_count = int(report.get("judge_disagreement_on_identical_output_count") or 0)
     if identical_count:
+        if direct_mode:
+            st.caption(f"A/B 提取正文相同 {identical_count} 条，已直接判为持平，不调用模型。")
+        else:
+            judge_disagreement_count = int(report.get("judge_disagreement_on_identical_output_count") or 0)
+            st.caption(
+                f"A/B 提取正文相同 {identical_count} 条，其中 Judge 打分或标签不一致 {judge_disagreement_count} 条；"
+                "这些差异按裁判波动处理，不归因于提示词优劣。"
+            )
+    if direct_mode:
         st.caption(
-            f"A/B 提取正文相同 {identical_count} 条，其中 Judge 打分或标签不一致 {judge_disagreement_count} 条；"
-            "这些差异按裁判波动处理，不归因于提示词优劣。"
+            "正文不同的同源 chunk 只调用一次对比模型；单边真实漏抽按覆盖差异处理；"
+            "提取/API/JSON 失败单独统计，不视为 A 或 B 得 0 分。偏好净值范围为 -1 到 +1。"
         )
-    st.caption("条件平均分只看 Judge 成功样本；端到端分数会把成功调用但未提取出正文的漏抽计入质量损失；API/网络/JSON 解析失败均单独统计，不按 0 分处理。")
-    _render_model_comparison(report)
+        excluded = sum(
+            int(gate.get(key) or 0)
+            for key in ("comparison_failures", "infrastructure_failures", "source_mismatches")
+        )
+        if excluded:
+            st.warning(
+                f"本次有 {excluded} 个 chunk 因对比调用失败、提取运行失败或源数据不一致而未进入胜负统计，"
+                "请在逐样本表中查看具体状态。"
+            )
+    else:
+        st.caption("条件平均分只看 Judge 成功样本；端到端分数会把成功调用但未提取出正文的漏抽计入质量损失；API/网络/JSON 解析失败均单独统计，不按 0 分处理。")
+        _render_model_comparison(report)
 
     winner_counts = report.get("winner_counts") or {}
     if winner_counts:
@@ -277,36 +318,59 @@ def _render_report(job_id: str, state: dict) -> None:
     rows = report.get("rows") or []
     if rows:
         st.markdown("**逐样本对比备注**")
-        table = pd.DataFrame(rows).rename(
-            columns={
-                "reviewer": "评测人",
-                "session_id": "session",
-                "chunk_index": "chunk",
-                "extraction_a": "A 提取状态",
-                "extraction_b": "B 提取状态",
-                "judge_status_a": "A Judge 状态",
-                "judge_status_b": "B Judge 状态",
-                "score_a": "A 得分",
-                "score_b": "B 得分",
-                "score_delta_b_minus_a": "B-A",
-                "comparison": "对比结论",
-                "comparison_note": "对比备注",
-                "error_tags_a": "A 错误标签",
-                "error_tags_b": "B 错误标签",
-                "comment_a": "A 评语",
-                "comment_b": "B 评语",
-                "old_memory_a": "A 侧旧记忆",
-                "old_memory_b": "B 侧旧记忆",
-                "candidate_output_a": "A 提取正文",
-                "candidate_output_b": "B 提取正文",
-            }
-        )
-        preview_columns = [
-            "评测人", "session", "chunk", "A 提取状态", "B 提取状态",
-            "A 得分", "B 得分", "B-A", "对比结论", "对比备注",
-        ]
+        rename_columns = {
+            "reviewer": "评测人",
+            "session_id": "session",
+            "chunk_index": "chunk",
+            "extraction_a": "A 提取状态",
+            "extraction_b": "B 提取状态",
+            "comparison": "对比结论",
+            "comparison_note": "对比备注",
+            "error_tags_a": "A 错误标签",
+            "error_tags_b": "B 错误标签",
+            "old_memory_a": "A 侧旧记忆",
+            "old_memory_b": "B 侧旧记忆",
+            "candidate_output_a": "A 提取正文",
+            "candidate_output_b": "B 提取正文",
+        }
+        if direct_mode:
+            rename_columns.update(
+                {
+                    "pairwise_status": "对比调用状态",
+                    "pairwise_model": "对比模型",
+                    "pairwise_confidence": "对比置信度",
+                    "rule_refs": "规则引用",
+                    "evidence_refs": "证据引用",
+                    "issues_a": "A 相对问题",
+                    "issues_b": "B 相对问题",
+                    "strengths_a": "A 相对优点",
+                    "strengths_b": "B 相对优点",
+                    "comparison_error": "对比调用错误",
+                }
+            )
+            preview_columns = [
+                "评测人", "session", "chunk", "A 提取状态", "B 提取状态",
+                "对比调用状态", "对比置信度", "对比结论", "对比备注",
+            ]
+        else:
+            rename_columns.update(
+                {
+                    "judge_status_a": "A Judge 状态",
+                    "judge_status_b": "B Judge 状态",
+                    "score_a": "A 得分",
+                    "score_b": "B 得分",
+                    "score_delta_b_minus_a": "B-A",
+                    "comment_a": "A 评语",
+                    "comment_b": "B 评语",
+                }
+            )
+            preview_columns = [
+                "评测人", "session", "chunk", "A 提取状态", "B 提取状态",
+                "A 得分", "B 得分", "B-A", "对比结论", "对比备注",
+            ]
+        table = pd.DataFrame(rows).rename(columns=rename_columns)
         st.dataframe(table[[column for column in preview_columns if column in table]], width="stretch", hide_index=True)
-        with st.expander("查看完整 Judge 评语、错误标签与规则引用", expanded=False):
+        with st.expander("查看完整对比依据、错误标签与正文", expanded=False):
             st.dataframe(table, width="stretch", hide_index=True)
 
     duplicate_keys = report.get("duplicate_source_keys") or []
@@ -367,7 +431,12 @@ def _render_report(job_id: str, state: dict) -> None:
     )
 
     st.markdown("**继续改进提示词**")
-    st.caption("下面只会把对应版本的评测结果送入提示词改进页面生成候选版本，不会覆盖当前提示词文件。通常应选择表现较弱或仍有明确错误的版本。")
+    st.caption(
+        "下面只会把对应版本在直接对比中暴露的问题转换为提示词改进证据，不会覆盖当前提示词文件。"
+        "这些证据是相对比较结论，不是独立绝对评分。"
+        if direct_mode
+        else "下面只会把对应版本的评测结果送入提示词改进页面生成候选版本，不会覆盖当前提示词文件。通常应选择表现较弱或仍有明确错误的版本。"
+    )
     c1, c2 = st.columns(2)
     if c1.button("基于 A 的问题生成改进建议", width="stretch", key=f"{job_id}_advise_a"):
         _handoff_to_advisor(job_id, "A", state)
@@ -420,7 +489,7 @@ def _render_job_state_auto(job_id: str) -> None:
 
 render_page_header(
     "提取提示词 A/B 对比",
-    "在同一原始数据与冻结评测标准下，比较两个提取提示词版本的覆盖率、质量和逐样本差异。",
+    "复用已有提取结果或重新提取，并按同源 chunk 直接比较两个版本。",
     category="优化实验",
 )
 
@@ -430,21 +499,57 @@ if "ui_config" not in st.session_state:
 with st.expander("使用说明", expanded=False):
     st.markdown(
         """
-1. A 是当前基线版本，B 是候选版本；两侧共用原始 Excel 和同一个提取模型，实验变量仍只有提取提示词。
-2. 冻结评测规则不会随 B 改变，避免候选提示词通过改变规则来证明自己更好。
-3. 系统按评测人、session、chunk 和原始行范围配对；漏抽会单独显示，不会造成后续 case 错位。
-4. 只有覆盖率、退化率、关键错误和统计置信度同时达标时才建议替换 A。
-5. 提取模型、绝对评测模型和对比总结模型可以分别指定；对比模型只补充说明，不覆盖统计结论。
-6. 比较完成后可以把任一版本的问题样本送入“提示词改进”，但候选版本仍需另存和复验。
+1. A、B 可分别选择重新提取或载入已有提取 Excel；只有一侧已有结果时，只调用另一侧提取。
+2. 若需要重新提取，可上传原始对话 Excel；只提供一侧已有结果时，也可直接用该文件中的原始对话列提取另一侧。
+3. A、B 可使用不同提取模型。模型不同时，结论代表“提示词 + 模型”组合差异，不能只归因于提示词。
+4. 系统按评测人、session、chunk 和原始行范围配对；正文相同自动持平，单边真实漏抽按覆盖差异处理。
+5. 正文不同的 chunk 只调用一次直接对比模型，不再对 A、B 分别做绝对评分；运行失败不按 0 分处理。
+6. 冻结规则、配对胜负率和聚类置信区间共同决定版本建议；候选提示词仍需另存并复验。
         """.strip()
     )
 
-st.subheader("1. 选择原始数据")
+st.subheader("1. 选择两侧结果来源")
 c1, c2 = st.columns(2)
 with c1:
-    uploaded = st.file_uploader("上传原始对话 Excel", type=["xlsx", "xls"], key="extract_ab_upload")
+    side_a_mode_label = st.radio("A 侧来源", [EXTRACT_MODE, EXISTING_MODE], horizontal=True)
 with c2:
-    local_excel_path = st.text_input("或填写本地 Excel 路径", key="extract_ab_local_path")
+    side_b_mode_label = st.radio("B 侧来源", [EXTRACT_MODE, EXISTING_MODE], horizontal=True)
+
+with st.expander("原始对话 Excel（存在重新提取的一侧时使用）", expanded=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        uploaded = st.file_uploader("上传原始对话 Excel（可选）", type=["xlsx", "xls"], key="extract_ab_upload")
+    with c2:
+        local_excel_path = st.text_input("或填写原始 Excel 本地路径", key="extract_ab_local_path")
+    st.caption("只重提一侧且未提供原始 Excel 时，系统会从另一侧已有结果中的轮次、query、answer、评测人列读取源数据。")
+
+c1, c2 = st.columns(2)
+with c1:
+    st.markdown("**A 侧已有结果**")
+    existing_a_upload = st.file_uploader(
+        "上传 A 提取结果 Excel",
+        type=["xlsx", "xls"],
+        key="extract_ab_existing_a_upload",
+        disabled=side_a_mode_label != EXISTING_MODE,
+    )
+    existing_a_local = st.text_input(
+        "或填写 A 结果本地路径",
+        key="extract_ab_existing_a_local",
+        disabled=side_a_mode_label != EXISTING_MODE,
+    )
+with c2:
+    st.markdown("**B 侧已有结果**")
+    existing_b_upload = st.file_uploader(
+        "上传 B 提取结果 Excel",
+        type=["xlsx", "xls"],
+        key="extract_ab_existing_b_upload",
+        disabled=side_b_mode_label != EXISTING_MODE,
+    )
+    existing_b_local = st.text_input(
+        "或填写 B 结果本地路径",
+        key="extract_ab_existing_b_local",
+        disabled=side_b_mode_label != EXISTING_MODE,
+    )
 c1, c2, c3 = st.columns(3)
 with c1:
     sheet_name_raw = st.text_input("工作表名称或序号", value="0")
@@ -453,7 +558,7 @@ with c2:
 with c3:
     chunk_size = st.number_input("每个 chunk 行数", min_value=1, max_value=200, value=10, step=1)
 
-st.subheader("2. 固定变量并选择 A/B")
+st.subheader("2. 选择 A/B 版本与冻结对比规则")
 task_type = st.selectbox(
     "任务类型",
     list(TASK_LABELS),
@@ -489,9 +594,10 @@ else:
     rule_file = st.selectbox("独立规则提示词版本", rule_candidates)
 rule_create, rule_update, evaluation_rule_text = _load_templates(rule_file)
 
-default_judge = get_default_prompt_file(task_type)
+pairwise_defaults = [item for item in judge_files if Path(item).name == "judge_extraction_pairwise_v1.md"]
+default_judge = pairwise_defaults[0] if pairwise_defaults else get_default_prompt_file(task_type)
 judge_prompt_file = st.selectbox(
-    "共同裁判提示词",
+    "直接对比裁判提示词",
     judge_files,
     index=judge_files.index(default_judge) if default_judge in judge_files else 0,
 )
@@ -504,12 +610,12 @@ if rule_mode == BASELINE_RULE:
 else:
     st.caption("当前使用独立规则版本共同评测 A/B，适合团队已有稳定规范的场景。")
 
-with st.expander("查看 A、B、冻结规则与裁判提示词全文", expanded=False):
-    tab_a, tab_b, tab_rule, tab_judge = st.tabs(["提取 A", "提取 B", "冻结规则", "裁判提示词"])
+with st.expander("查看 A、B、冻结规则与对比裁判提示词全文", expanded=False):
+    tab_a, tab_b, tab_rule, tab_judge = st.tabs(["提取 A", "提取 B", "冻结规则", "直接对比裁判"])
     tab_a.text_area("提取 A 全文", prompt_a_full, height=320, disabled=True)
     tab_b.text_area("提取 B 全文", prompt_b_full, height=320, disabled=True)
     tab_rule.text_area("冻结规则全文", evaluation_rule_text, height=320, disabled=True)
-    tab_judge.text_area("裁判提示词全文", judge_prompt_text, height=320, disabled=True)
+    tab_judge.text_area("直接对比裁判提示词全文", judge_prompt_text, height=320, disabled=True)
 
 st.subheader("3. 运行配置")
 cfg = dict(st.session_state.ui_config)
@@ -518,23 +624,18 @@ default_model = str(cfg.get("judge_model") or "") or ("mock-model" if mock else 
 st.markdown("**模型角色**")
 c1, c2, c3 = st.columns(3)
 with c1:
-    extraction_model = st.text_input("提取模型名称", value=default_model)
-    st.caption("仅负责使用 A/B 提示词生成 USER.md 或 MEMORY.md。")
+    extraction_model_a = st.text_input("A 提取模型名称", value=default_model)
+    st.caption("重新提取时实际调用；载入已有结果时用于记录来源。")
 with c2:
-    judge_model = st.text_input("绝对评测模型名称", value=default_model)
-    st.caption("使用冻结规则分别评价 A/B，不直接判定胜负。")
+    extraction_model_b = st.text_input("B 提取模型名称", value=default_model)
+    st.caption("可与 A 不同；不同时结论是提示词与模型的联合差异。")
 with c3:
-    comparison_enabled = st.checkbox("启用独立对比总结模型", value=True)
-    comparison_model = st.text_input(
-        "对比总结模型名称",
-        value=default_model,
-        disabled=not comparison_enabled,
-    )
-    st.caption("综合统计量与代表性差异，生成辅助说明和修改方向。")
-st.caption("三个角色默认共用配置页中的 API 地址和令牌，但模型型号与调用参数彼此独立。")
+    comparison_model = st.text_input("直接对比模型名称", value=default_model)
+    st.caption("每个有真实正文差异的同源 chunk 只调用一次。")
+st.caption("三个角色默认共用配置页中的 API 地址和令牌；A/B 提取只独立选择模型名称。")
 
 with st.expander("各阶段调用参数", expanded=True):
-    extraction_tab, judge_tab, comparison_tab = st.tabs(["提取", "绝对评测", "最终对比"])
+    extraction_tab, comparison_tab = st.tabs(["A/B 提取", "直接对比"])
     with extraction_tab:
         c1, c2, c3 = st.columns(3)
         extraction_max_tokens = c1.number_input(
@@ -577,48 +678,6 @@ with st.expander("各阶段调用参数", expanded=True):
             "提取启用 thinking",
             value=bool(cfg.get("judge_enable_thinking", False)),
         )
-    with judge_tab:
-        c1, c2, c3 = st.columns(3)
-        judge_max_tokens = c1.number_input(
-            "评测最大 tokens",
-            min_value=500,
-            max_value=100000,
-            value=int(cfg.get("judge_max_tokens") or 2000),
-            step=500,
-        )
-        judge_concurrency = c2.number_input(
-            "评测并发",
-            min_value=1,
-            max_value=100,
-            value=min(100, max(1, int(cfg.get("judge_concurrency") or 1))),
-            step=1,
-        )
-        judge_timeout = c3.number_input(
-            "评测超时（秒）",
-            min_value=10,
-            max_value=1800,
-            value=int(cfg.get("judge_timeout") or 120),
-            step=10,
-        )
-        c1, c2, c3 = st.columns(3)
-        judge_attempts = c1.number_input(
-            "评测最大尝试次数（含首次）",
-            min_value=1,
-            max_value=10,
-            value=int(cfg.get("judge_max_retries") or 3),
-            step=1,
-        )
-        judge_interval = c2.number_input(
-            "评测请求间隔（秒）",
-            min_value=0.0,
-            max_value=300.0,
-            value=float(cfg.get("judge_request_interval") or 0.0),
-            step=0.5,
-        )
-        judge_enable_thinking = c3.checkbox(
-            "评测启用 thinking",
-            value=bool(cfg.get("judge_enable_thinking", False)),
-        )
     with comparison_tab:
         c1, c2, c3 = st.columns(3)
         comparison_max_tokens = c1.number_input(
@@ -627,7 +686,6 @@ with st.expander("各阶段调用参数", expanded=True):
             max_value=20000,
             value=min(20000, max(500, int(cfg.get("judge_max_tokens") or 2000))),
             step=500,
-            disabled=not comparison_enabled,
         )
         comparison_timeout = c2.number_input(
             "对比超时（秒）",
@@ -635,7 +693,6 @@ with st.expander("各阶段调用参数", expanded=True):
             max_value=1800,
             value=int(cfg.get("judge_timeout") or 120),
             step=10,
-            disabled=not comparison_enabled,
         )
         comparison_attempts = c3.number_input(
             "对比最大尝试次数（含首次）",
@@ -643,7 +700,6 @@ with st.expander("各阶段调用参数", expanded=True):
             max_value=10,
             value=int(cfg.get("judge_max_retries") or 3),
             step=1,
-            disabled=not comparison_enabled,
         )
         c1, c2, c3 = st.columns(3)
         comparison_interval = c1.number_input(
@@ -652,115 +708,169 @@ with st.expander("各阶段调用参数", expanded=True):
             max_value=300.0,
             value=float(cfg.get("judge_request_interval") or 0.0),
             step=0.5,
-            disabled=not comparison_enabled,
         )
-        comparison_max_evidence = c2.number_input(
-            "代表性差异上限",
+        comparison_concurrency = c2.number_input(
+            "对比并发",
             min_value=1,
-            max_value=30,
-            value=8,
+            max_value=100,
+            value=min(100, max(1, int(cfg.get("judge_concurrency") or 1))),
             step=1,
-            disabled=not comparison_enabled,
-            help="只把最有区分度的样本交给对比模型，控制上下文长度。",
         )
         comparison_enable_thinking = c3.checkbox(
             "对比启用 thinking",
             value=False,
-            disabled=not comparison_enabled,
         )
 
 with st.expander("版本选择门槛", expanded=False):
-    st.caption("这些门槛只决定是否给出“建议选择 B”，不会修改任何提示词。小样本时系统通常会返回“证据不足”。")
+    st.caption("偏好净值按 B 胜=+1、A 胜=-1、持平=0 计算；这些门槛只决定版本建议，不会修改提示词。")
     c1, c2, c3 = st.columns(3)
-    min_score_delta = c1.number_input("最小配对平均提升", min_value=0.0, max_value=2.0, value=0.03, step=0.01)
-    max_regression_rate = c2.number_input("最大单样本退化率", min_value=0.0, max_value=1.0, value=0.10, step=0.01)
-    score_tolerance = c3.number_input("单样本持平容差", min_value=0.0, max_value=1.0, value=0.05, step=0.01)
+    min_score_delta = c1.number_input("最小配对偏好净值", min_value=0.0, max_value=1.0, value=0.03, step=0.01)
+    max_regression_rate = c2.number_input("最大 B 配对败率", min_value=0.0, max_value=1.0, value=0.10, step=0.01)
+    max_coverage_drop = c3.number_input("最大 B 覆盖率下降", min_value=0.0, max_value=1.0, value=0.005, step=0.005, format="%.3f")
     c1, c2, c3 = st.columns(3)
     min_paired_cases = c1.number_input("最少配对 case", min_value=1, max_value=10000, value=8, step=1)
     min_paired_clusters = c2.number_input("最少独立评测人/时序簇", min_value=1, max_value=1000, value=2, step=1)
     confidence_level = c3.selectbox("置信水平", [0.90, 0.95, 0.99], index=1, format_func=lambda value: f"{value:.0%}")
 
-judge_cfg = dict(cfg)
-judge_cfg["judge_model"] = judge_model.strip()
-judge_cfg["judge_max_tokens"] = int(judge_max_tokens)
-judge_cfg["judge_timeout"] = int(judge_timeout)
-judge_cfg["judge_max_retries"] = int(judge_attempts)
-judge_cfg["judge_concurrency"] = int(judge_concurrency)
-judge_cfg["judge_request_interval"] = float(judge_interval)
-judge_cfg["judge_enable_thinking"] = bool(judge_enable_thinking)
-judge_config = build_eval_config(judge_cfg, mock=mock)
-extraction_base_config = build_eval_config({**cfg, "judge_model": extraction_model}, mock=mock)
+extraction_base_config_a = build_eval_config(
+    {**cfg, "judge_model": extraction_model_a.strip()},
+    mock=mock,
+)
+extraction_base_config_b = build_eval_config(
+    {**cfg, "judge_model": extraction_model_b.strip()},
+    mock=mock,
+)
 comparison_cfg = dict(cfg)
 comparison_cfg["judge_model"] = comparison_model.strip()
 comparison_cfg["judge_max_tokens"] = int(comparison_max_tokens)
 comparison_cfg["judge_timeout"] = int(comparison_timeout)
 comparison_cfg["judge_max_retries"] = int(comparison_attempts)
+comparison_cfg["judge_concurrency"] = int(comparison_concurrency)
 comparison_cfg["judge_request_interval"] = float(comparison_interval)
 comparison_cfg["judge_enable_thinking"] = bool(comparison_enable_thinking)
 comparison_cfg["judge_prompt_cache_id"] = ""
 comparison_cfg["judge_prompt_cache_location"] = "none"
 comparison_config = build_eval_config(comparison_cfg, mock=mock)
+judge_config = comparison_config
 
 local_input = Path(local_excel_path.strip().strip('"')) if local_excel_path.strip() else None
-input_ready = uploaded is not None or bool(local_input and local_input.is_file())
+local_existing_a = Path(existing_a_local.strip().strip('"')) if existing_a_local.strip() else None
+local_existing_b = Path(existing_b_local.strip().strip('"')) if existing_b_local.strip() else None
+raw_input_ready = uploaded is not None or bool(local_input and local_input.is_file())
+existing_a_ready = existing_a_upload is not None or bool(local_existing_a and local_existing_a.is_file())
+existing_b_ready = existing_b_upload is not None or bool(local_existing_b and local_existing_b.is_file())
+side_a_mode = "existing" if side_a_mode_label == EXISTING_MODE else "extract"
+side_b_mode = "existing" if side_b_mode_label == EXISTING_MODE else "extract"
+single_existing_fallback = (
+    side_a_mode == "extract" and side_b_mode == "existing" and existing_b_ready
+) or (
+    side_b_mode == "extract" and side_a_mode == "existing" and existing_a_ready
+)
+source_ready = (
+    True
+    if side_a_mode == side_b_mode == "existing"
+    else raw_input_ready or single_existing_fallback
+)
 checks = [
-    PreflightCheck("input", "原始 Excel", PASS if input_ready else ERROR, "已选择输入。" if input_ready else "请上传 Excel 或填写存在的本地路径。"),
+    PreflightCheck(
+        "input",
+        "重新提取所需源数据",
+        PASS if source_ready else ERROR,
+        "源数据已就绪。" if source_ready else "请上传原始 Excel；若只重提一侧，也可提供另一侧已有结果。",
+    ),
+    PreflightCheck(
+        "existing_a",
+        "A 侧结果来源",
+        PASS if side_a_mode == "extract" or existing_a_ready else ERROR,
+        "将重新提取。" if side_a_mode == "extract" else ("已有结果已选择。" if existing_a_ready else "请上传或填写 A 结果文件。"),
+    ),
+    PreflightCheck(
+        "existing_b",
+        "B 侧结果来源",
+        PASS if side_b_mode == "extract" or existing_b_ready else ERROR,
+        "将重新提取。" if side_b_mode == "extract" else ("已有结果已选择。" if existing_b_ready else "请上传或填写 B 结果文件。"),
+    ),
     PreflightCheck("prompt_a", "提取提示词 A", PASS if prompt_a_full.strip() else ERROR, f"版本：{infer_prompt_version(prompt_a_file)}"),
     PreflightCheck("prompt_b", "提取提示词 B", PASS if prompt_b_full.strip() else ERROR, f"版本：{infer_prompt_version(prompt_b_file)}"),
     PreflightCheck(
         "prompt_difference",
-        "A/B 变量唯一且有差异",
+        "A/B 提取提示词有差异",
         PASS if prompt_text_hash(prompt_a_full) != prompt_text_hash(prompt_b_full) else ERROR,
-        "A/B 只改变提取提示词内容。" if prompt_text_hash(prompt_a_full) != prompt_text_hash(prompt_b_full) else "A/B 提示词内容相同。",
+        "提示词内容不同。" if prompt_text_hash(prompt_a_full) != prompt_text_hash(prompt_b_full) else "A/B 提示词内容相同。",
     ),
     PreflightCheck("frozen_rule", "冻结评测规则", PASS if evaluation_rule_text.strip() else ERROR, f"版本：{infer_prompt_version(rule_file)}"),
-    PreflightCheck("judge_prompt", "共同裁判提示词", PASS if judge_prompt_text.strip() else ERROR, f"版本：{infer_prompt_version(judge_prompt_file)}"),
+    PreflightCheck("judge_prompt", "直接对比裁判提示词", PASS if judge_prompt_text.strip() else ERROR, f"版本：{infer_prompt_version(judge_prompt_file)}"),
     PreflightCheck(
         "model_roles",
         "三个模型角色",
         PASS
-        if extraction_model.strip() and judge_model.strip() and (
-            comparison_model.strip() or not comparison_enabled
-        )
+        if extraction_model_a.strip() and extraction_model_b.strip() and comparison_model.strip()
         else ERROR,
         (
-            f"提取：{extraction_model.strip()}；评测：{judge_model.strip()}；"
-            f"对比：{comparison_model.strip() if comparison_enabled else '未启用'}"
+            f"A 提取：{extraction_model_a.strip()}；B 提取：{extraction_model_b.strip()}；"
+            f"直接对比：{comparison_model.strip()}"
         ),
     ),
 ]
-api_errors = judge_config.validate()
-if not mock and not extraction_model.strip():
-    api_errors.append("提取模型名称为空")
-if comparison_enabled:
-    api_errors.extend(f"对比模型：{item}" for item in comparison_config.validate())
+api_errors = [f"直接对比模型：{item}" for item in comparison_config.validate()]
+if not extraction_model_a.strip():
+    api_errors.append("A 提取模型名称为空")
+if not extraction_model_b.strip():
+    api_errors.append("B 提取模型名称为空")
 checks.append(PreflightCheck("api", "模型与接口", PASS if not api_errors else ERROR, "配置完整。" if not api_errors else "；".join(api_errors)))
-qps_risk = not mock and (int(extraction_concurrency) > 1 or int(judge_concurrency) > 1) and min(float(extraction_interval), float(judge_interval)) < 10
+qps_risk = not mock and (int(extraction_concurrency) > 1 or int(comparison_concurrency) > 1) and min(float(extraction_interval), float(comparison_interval)) < 10
 checks.append(PreflightCheck(
     "rate_limit",
     "限流设置",
     WARNING if qps_risk else PASS,
-    "并发大于 1 且请求间隔较短，低 QPS 接口可能限流。" if qps_risk else "提取、评测与最终对比请求会共用全局限流器。",
+    "并发大于 1 且请求间隔较短，低 QPS 接口可能限流。" if qps_risk else "提取和直接对比请求会共用全局限流器。",
 ))
 preflight_ready = render_preflight(checks)
 
 if st.button("开始提取提示词 A/B 实验", type="primary", width="stretch", disabled=not preflight_ready):
-    input_path = (
+    raw_input_path = (
         save_uploaded_file(uploaded, suffix=Path(uploaded.name).suffix)
         if uploaded is not None
-        else str(Path(local_excel_path.strip().strip('"')).resolve())
+        else str(local_input.resolve()) if local_input and local_input.is_file() else ""
     )
-    extraction_config = MemoryExtractionConfig.from_eval_config(
-        extraction_base_config,
-        model=extraction_model,
-        max_tokens=int(extraction_max_tokens),
-        request_interval=float(extraction_interval),
-        max_retries=max(0, int(extraction_attempts) - 1),
-        retry_sleep=float(cfg.get("judge_qps_backoff") or 12.0),
-        enable_thinking=bool(extraction_enable_thinking),
-        timeout=int(extraction_timeout),
+    existing_a_path = (
+        save_uploaded_file(existing_a_upload, suffix=Path(existing_a_upload.name).suffix)
+        if existing_a_upload is not None
+        else str(local_existing_a.resolve()) if local_existing_a and local_existing_a.is_file() else ""
     )
-    extraction_config.concurrency = int(extraction_concurrency)
+    existing_b_path = (
+        save_uploaded_file(existing_b_upload, suffix=Path(existing_b_upload.name).suffix)
+        if existing_b_upload is not None
+        else str(local_existing_b.resolve()) if local_existing_b and local_existing_b.is_file() else ""
+    )
+    input_path = raw_input_path
+    if not input_path and side_a_mode == "extract" and side_b_mode == "existing":
+        input_path = existing_b_path
+    if not input_path and side_b_mode == "extract" and side_a_mode == "existing":
+        input_path = existing_a_path
+
+    def build_extraction_config(base_config, model_name: str) -> MemoryExtractionConfig:
+        value = MemoryExtractionConfig.from_eval_config(
+            base_config,
+            model=model_name,
+            max_tokens=int(extraction_max_tokens),
+            request_interval=float(extraction_interval),
+            max_retries=max(0, int(extraction_attempts) - 1),
+            retry_sleep=float(cfg.get("judge_qps_backoff") or 12.0),
+            enable_thinking=bool(extraction_enable_thinking),
+            timeout=int(extraction_timeout),
+        )
+        value.concurrency = int(extraction_concurrency)
+        return value
+
+    extraction_config_a = build_extraction_config(
+        extraction_base_config_a,
+        extraction_model_a.strip(),
+    )
+    extraction_config_b = build_extraction_config(
+        extraction_base_config_b,
+        extraction_model_b.strip(),
+    )
     job_id = f"extract_prompt_ab_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     job_config = ExtractionPromptAbJobConfig(
         job_id=job_id,
@@ -786,16 +896,22 @@ if st.button("开始提取提示词 A/B 实验", type="primary", width="stretch"
         sheet_name=_resolve_sheet_name(sheet_name_raw),
         reviewer_filter=reviewer_filter.strip(),
         chunk_size=int(chunk_size),
-        score_tolerance=float(score_tolerance),
-        extraction_config=extraction_config,
+        score_tolerance=0.0,
+        extraction_config=extraction_config_a,
+        extraction_config_a=extraction_config_a,
+        extraction_config_b=extraction_config_b,
         eval_config=judge_config,
         comparison_config=comparison_config,
-        enable_model_comparison=bool(comparison_enabled),
-        comparison_max_evidence=int(comparison_max_evidence),
+        enable_model_comparison=True,
+        comparison_max_evidence=0,
+        side_a_mode=side_a_mode,
+        side_b_mode=side_b_mode,
+        existing_extraction_a_path=existing_a_path,
+        existing_extraction_b_path=existing_b_path,
         validation_config=ValidationGateConfig(
             min_score_delta=float(min_score_delta),
+            max_extraction_coverage_drop=float(max_coverage_drop),
             max_case_regression_rate=float(max_regression_rate),
-            score_regression_tolerance=float(score_tolerance),
             min_paired_cases=int(min_paired_cases),
             min_paired_clusters=int(min_paired_clusters),
             confidence_level=float(confidence_level),
