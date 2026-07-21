@@ -204,6 +204,9 @@ def _run_request(payload: dict[str, Any]) -> None:
         from src.ui.judge_ab_job_runner import JudgeAbJobConfig, run_judge_ab_job
 
         config_data["eval_config"] = _eval_config(dict(config_data.get("eval_config") or {}))
+        for side_key in ("eval_config_a", "eval_config_b"):
+            if config_data.get(side_key):
+                config_data[side_key] = _eval_config(dict(config_data.get(side_key) or {}))
         cases = [Case.from_dict(item) for item in payload.get("cases") or []]
         run_judge_ab_job(JudgeAbJobConfig(**config_data), cases)
         return

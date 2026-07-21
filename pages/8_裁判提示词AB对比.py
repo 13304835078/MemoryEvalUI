@@ -50,7 +50,7 @@ NO_EXTRACTION_PROMPT = "不使用提取规则辅助评测"
 
 render_page_header(
     "裁判提示词 A/B 对比",
-    "保持样本与裁判模型不变，仅比较两版裁判提示词的评分表现。",
+    "比较两版裁判提示词；需要时也可为 A/B 指定不同裁判模型并行运行。",
     category="优化实验",
 )
 
@@ -146,6 +146,11 @@ def render_judge_ab_job_state(job_id: str) -> None:
     c4.metric("更新时间", str(state.get("updated_at", ""))[:19])
     st.progress(progress)
     st.write(state.get("message", ""))
+    side_progress = state.get("side_progress") if isinstance(state.get("side_progress"), dict) else {}
+    if state.get("parallel_sides") and side_progress:
+        side_a, side_b = st.columns(2)
+        side_a.metric("A 已完成", f"{int(side_progress.get('A', 0) or 0)}/{total // 2}")
+        side_b.metric("B 已完成", f"{int(side_progress.get('B', 0) or 0)}/{total // 2}")
     if state.get("effective_request_interval") is not None:
         st.caption(
             f"实际请求启动间隔：{float(state.get('effective_request_interval') or 0):.1f}s"
@@ -203,10 +208,11 @@ def render_judge_ab_job_panel() -> str:
 with st.expander("使用说明", expanded=False):
     st.markdown(
         """
-这个页面用于比较两个裁判提示词，而不是比较两个被评测模型。
+这个页面用于比较两个裁判提示词，而不是比较 case 中的两个被评测模型。
 
-- 固定不变：case 文件、被评测模型输出、裁判模型、温度、top_p、并发、请求间隔、提取规则。
-- 唯一变化：裁判提示词 A 和裁判提示词 B。
+- 单变量模式：A/B 使用同一裁判模型，只改变裁判提示词，按顺序运行以降低限流风险。
+- 联合对比模式：A/B 使用不同裁判模型时可并行运行；结论同时包含提示词差异和裁判模型差异。
+- 两侧仍分别执行重试与落盘；相同接口和 Token 继续共用全局限流器。
 - 适合观察：分数分布、错误标签、fatal、diagnostics、comment 和规则引用是否更稳定、更清晰。
 - 如果接口提示 `QPS limit exceeded, limit:0.10`，建议请求间隔设为 10.5 秒以上，并发设为 1-2。
         """.strip()
@@ -326,36 +332,58 @@ st.subheader("3. 运行配置")
 cfg = dict(st.session_state.ui_config)
 render_run_preset_selector(cfg, key="judge_ab")
 mock = st.checkbox("模拟模式", value=bool(cfg.get("mock", False)))
+default_judge_model = str(cfg.get("judge_model") or "")
+model_col_a, model_col_b = st.columns(2)
+with model_col_a:
+    judge_model_a = st.text_input("A 裁判模型名称", value=default_judge_model)
+with model_col_b:
+    judge_model_b = st.text_input("B 裁判模型名称", value=default_judge_model)
+different_judge_models = bool(
+    judge_model_a.strip()
+    and judge_model_b.strip()
+    and judge_model_a.strip() != judge_model_b.strip()
+)
+parallel_different_models = st.checkbox(
+    "A/B 使用不同裁判模型时并行调用",
+    value=True,
+    disabled=not different_judge_models,
+    help="仅在模型名称不同且两侧都需要调用时生效。相同 API 地址和 Token 仍共用全局请求间隔。",
+)
 cfg["judge_concurrency"] = st.number_input(
-    "并发数",
+    "每侧并发数",
     min_value=1,
     max_value=100,
     value=min(100, max(1, int(cfg.get("judge_concurrency", 1) or 1))),
     step=1,
 )
 configured_interval = float(cfg.get("judge_request_interval", 0) or 0)
-if int(cfg["judge_concurrency"]) > 1 and configured_interval < 10:
+if (int(cfg["judge_concurrency"]) > 1 or (different_judge_models and parallel_different_models)) and configured_interval < 10:
     st.warning(
         "并发数较高且请求间隔小于 10 秒。如果接口限制是 `limit:0.10`，建议请求间隔设为 10.5 秒以上。"
         "未设置请求间隔时，本页会用“限流等待”作为保底启动间隔。"
     )
 
-with st.expander("当前共用裁判模型配置", expanded=False):
+with st.expander("当前裁判调用配置", expanded=False):
     st.write({
         "模拟模式": mock,
-        "裁判模型": cfg.get("judge_model", ""),
+        "A 裁判模型": judge_model_a.strip(),
+        "B 裁判模型": judge_model_b.strip(),
+        "两侧调度": "并行" if different_judge_models and parallel_different_models else "顺序",
         "温度": cfg.get("judge_temperature", 0),
         "top_p": cfg.get("judge_top_p", 1.0),
         "top_k": cfg.get("judge_top_k", None),
         "请求间隔": cfg.get("judge_request_interval", 0),
-        "并发数": cfg.get("judge_concurrency", 1),
+        "每侧并发数": cfg.get("judge_concurrency", 1),
+        "理论最大同时在途": int(cfg.get("judge_concurrency", 1)) * (2 if different_judge_models and parallel_different_models else 1),
         "限流退避": cfg.get("judge_qps_backoff", 12),
         "最大尝试（含首次）": cfg.get("judge_max_retries", 3),
         "提取提示词版本": extraction_prompt_version or "未使用",
         "提取提示词 Hash": extraction_prompt_hash[:12] if extraction_prompt_hash else "",
     })
 
-config = build_eval_config(cfg, mock=mock)
+config_a = build_eval_config({**cfg, "judge_model": judge_model_a.strip()}, mock=mock)
+config_b = build_eval_config({**cfg, "judge_model": judge_model_b.strip()}, mock=mock)
+config = config_a
 render_workspace_context(
     task_type=task_type,
     case_count=len(run_cases),
@@ -377,6 +405,21 @@ preflight_checks = build_ab_preflight(
     eval_config=config,
 )
 preflight_ready = render_preflight(preflight_checks)
+model_errors = []
+if not judge_model_a.strip():
+    model_errors.append("A 裁判模型名称为空")
+if not judge_model_b.strip():
+    model_errors.append("B 裁判模型名称为空")
+model_errors.extend(f"A：{item}" for item in config_a.validate())
+model_errors.extend(f"B：{item}" for item in config_b.validate())
+if model_errors:
+    st.error("；".join(dict.fromkeys(model_errors)))
+    preflight_ready = False
+elif different_judge_models:
+    st.info(
+        "当前是联合对比：裁判提示词和裁判模型同时变化。两侧会并行调度，"
+        "但同一接口和 Token 的请求仍按全局限流设置排队。"
+    )
 
 if st.button(
     "开始 A/B 对比",
@@ -395,7 +438,10 @@ if st.button(
         extraction_prompt_text=extraction_prompt_text,
         extraction_prompt_version=extraction_prompt_version,
         extraction_prompt_hash=extraction_prompt_hash,
-        eval_config=config,
+        eval_config=config_a,
+        eval_config_a=config_a,
+        eval_config_b=config_b,
+        parallel_different_models=bool(parallel_different_models),
     )
     launch_background_task("judge_ab", job_config, cases=run_cases)
     st.session_state.judge_ab_job_id = job_id

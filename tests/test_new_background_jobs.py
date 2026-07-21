@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import Barrier
 
 from src.schema import Case, DialogueTurn, EvalConfig, EvalResult, TaskType
 from src.ui import eval_job_runner, judge_ab_job_runner, prompt_advisor_job_runner
@@ -152,6 +153,45 @@ def test_judge_ab_background_job_completes_in_mock(tmp_path, monkeypatch):
     results_a, results_b = load_judge_ab_results("ab-1")
     assert len(results_a) == 2
     assert len(results_b) == 2
+
+
+def test_judge_ab_uses_parallel_sides_for_different_models(tmp_path, monkeypatch):
+    monkeypatch.setattr(judge_ab_job_runner, "JUDGE_AB_JOBS_DIR", tmp_path)
+    barrier = Barrier(2)
+    entered: list[str] = []
+
+    def fake_evaluate_prompt(*, label, cases, eval_config, **_kwargs):
+        entered.append(label)
+        barrier.wait(timeout=2)
+        result = EvalResult(
+            case_id=cases[0].case_id,
+            task_type=TaskType.USER_MD.value,
+            score_total=5.0,
+            scores={"correctness": 5.0},
+            comment="ok",
+            model_name=cases[0].model_name,
+            prompt_version=cases[0].prompt_version,
+            judge_prompt_version=label,
+        )
+        return [result], {"stopped": False, "judge_model": eval_config.judge_model}
+
+    monkeypatch.setattr(judge_ab_job_runner, "_evaluate_prompt", fake_evaluate_prompt)
+    config = JudgeAbJobConfig(
+        job_id="ab-parallel",
+        task_type=TaskType.USER_MD.value,
+        prompt_a="judge_a.md",
+        prompt_b="judge_b.md",
+        eval_config=EvalConfig(mock=True, judge_model="judge-a"),
+        eval_config_a=EvalConfig(mock=True, judge_model="judge-a"),
+        eval_config_b=EvalConfig(mock=True, judge_model="judge-b"),
+    )
+
+    run_judge_ab_job(config, [_case("c1")])
+
+    state = judge_ab_job_runner.read_judge_ab_job_state("ab-parallel")
+    assert set(entered) == {"A", "B"}
+    assert state["status"] == "completed"
+    assert state["parallel_sides"] is True
 
 
 def test_judge_ab_stop_preserves_partial_stage_results(tmp_path, monkeypatch):

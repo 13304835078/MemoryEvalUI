@@ -126,3 +126,42 @@ def test_job_can_reuse_one_existing_file_as_source_for_the_other_extraction(
     assert state["stats_a"]["extraction"]["api_calls"] == 0
     assert state["stats_b"]["extraction"]["api_calls"] == 1
     assert runner.extraction_path(config.job_id, "B").exists()
+
+
+def test_job_runs_both_extraction_sides_in_parallel_for_different_models(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(runner, "EXTRACTION_PROMPT_AB_JOBS_DIR", tmp_path / "jobs")
+    source = tmp_path / "source.xlsx"
+    _write_extraction(source, "")
+    extraction_config_a = MemoryExtractionConfig(mock=True, model="extract-model-a", concurrency=1)
+    extraction_config_b = MemoryExtractionConfig(mock=True, model="extract-model-b", concurrency=1)
+    comparison_config = EvalConfig(mock=True, judge_model="pairwise-model")
+    config = runner.ExtractionPromptAbJobConfig(
+        job_id="parallel-extraction-ab",
+        task_type=TaskType.USER_MD.value,
+        input_path=str(source),
+        prompt_a_text="prompt A",
+        prompt_a_version="A-v1",
+        prompt_b_text="prompt B",
+        prompt_b_version="B-v1",
+        judge_prompt_text="直接比较",
+        judge_prompt_version="pairwise-v1",
+        evaluation_rule_prompt_text="只记录长期事实",
+        evaluation_rule_prompt_version="rule-v1",
+        extraction_config=extraction_config_a,
+        extraction_config_a=extraction_config_a,
+        extraction_config_b=extraction_config_b,
+        eval_config=comparison_config,
+        comparison_config=comparison_config,
+        validation_config=ValidationGateConfig(require_statistical_confidence=False),
+    )
+
+    runner.run_extraction_prompt_ab_job(config)
+
+    state = runner.read_extraction_prompt_ab_job_state(config.job_id)
+    report = runner.load_extraction_prompt_ab_report(config.job_id)
+    assert state["status"] == "completed"
+    assert state["parallel_extraction_sides"] is True
+    assert report["parallel_extraction_sides"] is True

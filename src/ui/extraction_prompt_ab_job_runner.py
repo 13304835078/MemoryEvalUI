@@ -6,7 +6,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -110,6 +111,7 @@ class ExtractionPromptAbJobConfig:
     extraction_config_a: MemoryExtractionConfig | None = None
     extraction_config_b: MemoryExtractionConfig | None = None
     diff_excel_optional_sections: list[str] = field(default_factory=list)
+    parallel_different_models: bool = True
 
 
 def job_dir(job_id: str) -> Path:
@@ -201,6 +203,16 @@ def _side_extraction_config(
 ) -> MemoryExtractionConfig:
     selected = config.extraction_config_a if label.upper() == "A" else config.extraction_config_b
     return replace(selected or config.extraction_config)
+
+
+def should_parallelize_extraction_ab(config: ExtractionPromptAbJobConfig) -> bool:
+    if not config.parallel_different_models:
+        return False
+    if config.side_a_mode != "extract" or config.side_b_mode != "extract":
+        return False
+    model_a = str(_side_extraction_config(config, "A").model or "").strip()
+    model_b = str(_side_extraction_config(config, "B").model or "").strip()
+    return bool(model_a and model_b and model_a != model_b)
 
 
 def extraction_prompt_ab_job_stale_after_seconds(state: dict[str, Any]) -> float:
@@ -390,653 +402,45 @@ def _run_extraction_side(
     progress_start: int,
     progress_end: int,
     started_at: str,
+    progress_callback: Callable[
+        [str, float, str, str, int | None, int | None, dict[str, Any]], None
+    ] | None = None,
 ) -> tuple[list[Case], list[Case], dict[str, Any]]:
+    def report_progress(
+        fraction: float,
+        *,
+        stage: str,
+        message: str,
+        phase_done: int | None = None,
+        phase_total: int | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        bounded_fraction = min(1.0, max(0.0, float(fraction)))
+        details = dict(extra or {})
+        if progress_callback is not None:
+            progress_callback(
+                label,
+                bounded_fraction,
+                stage,
+                message,
+                phase_done,
+                phase_total,
+                details,
+            )
+            return
+        weighted = progress_start + round((progress_end - progress_start) * bounded_fraction)
+        _write_state(
+            config,
+            stage=stage,
+            done=weighted,
+            phase_done=phase_done,
+            phase_total=phase_total,
+            message=message,
+            started_at=started_at,
+            extra=details,
+        )
+
     if extraction_prompt_ab_stop_requested(config.job_id):
         raise ExtractionPromptAbStopped()
-    side_mode = config.side_a_mode if label.upper() == "A" else config.side_b_mode
-    existing_path = (
-        config.existing_extraction_a_path
-        if label.upper() == "A"
-        else config.existing_extraction_b_path
-    )
-    output_path = extraction_path(config.job_id, label)
-    if side_mode == "existing":
-        source_path = Path(existing_path)
-        if not source_path.is_file():
-            raise FileNotFoundError(f"æç¤ºè¯ {label} çš„å·²æœ‰æå–ç»“æœä¸å­˜åœ¨ï¼š{source_path}")
-        atomic_write_bytes(output_path, source_path.read_bytes())
-        _write_state(
-            config,
-            stage=f"ç‰ˆæœ¬ {label}ï¼šè¯»å–å·²æœ‰ç»“æœ",
-            done=progress_end,
-            message=f"ç‰ˆæœ¬ {label} å·²è½½å…¥å·²æœ‰æå– Excelï¼Œæ­£åœ¨ç”ŸæˆåŒæºæ¯”è¾ƒ caseã€‚",
-            started_at=started_at,
-            extra={"current_side": label, "current_phase": "load_existing"},
-        )
-        cases, missed, case_stats = _convert_extraction(
-            config,
-            label,
-            output_path,
-            prompt_version,
-        )
-        return cases, missed, {
-            "extraction": {
-                "mode": "existing",
-                "source_path": str(source_path),
-                "output_path": str(output_path),
-                "api_calls": 0,
-            },
-            "case_generation": case_stats,
-        }
-
-    side_config = _side_extraction_config(config, label)
-    if str(side_config.prompt_cache_location or "none").lower() != "none":
-        cache_text = "\n\n".join(filter(None, (create_prompt_text, prompt_text)))
-        prompt_digest = hashlib.sha256(cache_text.encode("utf-8")).hexdigest()[:16]
-        cache_prefix = str(side_config.prompt_cache_id or "memory_eval_extraction_ab").strip()
-        side_config.prompt_cache_id = f"{cache_prefix}_{prompt_digest}"
-    runner = MemoryExtractionRunner(
-        config=side_config,
-        prompt_text=prompt_text,
-        task_type=TaskType(config.task_type),
-        create_prompt_text=create_prompt_text or prompt_text,
-        update_prompt_text=prompt_text,
-    )
-    def on_progress(done: int, total: int, message: str) -> None:
-        fraction = done / total if total else 0.0
-        weighted = progress_start + round((progress_end - progress_start) * fraction)
-        _write_state(
-            config,
-            stage=f"æç¤ºè¯ {label}ï¼šè®°å¿†æå–",
-            done=weighted,
-            phase_done=done,
-            phase_total=total,
-            message=f"æç¤ºè¯ {label}ï¼š{message}",
-            started_at=started_at,
-            extra={"current_side": label, "current_phase": "extraction"},
-        )
-
-    stats = runner.process_excel(
-        config.input_path,
-        output_path,
-        sheet_name=config.sheet_name,
-        reviewer_filter=config.reviewer_filter or None,
-        chunk_size=max(1, int(config.chunk_size)),
-        progress_callback=on_progress,
-        should_stop=lambda: extraction_prompt_ab_stop_requested(config.job_id),
-        emit_parallel_chunk_progress=True,
-        priority_provider=lambda: _current_priority(config),
-        concurrency_provider=lambda: _current_extraction_concurrency(config, label),
-    )
-    if stats.get("stopped") or extraction_prompt_ab_stop_requested(config.job_id):
-        raise ExtractionPromptAbStopped()
-    _write_state(
-        config,
-        stage=f"æç¤ºè¯ {label}ï¼šç”Ÿæˆ case",
-        done=progress_end,
-        message=f"æç¤ºè¯ {label} æå–å®Œæˆï¼Œæ­£åœ¨ç”ŸæˆåŒæºè¯„æµ‹ caseã€‚",
-        started_at=started_at,
-        extra={"current_side": label, "current_phase": "case_generation"},
-    )
-    cases, missed, case_stats = _convert_extraction(config, label, output_path, prompt_version)
-    return cases, missed, {"extraction": stats, "case_generation": case_stats}
-
-
-def _run_pairwise_comparisons(
-    config: ExtractionPromptAbJobConfig,
-    *,
-    cases_a: list[Case],
-    cases_b: list[Case],
-    missed_a: list[Case],
-    missed_b: list[Case],
-    progress_start: int,
-    progress_end: int,
-    started_at: str,
-    evaluation_protocol: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    pairs, duplicate_keys = build_extraction_pairs(
-        cases_a=cases_a,
-        cases_b=cases_b,
-        missed_cases_a=missed_a,
-        missed_cases_b=missed_b,
-    )
-    output = pairwise_results_path(config.job_id)
-    atomic_write_jsonl(output, [])
-    results_by_key: dict[str, dict[str, Any]] = {}
-    completed = 0
-    total = len(pairs)
-    comparison_config = config.comparison_config
-    configured_concurrency = min(100, max(1, int(comparison_config.judge_concurrency or 1)))
-    configured_interval = (
-        float(comparison_config.judge_request_interval or 0.0)
-        if not comparison_config.mock
-        else 0.0
-    )
-    backoff = float(comparison_config.judge_qps_backoff or 0.0)
-    rate_scope = api_rate_scope(
-        comparison_config.judge_api_base_url,
-        comparison_config.judge_api_bearer_token,
-    )
-
-    def current_concurrency() -> int:
-        return min(
-            max(1, total),
-            control_int(
-                _current_controls(config),
-                "judge_concurrency",
-                configured_concurrency,
-                min_value=1,
-                max_value=100,
-            ),
-        )
-
-    def current_interval() -> float:
-        interval = (
-            control_float(
-                _current_controls(config),
-                "judge_request_interval",
-                configured_interval,
-                min_value=0.0,
-                max_value=300.0,
-            )
-            if not comparison_config.mock
-            else 0.0
-        )
-        if current_concurrency() > 1 and not comparison_config.mock:
-            interval = max(interval, backoff)
-        return interval
-
-    def wait_for_rate_slot() -> None:
-        wait_for_global_rate_slot(
-            rate_scope,
-            current_interval(),
-            disabled=bool(comparison_config.mock),
-            should_stop=lambda: extraction_prompt_ab_stop_requested(config.job_id),
-            priority=_current_priority(config),
-        )
-
-    def record(result: dict[str, Any]) -> None:
-        nonlocal completed
-        key = str(result.get("source_key") or "")
-        if key:
-            results_by_key[key] = result
-        append_jsonl(output, result)
-        completed += 1
-        fraction = completed / total if total else 1.0
-        weighted = progress_start + round((progress_end - progress_start) * fraction)
-        _write_state(
-            config,
-            stage="é€ chunk ç›´æ¥å¯¹æ¯”",
-            done=weighted,
-            phase_done=completed,
-            phase_total=total,
-            message=f"å·²å®Œæˆ {completed}/{total} ä¸ªåŒæº chunkï¼›ç›¸åŒæ­£æ–‡å’Œæ¼æŠ½å·®å¼‚ä¸è°ƒç”¨æ¨¡å‹ã€‚",
-            started_at=started_at,
-            extra={
-                "current_phase": "direct_pairwise_comparison",
-                "effective_judge_concurrency": current_concurrency(),
-                "effective_judge_request_interval": current_interval(),
-            },
-        )
-
-    pending = []
-    for pair in pairs:
-        deterministic = deterministic_pairwise_result(pair)
-        if deterministic is not None:
-            record(deterministic)
-        else:
-            pending.append(pair)
-
-    def compare_one(pair) -> dict[str, Any]:
-        if extraction_prompt_ab_stop_requested(config.job_id):
-            raise ExtractionPromptAbStopped()
-        case_a = pair.case_a or pair.missed_a
-        case_b = pair.case_b or pair.missed_b
-        if case_a is None or case_b is None:
-            return deterministic_pairwise_result(pair) or {
-                "source_key": pair.source_key,
-                "status": "source_mismatch",
-                "winner": "INSUFFICIENT",
-                "decision_basis": "insufficient",
-                "reason": "A/B æº chunk æ— æ³•å®Œæ•´å¯¹é½ã€‚",
-                "error": "æºæ•°æ®æœªå¯¹é½",
-            }
-        return call_pairwise_judge(
-            comparison_config,
-            case_a,
-            case_b,
-            source_key=pair.source_key,
-            judge_prompt_text=config.judge_prompt_text,
-            evaluation_rule_prompt=config.evaluation_rule_prompt_text,
-            evaluation_protocol=evaluation_protocol,
-            task_type=config.task_type,
-            rate_limit_wait_callback=wait_for_rate_slot,
-            should_stop=lambda: extraction_prompt_ab_stop_requested(config.job_id),
-        )
-
-    pair_iter = iter(pending)
-    futures: dict[Any, Any] = {}
-
-    def submit_next(executor: ThreadPoolExecutor) -> bool:
-        if extraction_prompt_ab_stop_requested(config.job_id):
-            return False
-        try:
-            pair = next(pair_iter)
-        except StopIteration:
-            return False
-        futures[executor.submit(compare_one, pair)] = pair
-        return True
-
-    if pending:
-        with ThreadPoolExecutor(max_workers=min(100, len(pending))) as executor:
-            for _ in range(current_concurrency()):
-                if not submit_next(executor):
-                    break
-            while futures:
-                done_set, _ = wait(set(futures), return_when=FIRST_COMPLETED)
-                for future in done_set:
-                    pair = futures.pop(future)
-                    try:
-                        result = future.result()
-                    except ExtractionPromptAbStopped:
-                        continue
-                    except Exception as exc:
-                        result = {
-                            "source_key": pair.source_key,
-                            "status": "failed",
-                            "winner": "INSUFFICIENT",
-                            "confidence": "low",
-                            "reason": "ç›´æ¥å¯¹æ¯”ä»»åŠ¡å‘ç”Ÿè¿è¡Œå¼‚å¸¸ï¼Œæœ¬æ¡ä¸è¿›å…¥èƒœè´Ÿç»Ÿè®¡ã€‚",
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
-                    if result.get("status") == "stopped":
-                        raise ExtractionPromptAbStopped()
-                    record(result)
-                if extraction_prompt_ab_stop_requested(config.job_id):
-                    for future in list(futures):
-                        future.cancel()
-                    raise ExtractionPromptAbStopped()
-                while len(futures) < current_concurrency() and submit_next(executor):
-                    pass
-
-    ordered_results = [results_by_key[pair.source_key] for pair in pairs if pair.source_key in results_by_key]
-    atomic_write_jsonl(output, ordered_results)
-    return ordered_results, duplicate_keys
-
-
-def _build_candidate_neutral_protocol(
-    config: ExtractionPromptAbJobConfig,
-    *,
-    prompt_a: str,
-    prompt_b: str,
-    started_at: str,
-) -> dict[str, Any]:
-    comparison_config = config.comparison_config
-    configured_interval = (
-        float(comparison_config.judge_request_interval or 0.0)
-        if not comparison_config.mock
-        else 0.0
-    )
-    rate_scope = api_rate_scope(
-        comparison_config.judge_api_base_url,
-        comparison_config.judge_api_bearer_token,
-    )
-
-    def wait_for_rate_slot() -> None:
-        wait_for_global_rate_slot(
-            rate_scope,
-            configured_interval,
-            disabled=bool(comparison_config.mock),
-            should_stop=lambda: extraction_prompt_ab_stop_requested(config.job_id),
-            priority=_current_priority(config),
-        )
-
-    _write_state(
-        config,
-        stage="æ•´ç†å€™é€‰æ— å…³è¯„æµ‹åè®®",
-        done=610,
-        message="æ­£åœ¨ä¸€æ¬¡æ€§æå– A/B å…±åŒè§„åˆ™ã€ç­–ç•¥å†²çªã€æ ¼å¼å·®å¼‚å’Œæç¤ºè¯è®¾è®¡è´¨é‡ã€‚",
-        started_at=started_at,
-    )
-    protocol = compile_evaluation_protocol(
-        comparison_config,
-        prompt_a=prompt_a,
-        prompt_b=prompt_b,
-        task_type=config.task_type,
-        rate_limit_wait_callback=wait_for_rate_slot,
-        should_stop=lambda: extraction_prompt_ab_stop_requested(config.job_id),
-    )
-    atomic_write_json(evaluation_protocol_path(config.job_id), protocol)
-    return protocol
-
-
-def _write_pairwise_advisor_evidence(
-    config: ExtractionPromptAbJobConfig,
-    *,
-    cases_a: list[Case],
-    cases_b: list[Case],
-    rows: list[dict[str, Any]],
-) -> None:
-    cases_by_side = {
-        "A": {source_case_key(case): case for case in cases_a},
-        "B": {source_case_key(case): case for case in cases_b},
-    }
-    for label in ("A", "B"):
-        evidence: list[EvalResult] = []
-        lower = label.lower()
-        losing_comparison = "Bè¾ƒä¼˜" if label == "A" else "Aè¾ƒä¼˜"
-        for row in rows:
-            if str(row.get("comparison") or "") in {"ç­–ç•¥å·®å¼‚", "å†å²åŸºçº¿å·®å¼‚"}:
-                continue
-            case = cases_by_side[label].get(str(row.get("source_key") or ""))
-            if case is None:
-                continue
-            issues = [item for item in str(row.get(f"issues_{lower}") or "").split("ï¼›") if item]
-            tags = [item for item in str(row.get(f"error_tags_{lower}") or "").split("ã€") if item]
-            lost = str(row.get("comparison") or "") == losing_comparison
-            if not lost and not issues and not tags:
-                continue
-            evidence.append(
-                EvalResult(
-                    case_id=case.case_id,
-                    task_type=case.task_type.value,
-                    score_total=3.5 if lost else 4.5,
-                    scores={},
-                    comment=(
-                        "ã€ç›´æ¥ A/B å¯¹æ¯”è¯æ®ã€‘"
-                        + str(row.get("comparison_note") or "è¯¥ä¾§å­˜åœ¨ç›¸å¯¹é—®é¢˜ã€‚")
-                    ),
-                    error_tags=tags,
-                    fatal_error=bool(set(tags) & {"privacy_sensitive", "hallucination", "wrong_fact"}),
-                    model_name=case.model_name,
-                    prompt_version=case.prompt_version,
-                    judge_model=config.comparison_config.judge_model,
-                    judge_prompt_version=f"direct_pairwise:{config.judge_prompt_version}",
-                    extraction_prompt_version=config.evaluation_rule_prompt_version,
-                    extraction_prompt_hash=config.evaluation_rule_prompt_hash,
-                    rule_refs=[item for item in str(row.get("rule_refs") or "").split("ï¼›") if item],
-                    evidence_refs=[item for item in str(row.get("evidence_refs") or "").split("ï¼›") if item],
-                )
-            )
-        results_to_jsonl(evidence, str(results_path(config.job_id, label)))
-
-
-def _write_report_excel(report: dict[str, Any], path: Path) -> None:
-    model_roles = report.get("model_roles") if isinstance(report.get("model_roles"), dict) else {}
-    model_comparison = (
-        report.get("model_comparison")
-        if isinstance(report.get("model_comparison"), dict)
-        else {}
-    )
-    summary = {
-        "comparison_mode": report.get("comparison_mode", "legacy_absolute_scores"),
-        "recommendation": report.get("recommendation"),
-        "recommendation_reason": report.get("recommendation_reason"),
-        "extraction_model_a": model_roles.get("extraction_model_a", model_roles.get("extraction_model", "")),
-        "extraction_model_b": model_roles.get("extraction_model_b", model_roles.get("extraction_model", "")),
-        "evaluation_model": model_roles.get("evaluation_model", ""),
-        "comparison_model": model_roles.get("direct_comparison_model", model_roles.get("comparison_model", "")),
-        "comparison_model_status": model_comparison.get("status", ""),
-        "comparison_model_preference": model_comparison.get("preferred_version", ""),
-        "comparison_model_summary": model_comparison.get("summary", ""),
-        "identical_output_count": report.get("identical_output_count", 0),
-        "judge_disagreement_on_identical_output_count": report.get(
-            "judge_disagreement_on_identical_output_count", 0
-        ),
-        **{f"A_{key}": value for key, value in (report.get("quality_a") or {}).items()},
-        **{f"B_{key}": value for key, value in (report.get("quality_b") or {}).items()},
-    }
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        pd.DataFrame([summary]).to_excel(writer, sheet_name="ç»“è®º", index=False)
-        dimension_rows = report.get("dimension_summary") or []
-        if dimension_rows:
-            pd.DataFrame(dimension_rows).to_excel(writer, sheet_name="ç»´åº¦å¯¹æ¯”", index=False)
-        pd.DataFrame(report.get("rows") or []).to_excel(writer, sheet_name="é€æ ·æœ¬å¯¹æ¯”", index=False)
-        protocol = report.get("evaluation_protocol") if isinstance(report.get("evaluation_protocol"), dict) else {}
-        if protocol:
-            common_rows = [{"ç±»å‹": "é€šç”¨è´¨é‡è§„åˆ™", "å†…å®¹": item} for item in protocol.get("universal_rules") or []]
-            common_rows.extend({"ç±»å‹": "åŒæ–¹å…±åŒè§„åˆ™", "å†…å®¹": item} for item in protocol.get("common_rules") or [])
-            common_rows.extend({"ç±»å‹": "æ ¼å¼å·®å¼‚", "å†…å®¹": item} for item in protocol.get("format_differences") or [])
-            pd.DataFrame(common_rows).to_excel(writer, sheet_name="è¯„æµ‹åè®®", index=False)
-            conflicts = protocol.get("policy_conflicts") or []
-            if conflicts:
-                pd.DataFrame(conflicts).to_excel(writer, sheet_name="ç­–ç•¥å†²çª", index=False)
-            prompt_quality_rows = []
-            for label in ("A", "B"):
-                quality = protocol.get(f"prompt_quality_{label.lower()}") or {}
-                prompt_quality_rows.append(
-                    {
-                        "ç‰ˆæœ¬": label,
-                        **{key: value for key, value in quality.items() if key not in {"issues", "strengths"}},
-                        "ä¼˜ç‚¹": "ï¼›".join(quality.get("strengths") or []),
-                        "é—®é¢˜": "ï¼›".join(quality.get("issues") or []),
-                    }
-                )
-            pd.DataFrame(prompt_quality_rows).to_excel(writer, sheet_name="æç¤ºè¯è®¾è®¡è´¨é‡", index=False)
-        if model_comparison:
-            comparison_sheet = {
-                key: "ï¼›".join(value) if isinstance(value, list) else value
-                for key, value in model_comparison.items()
-            }
-            pd.DataFrame([comparison_sheet]).to_excel(writer, sheet_name="æ¨¡å‹ç»¼åˆæ„è§", index=False)
-    atomic_write_bytes(path, buffer.getvalue())
-
-
-def load_extraction_prompt_ab_report(job_id: str) -> dict[str, Any]:
-    path = report_path(job_id)
-    return read_json_state(path) if path.exists() else {}
-
-
-def ensure_extraction_prompt_ab_diff_excel(job_id: str) -> Path | None:
-    output = diff_excel_path(job_id)
-    if output.exists():
-        return output
-    extraction_a = extraction_path(job_id, "A")
-    extraction_b = extraction_path(job_id, "B")
-    report = load_extraction_prompt_ab_report(job_id)
-    if not extraction_a.exists() or not extraction_b.exists() or not report:
-        return None
-    with state_file_lock(output):
-        if not output.exists():
-            write_extraction_prompt_diff_excel(
-                extraction_a_path=extraction_a,
-                extraction_b_path=extraction_b,
-                comparison_rows=report.get("rows") or [],
-                output_path=output,
-                model_comparison=report.get("model_comparison") or None,
-                optional_sections=report.get("diff_excel_optional_sections") or [],
-            )
-    return output
-
-
-def load_extraction_prompt_ab_side(
-    job_id: str, label: str
-) -> tuple[list[Case], list[Case], list[EvalResult]]:
-    ready = cases_from_jsonl(str(cases_path(job_id, label))) if cases_path(job_id, label).exists() else []
-    missed = cases_from_jsonl(str(missed_cases_path(job_id, label))) if missed_cases_path(job_id, label).exists() else []
-    results = results_from_jsonl(str(results_path(job_id, label))) if results_path(job_id, label).exists() else []
-    return ready, missed, results
-
-
-def run_extraction_prompt_ab_job(config: ExtractionPromptAbJobConfig) -> None:
-    started_at = utc_now()
-    directory = job_dir(config.job_id)
-    directory.mkdir(parents=True, exist_ok=True)
-    if stop_path(config.job_id).exists():
-        stop_path(config.job_id).unlink()
-    init_task_controls(
-        controls_path(config.job_id),
-        {
-            "priority": DEFAULT_PRIORITY,
-            "extraction_concurrency": min(
-                100,
-                max(
-                    1,
-                    int(_side_extraction_config(config, "A").concurrency or 1),
-                    int(_side_extraction_config(config, "B").concurrency or 1),
-                ),
-            ),
-            "judge_concurrency": min(
-                100,
-                max(1, int(config.comparison_config.judge_concurrency or 1)),
-            ),
-            "judge_request_interval": float(
-                config.comparison_config.judge_request_interval or 0.0
-            ),
-        },
-    )
-    _write_state(
-        config,
-        stage="å‡†å¤‡",
-        done=0,
-        message="æ­£åœ¨å‡†å¤‡ A/B æå–ç»“æœï¼›å·²æœ‰ç»“æœä¼šç›´æ¥è½½å…¥ï¼Œå·®å¼‚ chunk å°†æˆå¯¹æ¯”è¾ƒã€‚",
-        started_at=started_at,
-    )
-
-    try:
-        cases_a, missed_a, stats_a = _run_extraction_side(
-            config,
-            label="A",
-            prompt_text=config.prompt_a_text,
-            create_prompt_text=config.prompt_a_create_text,
-            prompt_version=config.prompt_a_version,
-            progress_start=0,
-            progress_end=300,
-            started_at=started_at,
-        )
-        cases_b, missed_b, stats_b = _run_extraction_side(
-            config,
-            label="B",
-            prompt_text=config.prompt_b_text,
-            create_prompt_text=config.prompt_b_create_text,
-            prompt_version=config.prompt_b_version,
-            progress_start=300,
-            progress_end=600,
-            started_at=started_at,
-        )
-        combined_prompt_a = "\n\n".join(
-            filter(None, (config.prompt_a_create_text, config.prompt_a_text))
-        )
-        combined_prompt_b = "\n\n".join(
-            filter(None, (config.prompt_b_create_text, config.prompt_b_text))
-        )
-        evaluation_protocol = _build_candidate_neutral_protocol(
-            config,
-            prompt_a=combined_prompt_a,
-            prompt_b=combined_prompt_b,
-            started_at=started_at,
-        )
-        if extraction_prompt_ab_stop_requested(config.job_id):
-            raise ExtractionPromptAbStopped()
-        pairwise_results, duplicate_keys = _run_pairwise_comparisons(
-            config,
-            cases_a=cases_a,
-            cases_b=cases_b,
-            missed_a=missed_a,
-            missed_b=missed_b,
-            progress_start=620,
-            progress_end=930,
-            started_at=started_at,
-            evaluation_protocol=evaluation_protocol,
-        )
-
-        _write_state(
-            config,
-            stage="è®¡ç®—ç»Ÿè®¡ç»“è®º",
-            done=950,
-            message="æ­£åœ¨æ±‡æ€»ç›´æ¥èƒœè´Ÿã€è¦†ç›–ç‡å’ŒæŒ‰è¯„æµ‹äººèšç±»çš„ç½®ä¿¡åŒºé—´ã€‚",
-            started_at=started_at,
-        )
-        report = compare_extraction_prompt_pairs(
-            cases_a=cases_a,
-            cases_b=cases_b,
-            missed_cases_a=missed_a,
-            missed_cases_b=missed_b,
-            pairwise_results=pairwise_results,
-            prompt_a=combined_prompt_a,
-            prompt_b=combined_prompt_b,
-            validation_config=config.validation_config,
-            evaluation_protocol=evaluation_protocol,
-        )
-        extraction_model_a = _side_extraction_config(config, "A").model
-        extraction_model_b = _side_extraction_config(config, "B").model
-        report["model_roles"] = {
-            "extraction_model_a": extraction_model_a,
-            "extraction_model_b": extraction_model_b,
-            "direct_comparison_model": config.comparison_config.judge_model,
-        }
-        report["input_modes"] = {"A": config.side_a_mode, "B": config.side_b_mode}
-        report["duplicate_source_keys"] = sorted(
-            set(report.get("duplicate_source_keys") or []) | set(duplicate_keys)
-        )
-        report["comparison_scope"] = (
-            "æå–æç¤ºè¯ä¸æå–æ¨¡å‹è”åˆå¯¹æ¯”"
-            if extraction_model_a != extraction_model_b
-            else "ä»…æå–æç¤ºè¯å¯¹æ¯”"
-        )
-        report["diff_excel_optional_sections"] = list(config.diff_excel_optional_sections or [])
-        _write_pairwise_advisor_evidence(
-            config,
-            cases_a=cases_a,
-            cases_b=cases_b,
-            rows=report.get("rows") or [],
-        )
-        atomic_write_json(report_path(config.job_id), report)
-        _write_report_excel(report, report_excel_path(config.job_id))
-        write_extraction_prompt_diff_excel(
-            extraction_a_path=extraction_path(config.job_id, "A"),
-            extraction_b_path=extraction_path(config.job_id, "B"),
-            comparison_rows=report.get("rows") or [],
-            output_path=diff_excel_path(config.job_id),
-            model_comparison=None,
-            optional_sections=config.diff_excel_optional_sections,
-        )
-        _write_state(
-            config,
-            status="completed",
-            stage="å®Œæˆ",
-            done=PROGRESS_TOTAL,
-            message=f"A/B æ¯”è¾ƒå®Œæˆï¼š{report.get('recommendation', 'å·²ç”Ÿæˆç»“è®º')}ã€‚",
-            started_at=started_at,
-            extra={
-                "recommendation": report.get("recommendation"),
-                "recommendation_reason": report.get("recommendation_reason"),
-                "quality_a": report.get("quality_a"),
-                "quality_b": report.get("quality_b"),
-                "validation_gate": report.get("validation_gate"),
-                "winner_counts": report.get("winner_counts"),
-                "model_roles": report.get("model_roles"),
-                "comparison_mode": report.get("comparison_mode"),
-                "diff_excel_path": str(diff_excel_path(config.job_id)),
-                "stats_a": stats_a,
-                "stats_b": stats_b,
-                "finished_at": utc_now(),
-            },
-        )
-    except ExtractionPromptAbStopped:
-        state = read_extraction_prompt_ab_job_state(config.job_id)
-        _write_state(
-            config,
-            status="stopped",
-            stage="å·²ç»ˆæ­¢",
-            done=int(state.get("done", 0) or 0),
-            message="æå–æç¤ºè¯ A/B ä»»åŠ¡å·²æŒ‰ç»ˆæ­¢è¯·æ±‚åœæ­¢ï¼Œå·²å®Œæˆçš„ä¸­é—´æ–‡ä»¶ä¼šä¿ç•™ã€‚",
-            started_at=started_at,
-            extra={"finished_at": utc_now()},
-        )
-    except Exception as exc:
-        state = read_extraction_prompt_ab_job_state(config.job_id)
-        _write_state(
-            config,
-            status="failed",
-            stage="å¤±è´¥",
-            done=int(state.get("done", 0) or 0),
-            message=f"æå–æç¤ºè¯ A/B å¤±è´¥ï¼š{type(exc).__name__}: {exc}",
-            started_at=started_at,
-            extra={
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc(),
-                "finished_at": utc_now(),
-            },
-        )
+    side_mode = config.sidç]u¶‰Ëkºwµçq}½µÁ…É¥Í½¸¹•Ğ ‰ÁÉ•™•ÉÉ•‘}Ù•ÉÍ¥½¸ˆ°€ˆˆ¤°(€€€€€€€€‰½µÁ…É¥Í½¹}µ½‘•±}ÍÕµµ…Éäˆèµ½‘•±}½µÁ…É¥Í½¸¹•Ğ ‰ÍÕµµ…Éäˆ°€ˆˆ¤°(€€€€€€€€‰¥‘•¹Ñ¥…±}½ÕÑÁÕÑ}½Õ¹ĞˆèÉ•Á½ÉĞ¹•Ğ ‰¥‘•¹Ñ¥…±}½ÕÑÁÕÑ}½Õ¹Ğˆ°€À¤°(€€€€€€€€‰©Õ‘•}‘¥Í…É••µ•¹Ñ}½¹}¥‘•¹Ñ¥…±}½ÕÑÁÕÑ}½Õ¹ĞˆèÉ•Á½ÉĞ¹•Ğ (€€€€€€€€€€€€‰©Õ‘•}‘¥Í…É••µ•¹Ñ}½¹}¥‘•¹Ñ¥…±}½ÕÑÁÕÑ}½Õ¹Ğˆ°€À(€€€€€€€€¤°(€€€€€€€€¨©í˜‰}í­•åôˆèÙ…±Õ”™½È­•ä°Ù…±Õ”¥¸€¡É•Á½ÉĞ¹•Ğ ‰ÅÕ…±¥Ñå}„ˆ¤½Èíô¤¹¥Ñ•µÌ ¥ô°(€€€€€€€€¨©í˜‰	}í­•åôˆèÙ…±Õ”™½È­•ä°Ù…±Õ”¥¸€¡É•Á½ÉĞ¹•Ğ ‰ÅÕ…±¥Ñå}ˆˆ¤½Èíô¤¹¥Ñ•µÌ ¥ô°(€€€ô(€€€‰Õ™™•È€ô	åÑ•Í%< ¤(€€€İ¥Ñ Á¹á•±]É¥Ñ•È¡‰Õ™™•È°•¹¥¹”ô‰½Á•¹Áåá°ˆ¤…ÌİÉ¥Ñ•Èè(€€€€€€€Á¹…Ñ…É…µ”¡mÍÕµµ…Éåt¤¹Ñ½}•á•°¡İÉ¥Ñ•È°Í¡••Ñ}¹…µ”ô‹îO¢ºèˆ°¥¹‘•àõ…±Í”¤(€€€€€€€‘¥µ•¹Í¥½¹}É½İÌ€ôÉ•Á½ÉĞ¹•Ğ ‰‘¥µ•¹Í¥½¹}ÍÕµµ…Éäˆ¤½Èmt(€€€€€€€¥˜‘¥µ•¹Í¥½¹}É½İÌè(€€€€€€€€€€€Á¹…Ñ…É…µ”¡‘¥µ•¹Í¥½¹}É½İÌ¤¹Ñ½}•á•°¡İÉ¥Ñ•È°Í¡••Ñ}¹…µ”ô‹îÓ–ê›–¾çš¾Pˆ°¥¹‘•àõ…±Í”¤(€€€€€€€Á¹…Ñ…É…µ”¡É•Á½ÉĞ¹•Ğ ‰É½İÌˆ¤½Èmt¤¹Ñ½}•á•°¡İÉ¥Ñ•È°Í¡••Ñ}¹…µ”ô‹¦Cš‚ßšr³–¾çš¾Pˆ°¥¹‘•àõ…±Í”¤(€€€€€€€ÁÉ½Ñ½½°€ôÉ•Á½ÉĞ¹•Ğ ‰•Ù…±Õ…Ñ¥½¹}ÁÉ½Ñ½½°ˆ¤¥˜¥Í¥¹ÍÑ…¹”¡É•Á½ÉĞ¹•Ğ ‰•Ù…±Õ…Ñ¥½¹}ÁÉ½Ñ½½°ˆ¤°‘¥Ğ¤•±Í”íô(€€€€€€€¥˜ÁÉ½Ñ½½°è(€€€€€€€€€€€½µµ½¹}É½İÌ€ômì‹Æï–z,ˆè€‹¦kR£¢Ò£¦?¢–"dˆ°€‹––ºäˆè¥Ñ•µô™½È¥Ñ•´¥¸ÁÉ½Ñ½½°¹•Ğ ‰Õ¹¥Ù•ÉÍ…±}ÉÕ±•Ìˆ¤½Èmut(€€€€€€€€€€€½µµ½¹}É½İÌ¹•áÑ•¹¡ì‹Æï–z,ˆè€‹–>3šZç–Ç–B3¢–"dˆ°€‹––ºäˆè¥Ñ•µô™½È¥Ñ•´¥¸ÁÉ½Ñ½½°¹•Ğ ‰½µµ½¹}ÉÕ±•Ìˆ¤½Èmt¤(€€€€€€€€€€€½µµ½¹}É½İÌ¹•áÑ•¹¡ì‹Æï–z,ˆè€‹š‚ó–ò?–Ş»–òˆ°€‹––ºäˆè¥Ñ•µô™½È¥Ñ•´¥¸ÁÉ½Ñ½½°¹•Ğ ‰™½Éµ…Ñ}‘¥™™•É•¹•Ìˆ¤½Èmt¤(€€€€€€€€€€€Á¹…Ñ…É…µ”¡½µµ½¹}É½İÌ¤¹Ñ½}•á•°¡İÉ¥Ñ•È°Í¡••Ñ}¹…µ”ô‹¢¾šÖ/–6?¢º¸ˆ°¥¹‘•àõ…±Í”¤(€€€€€€€€€€€½¹™±¥ÑÌ€ôÁÉ½Ñ½½°¹•Ğ ‰Á½±¥å}½¹™±¥ÑÌˆ¤½Èmt(€€€€€€€€€€€¥˜½¹™±¥ÑÌè(€€€€€€€€€€€€€€€Á¹…Ñ…É…µ”¡½¹™±¥ÑÌ¤¹Ñ½}•á•°¡İÉ¥Ñ•È°Í¡••Ñ}¹…µ”ô‹¶[V—–Ëªˆ°¥¹‘•àõ…±Í”¤(€€€€€€€€€€€ÁÉ½µÁÑ}ÅÕ…±¥Ñå}É½İÌ€ômt(€€€€€€€€€€€™½È±…‰•°¥¸€ ‰ˆ°€‰ˆ¤è(€€€€€€€€€€€€€€€ÅÕ…±¥Ñä€ôÁÉ½Ñ½½°¹•Ğ¡˜‰ÁÉ½µÁÑ}ÅÕ…±¥Ñå}í±…‰•°¹±½İ•È ¥ôˆ¤½Èíô(€€€€€€€€€€€€€€€ÁÉ½µÁÑ}ÅÕ…±¥Ñå}É½İÌ¹…ÁÁ•¹ (€€€€€€€€€€€€€€€€€€€ì(€€€€€€€€€€€€€€€€€€€€€€€€‹&#šr°ˆè±…‰•°°(€€€€€€€€€€€€€€€€€€€€€€€€¨©í­•äèÙ…±Õ”™½È­•ä°Ù…±Õ”¥¸ÅÕ…±¥Ñä¹¥Ñ•µÌ ¤¥˜­•ä¹½Ğ¥¸ì‰¥ÍÍÕ•Ìˆ°€‰ÍÑÉ•¹Ñ¡Ì‰õô°(€€€€€€€€€€€€€€€€€€€€€€€€‹’òc
+äˆè€‹¾òlˆ¹©½¥¸¡ÅÕ…±¥Ñä¹•Ğ ‰ÍÑÉ•¹Ñ¡Ìˆ¤½Èmt¤°(€€€€€€€€€€€€€€€€€€€€€€€€‹¦^»¦Š`ˆè€‹¾òlˆ¹©½¥¸¡ÅÕ…±¥Ñä¹•Ğ ‰¥ÍÍÕ•Ìˆ¤½Èmt¤°(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€¤(€€€€€€€€€€€Á¹…Ñ…É…µ”¡ÁÉ½µÁÑ}ÅÕ…±¥Ñå}É½İÌ¤¹Ñ½}•á•°¡İÉ¥Ñ•È°Í¡••Ñ}¹…µ”ô‹š>C’ë¢¾7¢ºû¢º‡¢Ò£¦<ˆ°¥¹‘•àõ…±Í”¤(€€€€€€€¥˜µ½‘•±}½µÁ…É¥Í½¸è(€€€€€€€€€€€½µÁ…É¥Í½¹}Í¡••Ğ€ôì(€€€€€€€€€€€€€€€­•äè€‹¾òlˆ¹©½¥¸¡Ù…±Õ”¤¥˜¥Í¥¹ÍÑ…¹”¡Ù…±Õ”°±¥ÍĞ¤•±Í”Ù…±Õ”(€€€€€€€€€€€€€€€™½È­•ä°Ù…±Õ”¥¸µ½‘•±}½µÁ…É¥Í½¸¹¥Ñ•µÌ ¤(€€€€€€€€€€€ô(€€€€€€€€€€€Á¹…Ñ…É…µ”¡m½µÁ…É¥Í½¹}Í¡••Ñt¤¹Ñ½}•á•°¡İÉ¥Ñ•È°Í¡••Ñ}¹…µ”ô‹š¢‡–z/îó–B#š?¢ˆ°¥¹‘•àõ…±Í”¤(€€€…Ñ½µ¥}İÉ¥Ñ•}‰åÑ•Ì¡Á…Ñ °‰Õ™™•È¹•ÑÙ…±Õ” ¤¤(()‘•˜±½…‘}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}…‰}É•Á½ÉĞ¡©½‰}¥èÍÑÈ¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€Á…Ñ €ôÉ•Á½ÉÑ}Á…Ñ ¡©½‰}¥¤(€€€É•ÑÕÉ¸É•…‘}©Í½¹}ÍÑ…Ñ”¡Á…Ñ ¤¥˜Á…Ñ ¹•á¥ÍÑÌ ¤•±Í”íô(()‘•˜•¹ÍÕÉ•}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}…‰}‘¥™™}•á•°¡©½‰}¥èÍÑÈ¤€´øA…Ñ ğ9½¹”è(€€€½ÕÑÁÕĞ€ô‘¥™™}•á•±}Á…Ñ ¡©½‰}¥¤(€€€¥˜½ÕÑÁÕĞ¹•á¥ÍÑÌ ¤è(€€€€€€€É•ÑÕÉ¸½ÕÑÁÕĞ(€€€•áÑÉ…Ñ¥½¹}„€ô•áÑÉ…Ñ¥½¹}Á…Ñ ¡©½‰}¥°€‰ˆ¤(€€€•áÑÉ…Ñ¥½¹}ˆ€ô•áÑÉ…Ñ¥½¹}Á…Ñ ¡©½‰}¥°€‰ˆ¤(€€€É•Á½ÉĞ€ô±½…‘}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}…‰}É•Á½ÉĞ¡©½‰}¥¤(€€€¥˜¹½Ğ•áÑÉ…Ñ¥½¹}„¹•á¥ÍÑÌ ¤½È¹½Ğ•áÑÉ…Ñ¥½¹}ˆ¹•á¥ÍÑÌ ¤½È¹½ĞÉ•Á½ÉĞè(€€€€€€€É•ÑÕÉ¸9½¹”(€€€İ¥Ñ ÍÑ…Ñ•}™¥±•}±½¬¡½ÕÑÁÕĞ¤è(€€€€€€€¥˜¹½Ğ½ÕÑÁÕĞ¹•á¥ÍÑÌ ¤è(€€€€€€€€€€€İÉ¥Ñ•}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}‘¥™™}•á•° (€€€€€€€€€€€€€€€•áÑÉ…Ñ¥½¹}…}Á…Ñ õ•áÑÉ…Ñ¥½¹}„°(€€€€€€€€€€€€€€€•áÑÉ…Ñ¥½¹}‰}Á…Ñ õ•áÑÉ…Ñ¥½¹}ˆ°(€€€€€€€€€€€€€€€½µÁ…É¥Í½¹}É½İÌõÉ•Á½ÉĞ¹•Ğ ‰É½İÌˆ¤½Èmt°(€€€€€€€€€€€€€€€½ÕÑÁÕÑ}Á…Ñ õ½ÕÑÁÕĞ°(€€€€€€€€€€€€€€€µ½‘•±}½µÁ…É¥Í½¸õÉ•Á½ÉĞ¹•Ğ ‰µ½‘•±}½µÁ…É¥Í½¸ˆ¤½È9½¹”°(€€€€€€€€€€€€€€€½ÁÑ¥½¹…±}Í•Ñ¥½¹ÌõÉ•Á½ÉĞ¹•Ğ ‰‘¥™™}•á•±}½ÁÑ¥½¹…±}Í•Ñ¥½¹Ìˆ¤½Èmt°(€€€€€€€€€€€€¤(€€€É•ÑÕÉ¸½ÕÑÁÕĞ(()‘•˜±½…‘}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}…‰}Í¥‘” (€€€©½‰}¥èÍÑÈ°±…‰•°èÍÑÈ(¤€´øÑÕÁ±•m±¥ÍÑm…Í•t°±¥ÍÑm…Í•t°±¥ÍÑmÙ…±I•ÍÕ±Ñutè(€€€É•…‘ä€ô…Í•Í}™É½µ}©Í½¹°¡ÍÑÈ¡…Í•Í}Á…Ñ ¡©½‰}¥°±…‰•°¤¤¤¥˜…Í•Í}Á…Ñ ¡©½‰}¥°±…‰•°¤¹•á¥ÍÑÌ ¤•±Í”mt(€€€µ¥ÍÍ•€ô…Í•Í}™É½µ}©Í½¹°¡ÍÑÈ¡µ¥ÍÍ•‘}…Í•Í}Á…Ñ ¡©½‰}¥°±…‰•°¤¤¤¥˜µ¥ÍÍ•‘}…Í•Í}Á…Ñ ¡©½‰}¥°±…‰•°¤¹•á¥ÍÑÌ ¤•±Í”mt(€€€É•ÍÕ±ÑÌ€ôÉ•ÍÕ±ÑÍ}™É½µ}©Í½¹°¡ÍÑÈ¡É•ÍÕ±ÑÍ}Á…Ñ ¡©½‰}¥°±…‰•°¤¤¤¥˜É•ÍÕ±ÑÍ}Á…Ñ ¡©½‰}¥°±…‰•°¤¹•á¥ÍÑÌ ¤•±Í”mt(€€€É•ÑÕÉ¸É•…‘ä°µ¥ÍÍ•°É•ÍÕ±ÑÌ(()‘•˜ÉÕ¹}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}…‰}©½ˆ¡½¹™¥œèáÑÉ…Ñ¥½¹AÉ½µÁÑ‰)½‰½¹™¥œ¤€´ø9½¹”è(€€€ÍÑ…ÉÑ•‘}…Ğ€ôÕÑ}¹½Ü ¤(€€€‘¥É•Ñ½Éä€ô©½‰}‘¥È¡½¹™¥œ¹©½‰}¥¤(€€€‘¥É•Ñ½Éä¹µ­‘¥È¡Á…É•¹ÑÌõQÉÕ”°•á¥ÍÑ}½¬õQÉÕ”¤(€€€¥˜ÍÑ½Á}Á…Ñ ¡½¹™¥œ¹©½‰}¥¤¹•á¥ÍÑÌ ¤è(€€€€€€€ÍÑ½Á}Á…Ñ ¡½¹™¥œ¹©½‰}¥¤¹Õ¹±¥¹¬ ¤(€€€¥¹¥Ñ}Ñ…Í­}½¹ÑÉ½±Ì (€€€€€€€½¹ÑÉ½±Í}Á…Ñ ¡½¹™¥œ¹©½‰}¥¤°(€€€€€€€ì(€€€€€€€€€€€€‰ÁÉ¥½É¥ÑäˆèU1Q}AI%=I%Qd°(€€€€€€€€€€€€‰•áÑÉ…Ñ¥½¹}½¹ÕÉÉ•¹äˆèµ¥¸ (€€€€€€€€€€€€€€€€ÄÀÀ°(€€€€€€€€€€€€€€€µ…à (€€€€€€€€€€€€€€€€€€€€Ä°(€€€€€€€€€€€€€€€€€€€¥¹Ğ¡}Í¥‘•}•áÑÉ…Ñ¥½¹}½¹™¥œ¡½¹™¥œ°€‰ˆ¤¹½¹ÕÉÉ•¹ä½È€Ä¤°(€€€€€€€€€€€€€€€€€€€¥¹Ğ¡}Í¥‘•}•áÑÉ…Ñ¥½¹}½¹™¥œ¡½¹™¥œ°€‰ˆ¤¹½¹ÕÉÉ•¹ä½È€Ä¤°(€€€€€€€€€€€€€€€€¤°(€€€€€€€€€€€€¤°(€€€€€€€€€€€€‰©Õ‘•}½¹ÕÉÉ•¹äˆèµ¥¸ (€€€€€€€€€€€€€€€€ÄÀÀ°(€€€€€€€€€€€€€€€µ…à Ä°¥¹Ğ¡½¹™¥œ¹½µÁ…É¥Í½¹}½¹™¥œ¹©Õ‘•}½¹ÕÉÉ•¹ä½È€Ä¤¤°(€€€€€€€€€€€€¤°(€€€€€€€€€€€€‰©Õ‘•}É•ÅÕ•ÍÑ}¥¹Ñ•ÉÙ…°ˆè™±½…Ğ (€€€€€€€€€€€€€€€½¹™¥œ¹½µÁ…É¥Í½¹}½¹™¥œ¹©Õ‘•}É•ÅÕ•ÍÑ}¥¹Ñ•ÉÙ…°½È€À¸À(€€€€€€€€€€€€¤°(€€€€€€€ô°(€€€€¤(€€€Á…É…±±•±}Í¥‘•Ì€ôÍ¡½Õ±‘}Á…É…±±•±¥é•}•áÑÉ…Ñ¥½¹}…ˆ¡½¹™¥œ¤(€€€}İÉ¥Ñ•}ÍÑ…Ñ” (€€€€€€€½¹™¥œ°(€€€€€€€ÍÑ…”ô‹––’ˆ°(€€€€€€€‘½¹”ôÀ°(€€€€€€€µ•ÍÍ…”ô (€€€€€€€€€€€€‹š¶–r£––’½ƒš>C–>[îOšzs¾òo’â7–B3š>C–>[š¢‡–z/–Â–æÛ¢†3¢ÂR£¾ò3–º3š"C–B;¦@¡Õ¹¬ƒ–¾çš¾Sˆ(€€€€€€€€€€€¥˜Á…É…±±•±}Í¥‘•Ì(€€€€€€€€€€€•±Í”€‹š¶–r£––’½ƒš>C–>[îOšzs¾òo–ŞËšr'îOšzs’òknÓš:—¢ö÷–—¾ò3–Ş»–ò¡Õ¹¬ƒ–Âš"C–¾çš¾S¢úˆ(€€€€€€€€¤°(€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€•áÑÉ„õì‰Á…É…±±•±}•áÑÉ…Ñ¥½¹}Í¥‘•ÌˆèÁ…É…±±•±}Í¥‘•Íô°(€€€€¤((€€€ÑÉäè(€€€€€€€¥˜Á…É…±±•±}Í¥‘•Ìè(€€€€€€€€€€€ÁÉ½É•ÍÍ}±½¬€ô1½¬ ¤(€€€€€€€€€€€Í¥‘•}™É…Ñ¥½¸€ôì‰ˆè€À¸À°€‰ˆè€À¸Áô(€€€€€€€€€€€Í¥‘•}Á¡…Í”€ôì‰ˆèíô°€‰ˆèíõô((€€€€€€€€€€€‘•˜½¹}Á…É…±±•±}ÁÉ½É•ÍÌ (€€€€€€€€€€€€€€€±…‰•°èÍÑÈ°(€€€€€€€€€€€€€€€™É…Ñ¥½¸è™±½…Ğ°(€€€€€€€€€€€€€€€ÍÑ…”èÍÑÈ°(€€€€€€€€€€€€€€€µ•ÍÍ…”èÍÑÈ°(€€€€€€€€€€€€€€€Á¡…Í•}‘½¹”è¥¹Ğğ9½¹”°(€€€€€€€€€€€€€€€Á¡…Í•}Ñ½Ñ…°è¥¹Ğğ9½¹”°(€€€€€€€€€€€€€€€•áÑÉ„è‘¥ÑmÍÑÈ°¹åt°(€€€€€€€€€€€€¤€´ø9½¹”è(€€€€€€€€€€€€€€€İ¥Ñ ÁÉ½É•ÍÍ}±½¬è(€€€€€€€€€€€€€€€€€€€Í¥‘•}™É…Ñ¥½¹m±…‰•±t€ôµ…à¡Í¥‘•}™É…Ñ¥½¹m±…‰•±t°™±½…Ğ¡™É…Ñ¥½¸¤¤(€€€€€€€€€€€€€€€€€€€Í¥‘•}Á¡…Í•m±…‰•±t€ôì(€€€€€€€€€€€€€€€€€€€€€€€€‰ÍÑ…”ˆèÍÑ…”°(€€€€€€€€€€€€€€€€€€€€€€€€‰µ•ÍÍ…”ˆèµ•ÍÍ…”°(€€€€€€€€€€€€€€€€€€€€€€€€‰‘½¹”ˆèÁ¡…Í•}‘½¹”°(€€€€€€€€€€€€€€€€€€€€€€€€‰Ñ½Ñ…°ˆèÁ¡…Í•}Ñ½Ñ…°°(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€½µ‰¥¹•‘}‘½¹”€ôÉ½Õ¹ ÌÀÀ€¨ÍÕ´¡Í¥‘•}™É…Ñ¥½¸¹Ù…±Õ•Ì ¤¤¤(€€€€€€€€€€€€€€€€€€€}İÉ¥Ñ•}ÍÑ…Ñ” (€€€€€€€€€€€€€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€€€€€€€€€€€€€ÍÑ…”ô‰½ƒ’â7–B3š>C–>[š¢‡–z/–æÛ¢†3¢şC¢†0ˆ°(€€€€€€€€€€€€€€€€€€€€€€€‘½¹”õ½µ‰¥¹•‘}‘½¹”°(€€€€€€€€€€€€€€€€€€€€€€€µ•ÍÍ…”ô (€€€€€€€€€€€€€€€€€€€€€€€€€€€˜‰èíÍ¥‘•}™É…Ñ¥½¹ltè¸À•÷¾òlˆ(€€€€€€€€€€€€€€€€€€€€€€€€€€€˜‰èíÍ¥‘•}™É…Ñ¥½¹ltè¸À•ôˆ(€€€€€€€€€€€€€€€€€€€€€€€€¤°(€€€€€€€€€€€€€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€€€€€€€€€€€€€€€€•áÑÉ„õì(€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰Á…É…±±•±}•áÑÉ…Ñ¥½¹}Í¥‘•ÌˆèQÉÕ”°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰Í¥‘•}ÁÉ½É•ÍÌˆè‘¥Ğ¡Í¥‘•}™É…Ñ¥½¸¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰Í¥‘•}Á¡…Í”ˆè‘¥Ğ¡Í¥‘•}Á¡…Í”¤°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰ÕÉÉ•¹Ñ}Í¥‘”ˆè±…‰•°°(€€€€€€€€€€€€€€€€€€€€€€€€€€€€¨©•áÑÉ„°(€€€€€€€€€€€€€€€€€€€€€€€ô°(€€€€€€€€€€€€€€€€€€€€¤((€€€€€€€€€€€İ¥Ñ Q¡É•…‘A½½±á•ÕÑ½È¡µ…á}İ½É­•ÉÌôÈ¤…Ì•á•ÕÑ½Èè(€€€€€€€€€€€€€€€™ÕÑÕÉ•}„€ô•á•ÕÑ½È¹ÍÕ‰µ¥Ğ (€€€€€€€€€€€€€€€€€€€}ÉÕ¹}•áÑÉ…Ñ¥½¹}Í¥‘”°(€€€€€€€€€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€€€€€€€€€±…‰•°ô‰ˆ°(€€€€€€€€€€€€€€€€€€€ÁÉ½µÁÑ}Ñ•áĞõ½¹™¥œ¹ÁÉ½µÁÑ}…}Ñ•áĞ°(€€€€€€€€€€€€€€€€€€€É•…Ñ•}ÁÉ½µÁÑ}Ñ•áĞõ½¹™¥œ¹ÁÉ½µÁÑ}…}É•…Ñ•}Ñ•áĞ°(€€€€€€€€€€€€€€€€€€€ÁÉ½µÁÑ}Ù•ÉÍ¥½¸õ½¹™¥œ¹ÁÉ½µÁÑ}…}Ù•ÉÍ¥½¸°(€€€€€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}ÍÑ…ÉĞôÀ°(€€€€€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}•¹ôÌÀÀ°(€€€€€€€€€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}…±±‰…¬õ½¹}Á…É…±±•±}ÁÉ½É•ÍÌ°(€€€€€€€€€€€€€€€€¤(€€€€€€€€€€€€€€€™ÕÑÕÉ•}ˆ€ô•á•ÕÑ½È¹ÍÕ‰µ¥Ğ (€€€€€€€€€€€€€€€€€€€}ÉÕ¹}•áÑÉ…Ñ¥½¹}Í¥‘”°(€€€€€€€€€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€€€€€€€€€±…‰•°ô‰ˆ°(€€€€€€€€€€€€€€€€€€€ÁÉ½µÁÑ}Ñ•áĞõ½¹™¥œ¹ÁÉ½µÁÑ}‰}Ñ•áĞ°(€€€€€€€€€€€€€€€€€€€É•…Ñ•}ÁÉ½µÁÑ}Ñ•áĞõ½¹™¥œ¹ÁÉ½µÁÑ}‰}É•…Ñ•}Ñ•áĞ°(€€€€€€€€€€€€€€€€€€€ÁÉ½µÁÑ}Ù•ÉÍ¥½¸õ½¹™¥œ¹ÁÉ½µÁÑ}‰}Ù•ÉÍ¥½¸°(€€€€€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}ÍÑ…ÉĞôÌÀÀ°(€€€€€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}•¹ôØÀÀ°(€€€€€€€€€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}…±±‰…¬õ½¹}Á…É…±±•±}ÁÉ½É•ÍÌ°(€€€€€€€€€€€€€€€€¤(€€€€€€€€€€€€€€€…Í•Í}„°µ¥ÍÍ•‘}„°ÍÑ…ÑÍ}„€ô™ÕÑÕÉ•}„¹É•ÍÕ±Ğ ¤(€€€€€€€€€€€€€€€…Í•Í}ˆ°µ¥ÍÍ•‘}ˆ°ÍÑ…ÑÍ}ˆ€ô™ÕÑÕÉ•}ˆ¹É•ÍÕ±Ğ ¤(€€€€€€€•±Í”è(€€€€€€€€€€€…Í•Í}„°µ¥ÍÍ•‘}„°ÍÑ…ÑÍ}„€ô}ÉÕ¹}•áÑÉ…Ñ¥½¹}Í¥‘” (€€€€€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€€€€€±…‰•°ô‰ˆ°(€€€€€€€€€€€€€€€ÁÉ½µÁÑ}Ñ•áĞõ½¹™¥œ¹ÁÉ½µÁÑ}…}Ñ•áĞ°(€€€€€€€€€€€€€€€É•…Ñ•}ÁÉ½µÁÑ}Ñ•áĞõ½¹™¥œ¹ÁÉ½µÁÑ}…}É•…Ñ•}Ñ•áĞ°(€€€€€€€€€€€€€€€ÁÉ½µÁÑ}Ù•ÉÍ¥½¸õ½¹™¥œ¹ÁÉ½µÁÑ}…}Ù•ÉÍ¥½¸°(€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}ÍÑ…ÉĞôÀ°(€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}•¹ôÌÀÀ°(€€€€€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€€€€€¤(€€€€€€€€€€€…Í•Í}ˆ°µ¥ÍÍ•‘}ˆ°ÍÑ…ÑÍ}ˆ€ô}ÉÕ¹}•áÑÉ…Ñ¥½¹}Í¥‘” (€€€€€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€€€€€±…‰•°ô‰ˆ°(€€€€€€€€€€€€€€€ÁÉ½µÁÑ}Ñ•áĞõ½¹™¥œ¹ÁÉ½µÁÑ}‰}Ñ•áĞ°(€€€€€€€€€€€€€€€É•…Ñ•}ÁÉ½µÁÑ}Ñ•áĞõ½¹™¥œ¹ÁÉ½µÁÑ}‰}É•…Ñ•}Ñ•áĞ°(€€€€€€€€€€€€€€€ÁÉ½µÁÑ}Ù•ÉÍ¥½¸õ½¹™¥œ¹ÁÉ½µÁÑ}‰}Ù•ÉÍ¥½¸°(€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}ÍÑ…ÉĞôÌÀÀ°(€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}•¹ôØÀÀ°(€€€€€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€€€€€¤(€€€€€€€½µ‰¥¹•‘}ÁÉ½µÁÑ}„€ô€‰q¹q¸ˆ¹©½¥¸ (€€€€€€€€€€€™¥±Ñ•È¡9½¹”°€¡½¹™¥œ¹ÁÉ½µÁÑ}…}É•…Ñ•}Ñ•áĞ°½¹™¥œ¹ÁÉ½µÁÑ}…}Ñ•áĞ¤¤(€€€€€€€€¤(€€€€€€€½µ‰¥¹•‘}ÁÉ½µÁÑ}ˆ€ô€‰q¹q¸ˆ¹©½¥¸ (€€€€€€€€€€€™¥±Ñ•È¡9½¹”°€¡½¹™¥œ¹ÁÉ½µÁÑ}‰}É•…Ñ•}Ñ•áĞ°½¹™¥œ¹ÁÉ½µÁÑ}‰}Ñ•áĞ¤¤(€€€€€€€€¤(€€€€€€€•Ù…±Õ…Ñ¥½¹}ÁÉ½Ñ½½°€ô}‰Õ¥±‘}…¹‘¥‘…Ñ•}¹•ÕÑÉ…±}ÁÉ½Ñ½½° (€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€ÁÉ½µÁÑ}„õ½µ‰¥¹•‘}ÁÉ½µÁÑ}„°(€€€€€€€€€€€ÁÉ½µÁÑ}ˆõ½µ‰¥¹•‘}ÁÉ½µÁÑ}ˆ°(€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€¤(€€€€€€€¥˜•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}…‰}ÍÑ½Á}É•ÅÕ•ÍÑ•¡½¹™¥œ¹©½‰}¥¤è(€€€€€€€€€€€É…¥Í”áÑÉ…Ñ¥½¹AÉ½µÁÑ‰MÑ½ÁÁ• ¤(€€€€€€€Á…¥Éİ¥Í•}É•ÍÕ±ÑÌ°‘ÕÁ±¥…Ñ•}­•åÌ€ô}ÉÕ¹}Á…¥Éİ¥Í•}½µÁ…É¥Í½¹Ì (€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€…Í•Í}„õ…Í•Í}„°(€€€€€€€€€€€…Í•Í}ˆõ…Í•Í}ˆ°(€€€€€€€€€€€µ¥ÍÍ•‘}„õµ¥ÍÍ•‘}„°(€€€€€€€€€€€µ¥ÍÍ•‘}ˆõµ¥ÍÍ•‘}ˆ°(€€€€€€€€€€€ÁÉ½É•ÍÍ}ÍÑ…ÉĞôØÈÀ°(€€€€€€€€€€€ÁÉ½É•ÍÍ}•¹ôäÌÀ°(€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€€€€•Ù…±Õ…Ñ¥½¹}ÁÉ½Ñ½½°õ•Ù…±Õ…Ñ¥½¹}ÁÉ½Ñ½½°°(€€€€€€€€¤((€€€€€€€}İÉ¥Ñ•}ÍÑ…Ñ” (€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€ÍÑ…”ô‹¢º‡º_î¢º‡îO¢ºèˆ°(€€€€€€€€€€€‘½¹”ôäÔÀ°(€€€€€€€€€€€µ•ÍÍ…”ô‹š¶–r£šÆšïnÓš:—¢s¢Ò¢šn[:–J3š2'¢¾šÖ/’êë¢kÆïjö»’ş‡–2ë¦^Óˆ°(€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€¤(€€€€€€€É•Á½ÉĞ€ô½µÁ…É•}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}Á…¥ÉÌ (€€€€€€€€€€€…Í•Í}„õ…Í•Í}„°(€€€€€€€€€€€…Í•Í}ˆõ…Í•Í}ˆ°(€€€€€€€€€€€µ¥ÍÍ•‘}…Í•Í}„õµ¥ÍÍ•‘}„°(€€€€€€€€€€€µ¥ÍÍ•‘}…Í•Í}ˆõµ¥ÍÍ•‘}ˆ°(€€€€€€€€€€€Á…¥Éİ¥Í•}É•ÍÕ±ÑÌõÁ…¥Éİ¥Í•}É•ÍÕ±ÑÌ°(€€€€€€€€€€€ÁÉ½µÁÑ}„õ½µ‰¥¹•‘}ÁÉ½µÁÑ}„°(€€€€€€€€€€€ÁÉ½µÁÑ}ˆõ½µ‰¥¹•‘}ÁÉ½µÁÑ}ˆ°(€€€€€€€€€€€Ù…±¥‘…Ñ¥½¹}½¹™¥œõ½¹™¥œ¹Ù…±¥‘…Ñ¥½¹}½¹™¥œ°(€€€€€€€€€€€•Ù…±Õ…Ñ¥½¹}ÁÉ½Ñ½½°õ•Ù…±Õ…Ñ¥½¹}ÁÉ½Ñ½½°°(€€€€€€€€¤(€€€€€€€•áÑÉ…Ñ¥½¹}µ½‘•±}„€ô}Í¥‘•}•áÑÉ…Ñ¥½¹}½¹™¥œ¡½¹™¥œ°€‰ˆ¤¹µ½‘•°(€€€€€€€•áÑÉ…Ñ¥½¹}µ½‘•±}ˆ€ô}Í¥‘•}•áÑÉ…Ñ¥½¹}½¹™¥œ¡½¹™¥œ°€‰ˆ¤¹µ½‘•°(€€€€€€€É•Á½ÉÑl‰µ½‘•±}É½±•Ì‰t€ôì(€€€€€€€€€€€€‰•áÑÉ…Ñ¥½¹}µ½‘•±}„ˆè•áÑÉ…Ñ¥½¹}µ½‘•±}„°(€€€€€€€€€€€€‰•áÑÉ…Ñ¥½¹}µ½‘•±}ˆˆè•áÑÉ…Ñ¥½¹}µ½‘•±}ˆ°(€€€€€€€€€€€€‰‘¥É•Ñ}½µÁ…É¥Í½¹}µ½‘•°ˆè½¹™¥œ¹½µÁ…É¥Í½¹}½¹™¥œ¹©Õ‘•}µ½‘•°°(€€€€€€€ô(€€€€€€€É•Á½ÉÑl‰¥¹ÁÕÑ}µ½‘•Ì‰t€ôì‰ˆè½¹™¥œ¹Í¥‘•}…}µ½‘”°€‰ˆè½¹™¥œ¹Í¥‘•}‰}µ½‘•ô(€€€€€€€É•Á½ÉÑl‰Á…É…±±•±}•áÑÉ…Ñ¥½¹}Í¥‘•Ì‰t€ôÁ…É…±±•±}Í¥‘•Ì(€€€€€€€É•Á½ÉÑl‰‘ÕÁ±¥…Ñ•}Í½ÕÉ•}­•åÌ‰t€ôÍ½ÉÑ• (€€€€€€€€€€€Í•Ğ¡É•Á½ÉĞ¹•Ğ ‰‘ÕÁ±¥…Ñ•}Í½ÕÉ•}­•åÌˆ¤½Èmt¤ğÍ•Ğ¡‘ÕÁ±¥…Ñ•}­•åÌ¤(€€€€€€€€¤(€€€€€€€É•Á½ÉÑl‰½µÁ…É¥Í½¹}Í½Á”‰t€ô€ (€€€€€€€€€€€€‹š>C–>[š>C’ë¢¾7’â;š>C–>[š¢‡–z/¢S–B#–¾çš¾Pˆ(€€€€€€€€€€€¥˜•áÑÉ…Ñ¥½¹}µ½‘•±}„€„ô•áÑÉ…Ñ¥½¹}µ½‘•±}ˆ(€€€€€€€€€€€•±Í”€‹’îš>C–>[š>C’ë¢¾7–¾çš¾Pˆ(€€€€€€€€¤(€€€€€€€É•Á½ÉÑl‰‘¥™™}•á•±}½ÁÑ¥½¹…±}Í•Ñ¥½¹Ì‰t€ô±¥ÍĞ¡½¹™¥œ¹‘¥™™}•á•±}½ÁÑ¥½¹…±}Í•Ñ¥½¹Ì½Èmt¤(€€€€€€€}İÉ¥Ñ•}Á…¥Éİ¥Í•}…‘Ù¥Í½É}•Ù¥‘•¹” (€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€…Í•Í}„õ…Í•Í}„°(€€€€€€€€€€€…Í•Í}ˆõ…Í•Í}ˆ°(€€€€€€€€€€€É½İÌõÉ•Á½ÉĞ¹•Ğ ‰É½İÌˆ¤½Èmt°(€€€€€€€€¤(€€€€€€€…Ñ½µ¥}İÉ¥Ñ•}©Í½¸¡É•Á½ÉÑ}Á…Ñ ¡½¹™¥œ¹©½‰}¥¤°É•Á½ÉĞ¤(€€€€€€€}İÉ¥Ñ•}É•Á½ÉÑ}•á•°¡É•Á½ÉĞ°É•Á½ÉÑ}•á•±}Á…Ñ ¡½¹™¥œ¹©½‰}¥¤¤(€€€€€€€İÉ¥Ñ•}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}‘¥™™}•á•° (€€€€€€€€€€€•áÑÉ…Ñ¥½¹}…}Á…Ñ õ•áÑÉ…Ñ¥½¹}Á…Ñ ¡½¹™¥œ¹©½‰}¥°€‰ˆ¤°(€€€€€€€€€€€•áÑÉ…Ñ¥½¹}‰}Á…Ñ õ•áÑÉ…Ñ¥½¹}Á…Ñ ¡½¹™¥œ¹©½‰}¥°€‰ˆ¤°(€€€€€€€€€€€½µÁ…É¥Í½¹}É½İÌõÉ•Á½ÉĞ¹•Ğ ‰É½İÌˆ¤½Èmt°(€€€€€€€€€€€½ÕÑÁÕÑ}Á…Ñ õ‘¥™™}•á•±}Á…Ñ ¡½¹™¥œ¹©½‰}¥¤°(€€€€€€€€€€€µ½‘•±}½µÁ…É¥Í½¸õ9½¹”°(€€€€€€€€€€€½ÁÑ¥½¹…±}Í•Ñ¥½¹Ìõ½¹™¥œ¹‘¥™™}•á•±}½ÁÑ¥½¹…±}Í•Ñ¥½¹Ì°(€€€€€€€€¤(€€€€€€€}İÉ¥Ñ•}ÍÑ…Ñ” (€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€ÍÑ…ÑÕÌô‰½µÁ±•Ñ•ˆ°(€€€€€€€€€€€ÍÑ…”ô‹–º3š"@ˆ°(€€€€€€€€€€€‘½¹”õAI=IMM}Q=Q0°(€€€€€€€€€€€µ•ÍÍ…”õ˜‰½ƒš¾S¢ú–º3š"C¾òiíÉ•Á½ÉĞ¹•Ğ É•½µµ•¹‘…Ñ¥½¸œ°€Ÿ–ŞËRš"CîO¢ºèœ¥÷ˆ°(€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€€€€•áÑÉ„õì(€€€€€€€€€€€€€€€€‰É•½µµ•¹‘…Ñ¥½¸ˆèÉ•Á½ÉĞ¹•Ğ ‰É•½µµ•¹‘…Ñ¥½¸ˆ¤°(€€€€€€€€€€€€€€€€‰É•½µµ•¹‘…Ñ¥½¹}É•…Í½¸ˆèÉ•Á½ÉĞ¹•Ğ ‰É•½µµ•¹‘…Ñ¥½¹}É•…Í½¸ˆ¤°(€€€€€€€€€€€€€€€€‰ÅÕ…±¥Ñå}„ˆèÉ•Á½ÉĞ¹•Ğ ‰ÅÕ…±¥Ñå}„ˆ¤°(€€€€€€€€€€€€€€€€‰ÅÕ…±¥Ñå}ˆˆèÉ•Á½ÉĞ¹•Ğ ‰ÅÕ…±¥Ñå}ˆˆ¤°(€€€€€€€€€€€€€€€€‰Ù…±¥‘…Ñ¥½¹}…Ñ”ˆèÉ•Á½ÉĞ¹•Ğ ‰Ù…±¥‘…Ñ¥½¹}…Ñ”ˆ¤°(€€€€€€€€€€€€€€€€‰İ¥¹¹•É}½Õ¹ÑÌˆèÉ•Á½ÉĞ¹•Ğ ‰İ¥¹¹•É}½Õ¹ÑÌˆ¤°(€€€€€€€€€€€€€€€€‰µ½‘•±}É½±•ÌˆèÉ•Á½ÉĞ¹•Ğ ‰µ½‘•±}É½±•Ìˆ¤°(€€€€€€€€€€€€€€€€‰½µÁ…É¥Í½¹}µ½‘”ˆèÉ•Á½ÉĞ¹•Ğ ‰½µÁ…É¥Í½¹}µ½‘”ˆ¤°(€€€€€€€€€€€€€€€€‰‘¥™™}•á•±}Á…Ñ ˆèÍÑÈ¡‘¥™™}•á•±}Á…Ñ ¡½¹™¥œ¹©½‰}¥¤¤°(€€€€€€€€€€€€€€€€‰ÍÑ…ÑÍ}„ˆèÍÑ…ÑÍ}„°(€€€€€€€€€€€€€€€€‰ÍÑ…ÑÍ}ˆˆèÍÑ…ÑÍ}ˆ°(€€€€€€€€€€€€€€€€‰Á…É…±±•±}•áÑÉ…Ñ¥½¹}Í¥‘•ÌˆèÁ…É…±±•±}Í¥‘•Ì°(€€€€€€€€€€€€€€€€‰™¥¹¥Í¡•‘}…ĞˆèÕÑ}¹½Ü ¤°(€€€€€€€€€€€ô°(€€€€€€€€¤(€€€•á•ÁĞáÑÉ…Ñ¥½¹AÉ½µÁÑ‰MÑ½ÁÁ•è(€€€€€€€ÍÑ…Ñ”€ôÉ•…‘}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}…‰}©½‰}ÍÑ…Ñ”¡½¹™¥œ¹©½‰}¥¤(€€€€€€€}İÉ¥Ñ•}ÍÑ…Ñ” (€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€ÍÑ…ÑÕÌô‰ÍÑ½ÁÁ•ˆ°(€€€€€€€€€€€ÍÑ…”ô‹–ŞËî#š¶ˆˆ°(€€€€€€€€€€€‘½¹”õ¥¹Ğ¡ÍÑ…Ñ”¹•Ğ ‰‘½¹”ˆ°€À¤½È€À¤°(€€€€€€€€€€€µ•ÍÍ…”ô‹š>C–>[š>C’ë¢¾4½ƒ’îï–*‡–ŞËš2'î#š¶‹¢¾ßšÆ–sš¶‹¾ò3–ŞË–º3š"Cj’â·¦^ÓšZ’îÛ’òk’şwVgˆ°(€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€€€€•áÑÉ„õì‰™¥¹¥Í¡•‘}…ĞˆèÕÑ}¹½Ü ¥ô°(€€€€€€€€¤(€€€•á•ÁĞá•ÁÑ¥½¸…Ì•áŒè(€€€€€€€ÍÑ…Ñ”€ôÉ•…‘}•áÑÉ…Ñ¥½¹}ÁÉ½µÁÑ}…‰}©½‰}ÍÑ…Ñ”¡½¹™¥œ¹©½‰}¥¤(€€€€€€€}İÉ¥Ñ•}ÍÑ…Ñ” (€€€€€€€€€€€½¹™¥œ°(€€€€€€€€€€€ÍÑ…ÑÕÌô‰™…¥±•ˆ°(€€€€€€€€€€€ÍÑ…”ô‹–’Ç¢Ò”ˆ°(€€€€€€€€€€€‘½¹”õ¥¹Ğ¡ÍÑ…Ñ”¹•Ğ ‰‘½¹”ˆ°€À¤½È€À¤°(€€€€€€€€€€€µ•ÍÍ…”õ˜‹š>C–>[š>C’ë¢¾4½ƒ–’Ç¢Ò—¾òiíÑåÁ”¡•áŒ¤¹}}¹…µ•}}ôèí•áôˆ°(€€€€€€€€€€€ÍÑ…ÉÑ•‘}…ĞõÍÑ…ÉÑ•‘}…Ğ°(€€€€€€€€€€€•áÑÉ„õì(€€€€€€€€€€€€€€€€‰•ÉÉ½Èˆè˜‰íÑåÁ”¡•áŒ¤¹}}¹…µ•}}ôèí•áôˆ°(€€€€€€€€€€€€€€€€‰ÑÉ…•‰…¬ˆèÑÉ…•‰…¬¹™½Éµ…Ñ}•áŒ ¤°(€€€€€€€€€€€€€€€€‰™¥¹¥Í¡•‘}…ĞˆèÕÑ}¹½Ü ¤°(€€€€€€€€€€€ô°(€€€€€€€€¤(

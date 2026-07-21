@@ -5,7 +5,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import mean
-from typing import Any
+from threading import Lock
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -59,6 +60,21 @@ class JudgeAbJobConfig:
     extraction_prompt_version: str = ""
     extraction_prompt_hash: str = ""
     eval_config: EvalConfig = field(default_factory=EvalConfig)
+    eval_config_a: EvalConfig | None = None
+    eval_config_b: EvalConfig | None = None
+    parallel_different_models: bool = True
+
+
+def _side_eval_config(config: JudgeAbJobConfig, label: str) -> EvalConfig:
+    selected = config.eval_config_a if label.upper() == "A" else config.eval_config_b
+    return selected or config.eval_config
+
+
+def should_parallelize_judge_ab(config: JudgeAbJobConfig) -> bool:
+    """Run both sides together only when the judge model is an intentional variable."""
+    model_a = str(_side_eval_config(config, "A").judge_model or "").strip()
+    model_b = str(_side_eval_config(config, "B").judge_model or "").strip()
+    return bool(config.parallel_different_models and model_a and model_b and model_a != model_b)
 
 
 def job_dir(job_id: str) -> Path:
@@ -120,11 +136,19 @@ def judge_ab_stop_requested(job_id: str) -> bool:
 
 def judge_ab_job_stale_after_seconds(state: dict[str, Any]) -> float:
     config = state.get("config") or {}
-    eval_config = config.get("eval_config") if isinstance(config.get("eval_config"), dict) else {}
-    timeout = float(eval_config.get("judge_timeout") or 120)
-    retries = float(eval_config.get("judge_max_retries") or 3)
-    backoff = float(eval_config.get("judge_qps_backoff") or 12)
-    interval = float(eval_config.get("judge_request_interval") or 0)
+    eval_configs = [
+        item
+        for item in (
+            config.get("eval_config_a"),
+            config.get("eval_config_b"),
+            config.get("eval_config"),
+        )
+        if isinstance(item, dict)
+    ] or [{}]
+    timeout = max(float(item.get("judge_timeout") or 120) for item in eval_configs)
+    retries = max(float(item.get("judge_max_retries") or 3) for item in eval_configs)
+    backoff = max(float(item.get("judge_qps_backoff") or 12) for item in eval_configs)
+    interval = max(float(item.get("judge_request_interval") or 0) for item in eval_configs)
     return max(300.0, timeout * 2 + retries * max(backoff, 5.0) + interval + 120.0)
 
 
@@ -163,10 +187,11 @@ def judge_ab_job_is_running(job_id: str) -> bool:
 def _safe_config(config: JudgeAbJobConfig) -> dict[str, Any]:
     value = asdict(config)
     value.pop("extraction_prompt_text", None)
-    eval_config = value.get("eval_config")
-    if isinstance(eval_config, dict):
-        eval_config.pop("judge_api_bearer_token", None)
-        eval_config["judge_max_attempts"] = int(eval_config.get("judge_max_retries") or 1)
+    for key in ("eval_config", "eval_config_a", "eval_config_b"):
+        eval_config = value.get(key)
+        if isinstance(eval_config, dict):
+            eval_config.pop("judge_api_bearer_token", None)
+            eval_config["judge_max_attempts"] = int(eval_config.get("judge_max_retries") or 1)
     return value
 
 
@@ -279,10 +304,13 @@ def _evaluate_prompt(
     total: int,
     started_at: str,
     result_path: Path,
+    eval_config: EvalConfig | None = None,
+    progress_callback: Callable[[str, int, int, dict[str, Any]], None] | None = None,
 ) -> tuple[list[EvalResult], dict[str, Any]]:
+    side_config = eval_config or _side_eval_config(config, label)
     prompt_version = infer_prompt_version(prompt_file)
     runner = EvalRunner(
-        config=config.eval_config,
+        config=side_config,
         task_type=TaskType(config.task_type),
         prompt_file=prompt_file,
         judge_prompt_version=prompt_version,
@@ -291,11 +319,11 @@ def _evaluate_prompt(
         extraction_prompt_hash=config.extraction_prompt_hash,
     )
 
-    configured_concurrency = min(100, max(1, int(config.eval_config.judge_concurrency or 1)))
+    configured_concurrency = min(100, max(1, int(side_config.judge_concurrency or 1)))
     configured_concurrency = min(configured_concurrency, max(1, len(cases)))
-    configured_interval = float(config.eval_config.judge_request_interval or 0.0) if not config.eval_config.mock else 0.0
-    backoff_interval = float(config.eval_config.judge_qps_backoff or 0.0)
-    rate_scope = api_rate_scope(config.eval_config.judge_api_base_url, config.eval_config.judge_api_bearer_token)
+    configured_interval = float(side_config.judge_request_interval or 0.0) if not side_config.mock else 0.0
+    backoff_interval = float(side_config.judge_qps_backoff or 0.0)
+    rate_scope = api_rate_scope(side_config.judge_api_base_url, side_config.judge_api_bearer_token)
 
     def current_controls() -> dict[str, Any]:
         return read_judge_ab_job_controls(config.job_id)
@@ -318,8 +346,8 @@ def _evaluate_prompt(
             configured_interval,
             min_value=0.0,
             max_value=300.0,
-        ) if not config.eval_config.mock else 0.0
-        if current_concurrency() > 1 and not config.eval_config.mock:
+        ) if not side_config.mock else 0.0
+        if current_concurrency() > 1 and not side_config.mock:
             value = max(value, backoff_interval)
         return value
 
@@ -330,7 +358,7 @@ def _evaluate_prompt(
         wait_for_global_rate_slot(
             rate_scope,
             current_interval(),
-            disabled=bool(config.eval_config.mock),
+            disabled=bool(side_config.mock),
             should_stop=lambda: judge_ab_stop_requested(config.job_id),
             priority=current_priority(),
         )
@@ -379,22 +407,25 @@ def _evaluate_prompt(
                     results_by_index[idx] = result
                     append_result_to_jsonl(result, str(result_path))
                     completed += 1
-                    global_done = completed_offset + completed
-                    _write_state(
-                        config,
-                        stage=f"评估提示词 {label}",
-                        done=global_done,
-                        total=total,
-                        message=f"提示词 {label}: {completed}/{len(cases)}",
-                        started_at=started_at,
-                        extra={
-                            "current_label": label,
-                            "configured_request_interval": configured_interval,
-                            "effective_request_interval": current_interval(),
-                            "effective_concurrency": current_concurrency(),
-                            "priority": current_priority(),
-                        },
-                    )
+                    progress_meta = {
+                        "judge_model": side_config.judge_model,
+                        "configured_request_interval": configured_interval,
+                        "effective_request_interval": current_interval(),
+                        "effective_concurrency": current_concurrency(),
+                        "priority": current_priority(),
+                    }
+                    if progress_callback is not None:
+                        progress_callback(label, completed, len(cases), progress_meta)
+                    else:
+                        _write_state(
+                            config,
+                            stage=f"评估提示词 {label}",
+                            done=completed_offset + completed,
+                            total=total,
+                            message=f"提示词 {label}: {completed}/{len(cases)}",
+                            started_at=started_at,
+                            extra={"current_label": label, **progress_meta},
+                        )
                 if stopped or judge_ab_stop_requested(config.job_id):
                     stopped = True
                     for future in list(futures):
@@ -410,6 +441,7 @@ def _evaluate_prompt(
     return [results_by_index[i] for i in sorted(results_by_index)], {
         "prompt_file": prompt_file,
         "prompt_version": prompt_version,
+        "judge_model": side_config.judge_model,
         "configured_request_interval": configured_interval,
         "effective_request_interval": current_interval(),
         "effective_concurrency": current_concurrency(),
@@ -423,10 +455,20 @@ def run_judge_ab_job(config: JudgeAbJobConfig, cases: list[Case]) -> None:
     if stop_path(config.job_id).exists():
         stop_path(config.job_id).unlink()
     job_dir(config.job_id).mkdir(parents=True, exist_ok=True)
+    side_config_a = _side_eval_config(config, "A")
+    side_config_b = _side_eval_config(config, "B")
+    parallel_sides = should_parallelize_judge_ab(config)
     init_task_controls(controls_path(config.job_id), {
         "priority": DEFAULT_PRIORITY,
-        "judge_concurrency": min(100, max(1, int(config.eval_config.judge_concurrency or 1))),
-        "judge_request_interval": float(config.eval_config.judge_request_interval or 0.0),
+        "judge_concurrency": min(100, max(
+            1,
+            int(side_config_a.judge_concurrency or 1),
+            int(side_config_b.judge_concurrency or 1),
+        )),
+        "judge_request_interval": max(
+            float(side_config_a.judge_request_interval or 0.0),
+            float(side_config_b.judge_request_interval or 0.0),
+        ),
     })
     total = len(cases) * 2
     results_to_jsonl([], str(results_a_path(config.job_id)))
@@ -437,68 +479,141 @@ def run_judge_ab_job(config: JudgeAbJobConfig, cases: list[Case]) -> None:
         stage="准备",
         done=0,
         total=total,
-        message=f"A/B 对比任务已启动，共 {len(cases)} 个 case。",
+        message=(
+            f"A/B 对比任务已启动，共 {len(cases)} 个 case；不同裁判模型并行评测。"
+            if parallel_sides
+            else f"A/B 对比任务已启动，共 {len(cases)} 个 case；相同裁判模型顺序评测。"
+        ),
         started_at=started_at,
+        extra={
+            "parallel_sides": parallel_sides,
+            "judge_model_a": side_config_a.judge_model,
+            "judge_model_b": side_config_b.judge_model,
+        },
     )
 
     try:
-        results_a, stats_a = _evaluate_prompt(
-            label="A",
-            prompt_file=config.prompt_a,
-            cases=cases,
-            config=config,
-            completed_offset=0,
-            total=total,
-            started_at=started_at,
-            result_path=results_a_path(config.job_id),
-        )
-        results_to_jsonl(results_a, str(results_a_path(config.job_id)))
-        if stats_a.get("stopped") or judge_ab_stop_requested(config.job_id):
-            _write_state(
-                config,
-                status="stopped",
-                stage="已终止",
-                done=len(results_a),
-                total=total,
-                message="A/B 对比已在提示词 A 后终止。",
-                started_at=started_at,
-                extra={
-                    "stats_a": stats_a,
-                    "summary_a": summarize_results(results_a),
-                    "finished_at": utc_now(),
-                },
-            )
-            return
+        if parallel_sides:
+            progress_lock = Lock()
+            side_completed = {"A": 0, "B": 0}
 
-        results_b, stats_b = _evaluate_prompt(
-            label="B",
-            prompt_file=config.prompt_b,
-            cases=cases,
-            config=config,
-            completed_offset=len(cases),
-            total=total,
-            started_at=started_at,
-            result_path=results_b_path(config.job_id),
-        )
+            def on_parallel_progress(
+                label: str,
+                completed: int,
+                side_total: int,
+                meta: dict[str, Any],
+            ) -> None:
+                with progress_lock:
+                    side_completed[label] = max(side_completed[label], int(completed))
+                    _write_state(
+                        config,
+                        stage="A/B 不同裁判模型并行评测",
+                        done=sum(side_completed.values()),
+                        total=total,
+                        message=(
+                            f"A: {side_completed['A']}/{side_total}；"
+                            f"B: {side_completed['B']}/{side_total}"
+                        ),
+                        started_at=started_at,
+                        extra={
+                            "parallel_sides": True,
+                            "side_progress": dict(side_completed),
+                            "current_label": label,
+                            **meta,
+                        },
+                    )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_a = executor.submit(
+                    _evaluate_prompt,
+                    label="A",
+                    prompt_file=config.prompt_a,
+                    cases=cases,
+                    config=config,
+                    completed_offset=0,
+                    total=total,
+                    started_at=started_at,
+                    result_path=results_a_path(config.job_id),
+                    eval_config=side_config_a,
+                    progress_callback=on_parallel_progress,
+                )
+                future_b = executor.submit(
+                    _evaluate_prompt,
+                    label="B",
+                    prompt_file=config.prompt_b,
+                    cases=cases,
+                    config=config,
+                    completed_offset=0,
+                    total=total,
+                    started_at=started_at,
+                    result_path=results_b_path(config.job_id),
+                    eval_config=side_config_b,
+                    progress_callback=on_parallel_progress,
+                )
+                results_a, stats_a = future_a.result()
+                results_b, stats_b = future_b.result()
+        else:
+            results_a, stats_a = _evaluate_prompt(
+                label="A",
+                prompt_file=config.prompt_a,
+                cases=cases,
+                config=config,
+                completed_offset=0,
+                total=total,
+                started_at=started_at,
+                result_path=results_a_path(config.job_id),
+                eval_config=side_config_a,
+            )
+            results_to_jsonl(results_a, str(results_a_path(config.job_id)))
+            if stats_a.get("stopped") or judge_ab_stop_requested(config.job_id):
+                _write_state(
+                    config,
+                    status="stopped",
+                    stage="已终止",
+                    done=len(results_a),
+                    total=total,
+                    message="A/B 对比已在提示词 A 后终止。",
+                    started_at=started_at,
+                    extra={
+                        "stats_a": stats_a,
+                        "summary_a": summarize_results(results_a),
+                        "finished_at": utc_now(),
+                    },
+                )
+                return
+
+            results_b, stats_b = _evaluate_prompt(
+                label="B",
+                prompt_file=config.prompt_b,
+                cases=cases,
+                config=config,
+                completed_offset=len(cases),
+                total=total,
+                started_at=started_at,
+                result_path=results_b_path(config.job_id),
+                eval_config=side_config_b,
+            )
+        results_to_jsonl(results_a, str(results_a_path(config.job_id)))
         results_to_jsonl(results_b, str(results_b_path(config.job_id)))
         table = result_table(results_a, results_b)
         atomic_write_bytes(table_path(config.job_id), dataframe_to_excel_bytes(table))
         summary_a = summarize_results(results_a)
         summary_b = summarize_results(results_b)
-        if stats_b.get("stopped") or judge_ab_stop_requested(config.job_id):
+        if stats_a.get("stopped") or stats_b.get("stopped") or judge_ab_stop_requested(config.job_id):
             _write_state(
                 config,
                 status="stopped",
                 stage="已终止",
                 done=len(results_a) + len(results_b),
                 total=total,
-                message="A/B 对比已在提示词 B 阶段终止，已保留部分结果。",
+                message="A/B 对比已终止，已保留两侧完成的部分结果。",
                 started_at=started_at,
                 extra={
                     "stats_a": stats_a,
                     "stats_b": stats_b,
                     "summary_a": summary_a,
                     "summary_b": summary_b,
+                    "parallel_sides": parallel_sides,
                     "table_preview": table.head(100).to_dict("records"),
                     "finished_at": utc_now(),
                 },
@@ -517,6 +632,7 @@ def run_judge_ab_job(config: JudgeAbJobConfig, cases: list[Case]) -> None:
                 "stats_b": stats_b,
                 "summary_a": summary_a,
                 "summary_b": summary_b,
+                "parallel_sides": parallel_sides,
                 "table_preview": table.head(100).to_dict("records"),
                 "finished_at": utc_now(),
             },
